@@ -28,7 +28,7 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--dataset",
         type=str,
-        default="cora",
+        default="citeseer",
         choices=["cora", "citeseer", "pubmed", "computer", "cs", "physics", "flickr", "ogbn-arxiv"],
         help="Dataset name (must match nc_datasets_simple.py)",
     )
@@ -77,7 +77,7 @@ def parser_add_main_args(parser):
 
     # optimization
     parser.add_argument("--lr", type=float, default=0.001)
-    parser.add_argument("--weight_decay", type=float, default=5e-4)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--dropout", type=float, default=0.0)
 
     # augmentation (Bernoulli drop/add)
@@ -103,7 +103,7 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--rade_scope",
         type=str,
-        default="last",
+        default="all",
         choices=["all", "last"],
         help="RADE application scope: 'all' applies RADE at every layer; "
              "'last' applies RADE only at final layer and removes last nonlinearity for a linear head.",
