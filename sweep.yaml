@@ -1,0 +1,46 @@
+project: rade-nc
+entity: danial-saber
+
+method: grid
+metric:
+  name: best/valid_acc
+  goal: maximize
+
+parameters:
+  dataset:
+    values: [cora]
+  gnn:
+    values: [gcn, gin]
+  local_layers:
+    values: [2]
+  hidden_channels:
+    values: [64]
+  lr:
+    values: [0.0005]
+  dropout:
+    values: [0.0]
+  aug_mode:
+    values: [both]
+  unbiased_mode:
+    values: [rade]
+  mask_sharing:
+    values: [shared]
+  unbiased:
+    values: [true]
+  pq_gradnorm:
+    values: [true]
+  p:
+    values: [0.2]
+  q:
+    values: [0.0002]
+
+command:
+  - ${env}
+  - python
+  - main.py
+  - --wandb
+  - --wandb_project
+  - rade-nc
+  - --runs
+  - "1"
+  - ${args}
