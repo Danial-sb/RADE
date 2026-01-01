@@ -18,7 +18,7 @@ def parse_method(args, num_nodes, num_classes, in_dim, device):
         jk=args.jk,
         gnn=args.gnn,
         unbiased=args.unbiased,
-        rade_scope=args.rade_scope,
+        unbiased_mode=args.unbiased_mode,
     ).to(device)
     return model
 
@@ -88,7 +88,7 @@ def parser_add_main_args(parser):
                         help="Edge drop probability for edges (i,j) in E.")
     parser.add_argument("--q", type=float, default=0.000143,
                         help="Non-edge add probability for pairs (i,j) not in E (per-non-edge rate).")
-    parser.add_argument("--unbiased", type=bool, default=False,
+    parser.add_argument("--unbiased", action="store_true",
                         help="Use expectation-preserving (unbiased) aggregation for drop/add (RADE-style).")
     # augmentation (Bernoulli drop/add)
     parser.add_argument(
@@ -101,13 +101,59 @@ def parser_add_main_args(parser):
     )
 
     parser.add_argument(
-        "--rade_scope",
+        "--unbiased_mode",
         type=str,
-        default="all",
-        choices=["all", "last"],
-        help="RADE application scope: 'all' applies RADE at every layer; "
-             "'last' applies RADE only at final layer and removes last nonlinearity for a linear head.",
+        default="rade",
+        choices=["rade", "rade-ic"],
+        help="When --unbiased=True: "
+             "'rade' uses train-time centering for additions (clean inference). "
+             "'rade-ic' uses no centering at train and applies inference correction.",
     )
+
+    # ---- GradNorm p/q tuning (epoch-wise) ----
+    parser.add_argument("--pq_gradnorm", action="store_true",
+                        help="Enable epoch-wise GradNorm matching to adapt (p,q).")
+
+    parser.add_argument("--p_max", type=float, default=0.5,
+                        help="Upper bound for p during GradNorm tuning.")
+    parser.add_argument("--q_max", type=float, default=1e-3,
+                        help="Upper bound for q during GradNorm tuning.")
+
+    parser.add_argument("--pq_grid_size", type=int, default=5,
+                        help="Grid size for (p,q) search. Use 11 for GIN; use 3-5 for GCN (costlier).")
+
+    parser.add_argument("--pq_subset_nodes", type=int, default=1024,
+                        help="Number of train nodes used to estimate GradNorm norms.")
+    parser.add_argument("--pq_ema", type=float, default=0.9,
+                        help="EMA smoothing for p,q updates (stability).")
+
+    parser.add_argument("--pq_update_every", type=int, default=1,
+                        help="Update (p,q) every k epochs.")
+    parser.add_argument("--pq_warmup_epochs", type=int, default=50,
+                        help="Number of initial epochs to skip pq updates.")
+    parser.add_argument("--pq_eps", type=float, default=1e-12,
+                        help="Small epsilon for log/denominator stabilizers.")
+    parser.add_argument("--pq_seed", type=int, default=0,
+                        help="Seed for selecting the subset of nodes for pq selection.")
+
+
+    # -----------------------
+    # Weights & Biases (wandb)
+    # -----------------------
+    parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
+    parser.add_argument("--wandb_project", type=str, default="rade-nc")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="wandb entity/team (optional)")
+    parser.add_argument("--wandb_group", type=str, default=None, help="wandb group (optional)")
+    parser.add_argument("--wandb_name", type=str, default=None, help="wandb run name (optional)")
+    parser.add_argument("--wandb_tags", type=str, default="", help="comma-separated tags (optional)")
+    parser.add_argument(
+        "--wandb_mode",
+        type=str,
+        default="online",
+        choices=["online", "offline", "disabled"],
+        help="wandb mode",
+    )
+    parser.add_argument("--wandb_log_every", type=int, default=1, help="log every k epochs")
 
     # misc
     parser.add_argument("--display_step", type=int, default=1)

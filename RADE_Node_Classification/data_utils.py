@@ -113,7 +113,10 @@ def class_rand_splits(
             non_train_idx.append(perm_c[take:])
 
     train_idx = torch.cat(train_idx, dim=0).to(torch.long)
-    non_train_idx = torch.cat(non_train_idx, dim=0).to(torch.long)
+    if len(non_train_idx) > 0:
+        non_train_idx = torch.cat(non_train_idx, dim=0).to(torch.long)
+    else:
+        non_train_idx = torch.empty((0,), dtype=torch.long)
 
     # shuffle remaining nodes and split valid/test
     non_train_idx = non_train_idx[torch.randperm(non_train_idx.numel(), generator=g)]

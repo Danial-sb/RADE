@@ -2,10 +2,8 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 from torch_geometric.nn import GCNConv, GINConv
-from typing import Optional, Literal
+from typing import Optional
 from rade_convs import GraphCache, RADEGCNConv, RADEGINConv
-
-RadeScope = Literal["all", "last"]
 
 
 class MPNNs(torch.nn.Module):
@@ -23,7 +21,7 @@ class MPNNs(torch.nn.Module):
         jk=False,
         gnn="gcn",
         unbiased: bool = False,
-        rade_scope: RadeScope = "all",
+        unbiased_mode: str = "rade",
     ):
         super(MPNNs, self).__init__()
 
@@ -32,9 +30,8 @@ class MPNNs(torch.nn.Module):
         if ln and bn:
             raise ValueError("Choose at most one normalization: ln=True or bn=True (not both).")
 
-        rade_scope = str(rade_scope).lower().strip()
-        if rade_scope not in ("all", "last"):
-            raise ValueError(f"rade_scope must be 'all' or 'last'. Got {rade_scope}")
+        if unbiased_mode not in ("rade", "rade-ic"):
+            raise ValueError(f"unbiased_mode must be 'rade' or 'rade-ic'. Got {unbiased_mode}")
 
         self.dropout = float(dropout)
         self.pre_linear = bool(pre_linear)
@@ -44,7 +41,7 @@ class MPNNs(torch.nn.Module):
         self.jk = bool(jk)
         self.gnn = gnn
         self.unbiased = bool(unbiased)
-        self.rade_scope: RadeScope = rade_scope  # "all" or "last"
+        self.unbiased_mode = str(unbiased_mode)
 
         self.local_convs = torch.nn.ModuleList()
         self.lins = torch.nn.ModuleList() if self.res else None
@@ -55,31 +52,16 @@ class MPNNs(torch.nn.Module):
 
         # ----- helpers for GIN -----
         def make_gin_mlp(in_dim, out_dim):
-            # regular (nonlinear) MLP
             return nn.Sequential(
                 nn.Linear(in_dim, out_dim),
                 nn.ReLU(),
                 nn.Linear(out_dim, out_dim),
             )
 
-        def make_gin_mlp_linear(in_dim, out_dim):
-            # strictly linear map (no activation)
-            # two linears is still linear; you can replace with nn.Linear(in_dim, out_dim) if preferred
-            return nn.Sequential(
-                nn.Linear(in_dim, out_dim),
-                nn.Linear(out_dim, out_dim),
-            )
-
         first_in = hidden_channels if self.pre_linear else in_channels
         L = int(local_layers)
 
-        def use_rade_at_layer(layer_idx: int) -> bool:
-            if not self.unbiased:
-                return False
-            if self.rade_scope == "all":
-                return True
-            # self.rade_scope == "last"
-            return layer_idx == (L - 1)
+        use_ic = (self.unbiased_mode == "rade-ic")
 
         # -------------------------
         # Build layers
@@ -89,17 +71,13 @@ class MPNNs(torch.nn.Module):
             out_dim = hidden_channels
 
             if gnn == "gin":
-                if use_rade_at_layer(layer_idx):
-                    # If RADE is applied only at LAST layer, make that last GIN MLP linear
-                    if self.rade_scope == "last" and layer_idx == (L - 1):
-                        conv = RADEGINConv(make_gin_mlp_linear(in_dim, out_dim))
-                    else:
-                        conv = RADEGINConv(make_gin_mlp(in_dim, out_dim))
+                if self.unbiased:
+                    conv = RADEGINConv(make_gin_mlp(in_dim, out_dim), ic_mode=use_ic)
                 else:
                     conv = GINConv(make_gin_mlp(in_dim, out_dim))
             else:
-                if use_rade_at_layer(layer_idx):
-                    conv = RADEGCNConv(in_dim, out_dim, bias=True)
+                if self.unbiased:
+                    conv = RADEGCNConv(in_dim, out_dim, bias=True, correct_self_loop=True, ic_mode=use_ic)
                 else:
                     conv = GCNConv(in_dim, out_dim, cached=False, normalize=True)
 
@@ -145,6 +123,7 @@ class MPNNs(torch.nn.Module):
         edge_index_add: Optional[torch.Tensor] = None,
         p: float = 0.0,
         q: float = 0.0,
+        return_embeddings: bool = False,
     ):
         if self.lin_in is not None:
             x = self.lin_in(x)
@@ -164,11 +143,10 @@ class MPNNs(torch.nn.Module):
         )
 
         def _pick_layer_edges(obj, i: int):
+            # FIX: if obj is a tensor (shared), return it directly
             if obj is None:
                 return None
             if _is_list(obj):
-                if self.rade_scope == "last":
-                    return obj[-1]
                 if len(obj) != L:
                     raise ValueError(f"Expected list length={L}, got {len(obj)}")
                 return obj[i]
@@ -179,11 +157,7 @@ class MPNNs(torch.nn.Module):
         for i, conv in enumerate(self.local_convs):
             x_in = x  # for residual
 
-            apply_rade_here = (
-                rade_active
-                and hasattr(conv, "set_graph")  # RADE conv module
-                and (self.rade_scope == "all" or i == (L - 1))
-            )
+            apply_rade_here = rade_active and hasattr(conv, "set_graph")  # RADE conv module
 
             if apply_rade_here:
                 layer_keep = _pick_layer_edges(edge_index_keep, i)
@@ -197,28 +171,30 @@ class MPNNs(torch.nn.Module):
                     q=q,
                 )
             else:
-                # Works for both PyG convs and RADE convs in "clean path"
-                x = conv(x, edge_index_clean)
+                # Clean path:
+                # - For RADE-IC, the conv may add inference correction in eval mode using p,q.
+                if hasattr(conv, "set_graph"):
+                    x = conv(x, edge_index_clean, p=p, q=q)
+                else:
+                    x = conv(x, edge_index_clean)
 
             if self.res:
                 x = x + self.lins[i](x_in)
+            if self.ln:
+                x = self.lns[i](x)
+            elif self.bn:
+                x = self.bns[i](x)
 
-            # In last-layer RADE mode, keep the final mapping linear:
-            # skip LN/BN, ReLU, and dropout after the last layer.
-            skip_last_postproc = (self.unbiased and self.rade_scope == "last" and i == (L - 1))
-
-            if not skip_last_postproc:
-                if self.ln:
-                    x = self.lns[i](x)
-                elif self.bn:
-                    x = self.bns[i](x)
-
-                x = F.relu(x)
-                x = F.dropout(x, p=self.dropout, training=self.training)
+            x = F.relu(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
 
             if self.jk:
                 x_final = x if x_final is None else (x_final + x)
             else:
                 x_final = x
 
-        return self.pred_local(x_final)
+        logits = self.pred_local(x_final)
+        if return_embeddings:
+            return logits, x_final
+        return logits
+
