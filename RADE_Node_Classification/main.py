@@ -38,6 +38,15 @@ parser = argparse.ArgumentParser(description="Training Pipeline for Node Classif
 parser_add_main_args(parser)
 args = parser.parse_args()
 print(args)
+
+# Enforce strict linearity at CLI level (before wandb overrides)
+if getattr(args, "linear", False):
+    args.dropout = 0.0
+    if hasattr(args, "bn"):
+        args.bn = False
+    if hasattr(args, "ln"):
+        args.ln = False
+
 # -----------------------
 # wandb init (optional)
 # -----------------------
@@ -55,15 +64,47 @@ if getattr(args, "wandb", False):
         name=getattr(args, "wandb_name", None) or None,
         tags=tags,
         mode=str(getattr(args, "wandb_mode", "online")),
-        # config=vars(args),  # logs all CLI hyperparameters
     )
 
     for k, v in dict(wandb.config).items():
         if hasattr(args, k):
             setattr(args, k, v)
-
-    # Log the final resolved args (after sweep overrides)
     wandb.config.update(vars(args), allow_val_change=True)
+
+    if getattr(args, "linear", False):
+        args.dropout = 0.0
+        if hasattr(args, "bn"):
+            args.bn = False
+        if hasattr(args, "ln"):
+            args.ln = False
+
+# -----------------------
+# Augmentation technique routing
+# -----------------------
+aug_tech = str(getattr(args, "aug_tech", "rade")).lower().strip()
+if aug_tech not in {"rade", "dropmessage", "dropnode", "none"}:
+    raise ValueError(f"--aug_tech must be one of {{rade, dropmessage, dropnode, none}}. Got {aug_tech}")
+
+def _require_no_rade_contrib(name: str) -> None:
+    if getattr(args, "unbiased", False):
+        raise ValueError(f"--aug_tech={name} must be used with --unbiased False.")
+    if getattr(args, "pq_gradnorm", False):
+        raise ValueError(f"--aug_tech={name} must be used with --pq_gradnorm False.")
+    if str(getattr(args, "aug_mode", "none")).lower().strip() != "none":
+        raise ValueError(f"--aug_tech={name} requires --aug_mode none (edge augmentation disabled).")
+    if getattr(args, "linear", False):
+        raise ValueError(f"--aug_tech={name} is incompatible with --linear (strict linearity).")
+
+# DropMessage must NOT use your RADE contributions
+if aug_tech == "dropmessage":
+    _require_no_rade_contrib("dropmessage")
+
+# DropNode must NOT use your RADE contributions
+if aug_tech == "dropnode":
+    _require_no_rade_contrib("dropnode")
+
+if aug_tech == "none":
+    args.aug_mode = "none"
 
 fix_seed(args.seed)
 
@@ -90,7 +131,7 @@ data, base_split_idx = load_nc_dataset(
 n = int(data.num_nodes)
 e = int(data.edge_index.size(1)) // 2
 d = int(data.x.size(1))
-c = int(data.y.max().item()) + 1  # safe with Data-only loader
+c = int(data.y.max().item()) + 1
 
 print(f"dataset {args.dataset} | num nodes {n} | num edges {e} | num feats {d} | num classes {c}")
 if wandb_run is not None:
@@ -101,8 +142,9 @@ if wandb_run is not None:
 
 
 # Cache clean edges on CPU for fast per-epoch augmentation
-augmentor = BernoulliEdgeAugmentor.from_edge_index(data.edge_index, num_nodes=int(data.num_nodes))
-
+augmentor = None
+if aug_tech == "rade":
+    augmentor = BernoulliEdgeAugmentor.from_edge_index(data.edge_index, num_nodes=int(data.num_nodes))
 
 # -----------------------
 # Build split list for runs
@@ -130,12 +172,10 @@ data = data.to(device)
 model = parse_method(args, n, c, d, device)
 
 # IMPORTANT for RADE-GCN/RADE-GIN:
-# set the clean graph cache ONCE (your model must implement set_graph).
 if getattr(args, "unbiased", False):
     if not hasattr(model, "set_graph"):
         raise RuntimeError("args.unbiased=True but model has no set_graph(). Add it to your model class.")
     model.set_graph(data.edge_index, int(data.num_nodes))
-
 
 criterion = nn.CrossEntropyLoss()
 eval_func = eval_acc_nc
@@ -168,7 +208,7 @@ for run in range(args.runs):
     # (p,q) used for THIS run
     p_eff, q_eff = _enforce_aug_mode(float(args.p), float(args.q), args.aug_mode)
 
-    # Create a fresh tuner per run (prevents EMA/state leakage across runs)
+    # Create a fresh tuner per run
     pq_tuner = None
     if getattr(args, "pq_gradnorm", False):
         if str(args.aug_mode).lower().strip() == "none":
@@ -211,14 +251,20 @@ for run in range(args.runs):
         edge_index_keep = None
         edge_index_add = None
 
-        do_aug = (str(args.aug_mode).lower().strip() != "none") and (p_eff > 0.0 or q_eff > 0.0)
+        dropmessage_rate = float(getattr(args, "dropmessage_rate", 0.0)) if aug_tech == "dropmessage" else 0.0
+        dropnode_rate = float(getattr(args, "dropnode_rate", 0.0)) if aug_tech == "dropnode" else 0.0
+
+        do_aug = (
+            aug_tech == "rade"
+            and (str(args.aug_mode).lower().strip() != "none")
+            and (p_eff > 0.0 or q_eff > 0.0)
+        )
 
         if do_aug:
             if getattr(args, "unbiased", False):
                 base_seed = args.seed + 10_000 * run + epoch
 
                 if str(getattr(args, "mask_sharing", "shared")).lower().strip() == "shared":
-                    # One keep/add mask shared across all layers
                     _, edge_index_keep, edge_index_add, aug_stats = augmentor.augment_edge_indices(
                         p=p_eff,
                         q=q_eff,
@@ -226,9 +272,8 @@ for run in range(args.runs):
                         seed=base_seed,
                         device=device,
                     )
-                    edge_index_aug = data.edge_index  # clean is used in RADE forward
+                    edge_index_aug = data.edge_index
                 else:
-                    # Independent keep/add per layer
                     edge_index_keep = []
                     edge_index_add = []
                     stats_list = []
@@ -252,7 +297,6 @@ for run in range(args.runs):
                     edge_index_aug = data.edge_index
 
             else:
-                # Baseline augmentation: just use edge_index_aug
                 edge_index_aug, aug_stats = augmentor.augment_edge_index(
                     p=p_eff,
                     q=q_eff,
@@ -263,12 +307,16 @@ for run in range(args.runs):
                 )
 
         # -----------------------
-        # Forward (baseline vs RADE)
+        # Forward
         # -----------------------
-        if getattr(args, "unbiased", False) and do_aug:
+        if aug_tech == "dropmessage":
+            logits = model(data.x, data.edge_index, dropmessage_rate=dropmessage_rate)
+        elif aug_tech == "dropnode":
+            logits = model(data.x, data.edge_index, dropnode_rate=dropnode_rate)
+        elif getattr(args, "unbiased", False) and do_aug:
             logits = model(
                 data.x,
-                data.edge_index,  # clean reference graph
+                data.edge_index,
                 edge_index_keep=edge_index_keep,
                 edge_index_add=edge_index_add,
                 p=p_eff,
@@ -283,12 +331,14 @@ for run in range(args.runs):
 
         # -----------------------
         # Evaluation
-        #   - RADE: clean inference
-        #   - RADE-IC: clean + inference correction (uses p_eff,q_eff)
         # -----------------------
         model.eval()
         with torch.no_grad():
-            if getattr(args, "unbiased", False) and str(getattr(args, "unbiased_mode", "rade")) == "rade-ic":
+            if aug_tech == "dropmessage":
+                logits_eval = model(data.x, data.edge_index, dropmessage_rate=0.0)
+            elif aug_tech == "dropnode":
+                logits_eval = model(data.x, data.edge_index, dropnode_rate=0.0)
+            elif getattr(args, "unbiased", False) and str(getattr(args, "unbiased_mode", "rade")) == "rade-ic":
                 logits_eval = model(data.x, data.edge_index, p=p_eff, q=q_eff)
             else:
                 logits_eval = model(data.x, data.edge_index)
@@ -312,12 +362,13 @@ for run in range(args.runs):
                 save_model(args, model, optimizer, run)
 
         # -----------------------
-        # wandb logging (per-epoch)
+        # wandb logging
         # -----------------------
         if wandb_run is not None and (epoch % int(getattr(args, "wandb_log_every", 1)) == 0):
             step = epoch + run * int(args.epochs)
 
             log_dict = {
+                "aug/tech": str(aug_tech),
                 "run": int(run + 1),
                 "epoch": int(epoch),
                 "train/loss": float(loss.item()),
@@ -325,38 +376,55 @@ for run in range(args.runs):
                 "valid/acc": float(result[1]),
                 "test/acc": float(result[2]),
                 "valid/loss": float(result[3].item()) if hasattr(result[3], "item") else float(result[3]),
-                "aug/p": float(p_eff),
-                "aug/q": float(q_eff),
                 "best/valid_acc": float(best_val),
                 "best/test_acc_at_best_valid": float(best_test),
             }
 
-            if aug_stats is not None:
-                # shared-mask stats
-                if "dropped_undir" in aug_stats:
-                    log_dict["aug/dropped_undir"] = float(aug_stats["dropped_undir"])
-                if "added_undir" in aug_stats:
-                    log_dict["aug/added_undir"] = float(aug_stats["added_undir"])
-                # layerwise-mask averages
-                if "dropped_undir_avg" in aug_stats:
-                    log_dict["aug/dropped_undir_avg"] = float(aug_stats["dropped_undir_avg"])
-                if "added_undir_avg" in aug_stats:
-                    log_dict["aug/added_undir_avg"] = float(aug_stats["added_undir_avg"])
+            if aug_tech == "rade":
+                log_dict["aug/p"] = float(p_eff)
+                log_dict["aug/q"] = float(q_eff)
+
+                if aug_stats is not None:
+                    if "dropped_undir" in aug_stats:
+                        log_dict["aug/dropped_undir"] = float(aug_stats["dropped_undir"])
+                    if "added_undir" in aug_stats:
+                        log_dict["aug/added_undir"] = float(aug_stats["added_undir"])
+                    if "dropped_undir_avg" in aug_stats:
+                        log_dict["aug/dropped_undir_avg"] = float(aug_stats["dropped_undir_avg"])
+                    if "added_undir_avg" in aug_stats:
+                        log_dict["aug/added_undir_avg"] = float(aug_stats["added_undir_avg"])
+
+            elif aug_tech == "dropmessage":
+                log_dict["aug/dropmessage_rate"] = float(dropmessage_rate)
+
+            elif aug_tech == "dropnode":
+                log_dict["aug/dropnode_rate"] = float(dropnode_rate)
 
             wandb.log(log_dict, step=step)
 
-
+        # -----------------------
+        # Console print
+        # -----------------------
         if epoch % int(args.display_step) == 0:
             aug_str = ""
-            if aug_stats is not None:
-                if "dropped_undir" in aug_stats and "added_undir" in aug_stats:
-                    dU = aug_stats["dropped_undir"]
-                    aU = aug_stats["added_undir"]
-                    aug_str = f", Drop/Add: -{dU} +{aU} edges"
-                elif "dropped_undir_avg" in aug_stats and "added_undir_avg" in aug_stats:
-                    dU = aug_stats["dropped_undir_avg"]
-                    aU = aug_stats["added_undir_avg"]
-                    aug_str = f", Drop/Add(avg per layer): -{dU:.1f} +{aU:.1f} edges"
+
+            if aug_tech == "rade":
+                if aug_stats is not None:
+                    if "dropped_undir" in aug_stats and "added_undir" in aug_stats:
+                        dU = aug_stats["dropped_undir"]
+                        aU = aug_stats["added_undir"]
+                        aug_str = f", Drop/Add: -{dU} +{aU} edges"
+                    elif "dropped_undir_avg" in aug_stats and "added_undir_avg" in aug_stats:
+                        dU = aug_stats["dropped_undir_avg"]
+                        aU = aug_stats["added_undir_avg"]
+                        aug_str = f", Drop/Add(avg per layer): -{dU:.1f} +{aU:.1f} edges"
+                aug_str += f" (p={p_eff:.4f}, q={q_eff:.6f})"
+
+            elif aug_tech == "dropmessage":
+                aug_str = f" (dropmessage={dropmessage_rate:.3f})"
+
+            elif aug_tech == "dropnode":
+                aug_str = f" (dropnode={dropnode_rate:.3f})"
 
             print(
                 f"Run: {run + 1:02d}, "
@@ -367,21 +435,18 @@ for run in range(args.runs):
                 f"Test: {100 * result[2]:.2f}%, "
                 f"Best Valid: {100 * best_val:.2f}%, "
                 f"Best Test: {100 * best_test:.2f}%"
-                f"{aug_str} "
-                f"(p={p_eff:.4f}, q={q_eff:.6f})"
+                f"{aug_str}"
             )
 
         # -----------------------
-        # Epoch-wise GradNorm update of (p,q) for next epoch
+        # PQ-GradNorm update (RADE only)
         # -----------------------
         if pq_tuner is not None:
             warmup = int(getattr(args, "pq_warmup_epochs", 0))
             every = int(getattr(args, "pq_update_every", 1))
             if (epoch + 1) >= warmup and ((epoch + 1) % every == 0):
-                # Deterministic-but-epoch-varying seed for subset selection and tuner RNG isolation
                 epoch_seed = int(args.seed) + 100000 * int(run) + int(epoch) + int(getattr(args, "pq_seed", 0))
 
-                # IMPORTANT: tune using training-mode gradients (but BN buffers are frozen inside tuner)
                 prev_mode_training = model.training
                 model.train()
 
@@ -396,11 +461,9 @@ for run in range(args.runs):
                     epoch_seed=epoch_seed,
                 )
 
-                # restore mode
                 if not prev_mode_training:
                     model.eval()
 
-                # enforce aug_mode again (robustness)
                 p_new, q_new = _enforce_aug_mode(p_new, q_new, args.aug_mode)
                 p_eff, q_eff = p_new, q_new
 
@@ -425,22 +488,15 @@ for run in range(args.runs):
                         step=(epoch + run * int(args.epochs)),
                     )
 
-
     logger.print_statistics(run)
 
 results = logger.print_statistics()
-
-# -----------------------
-# Save results
-# -----------------------
 save_result(args, results)
 
 if wandb_run is not None:
-    # log multi-run summary (if runs > 1)
     try:
         wandb_run.summary["final_test_mean"] = float(results.mean().item())
         wandb_run.summary["final_test_std"] = float(results.std().item())
     except Exception:
         pass
     wandb.finish()
-

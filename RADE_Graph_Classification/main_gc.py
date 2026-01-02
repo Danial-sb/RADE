@@ -4,7 +4,8 @@ from __future__ import annotations
 import argparse
 import os
 import random
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional, List, Union
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -24,11 +25,19 @@ from pq_gradnorm_gc import PQGradNormTunerGC, PQTunerGCConfig
 import wandb
 
 
+EdgeIndexObj = Union[torch.Tensor, List[torch.Tensor]]
+
+
 def fix_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True)
+    torch.set_deterministic_debug_mode("error")
 
 
 def _make_loaders(
@@ -66,16 +75,18 @@ def _save_checkpoint(args, model, optimizer, run: int, epoch: int, best_valid: f
 
 
 def _maybe_cast_batch_for_linear(batch, *, use_ogb_encoders: bool, use_edge_attr: bool) -> None:
-    """
-    Keep OGB categorical tensors as-is (Atom/Bond encoders expect LongTensor).
-    For TU-style float models (Linear encoder), ensure float.
-    """
     if not use_ogb_encoders:
         if batch.x is not None and not torch.is_floating_point(batch.x):
             batch.x = batch.x.float()
         if use_edge_attr and hasattr(batch, "edge_attr") and (batch.edge_attr is not None):
             if not torch.is_floating_point(batch.edge_attr):
                 batch.edge_attr = batch.edge_attr.float()
+
+
+def _cat_edge_indices(chunks: List[torch.Tensor]) -> torch.Tensor:
+    if not chunks:
+        return torch.empty((2, 0), dtype=torch.long)
+    return torch.cat(chunks, dim=1)
 
 
 def _augment_batch_graphwise(
@@ -88,36 +99,38 @@ def _augment_batch_graphwise(
     device: torch.device,
     use_edge_attr: bool,
     unbiased: bool,
+    mask_sharing: str,
+    local_layers: int,
     safety_max_additions: int = 2_000_000,
-) -> Tuple[object, dict]:
-    """
-    Apply sampling per graph in the batch.
-
-    If unbiased=False:
-      - overwrite data.edge_index with augmented topology (baseline perturbation)
-      - overwrite data.edge_attr accordingly (if enabled)
-
-    If unbiased=True:
-      - keep data.edge_index CLEAN
-      - attach:
-          data.edge_index_keep  (directed kept edges)
-          data.edge_index_add   (directed added edges)
-        so RADE convs can consume masks and be expectation-preserving.
-    """
+) -> Tuple[object, dict, Optional[EdgeIndexObj], Optional[EdgeIndexObj]]:
     if PyGBatch is None:
         raise RuntimeError("torch_geometric.data.Batch is required for batch augmentation.")
 
     mode = str(mode).lower().strip()
+    mask_sharing = str(mask_sharing).lower().strip()
+
     if mode == "none" or ((p <= 0.0) and (q <= 0.0)):
-        return batch.to(device), {"dropped_undir": 0, "added_undir": 0, "graphs": int(getattr(batch, "num_graphs", 0))}
+        stats = {"graphs": int(getattr(batch, "num_graphs", 0)), "p": float(p), "q": float(q), "mode": mode}
+        return batch.to(device), stats, None, None
 
     data_list = batch.to_data_list()
 
     dropped_total = 0
     added_total = 0
+    graphs_in_batch = int(getattr(batch, "num_graphs", len(data_list)))
+
+    if bool(unbiased) and (mask_sharing == "layerwise"):
+        keep_layers: List[List[torch.Tensor]] = [[] for _ in range(int(local_layers))]
+        add_layers: List[List[torch.Tensor]] = [[] for _ in range(int(local_layers))]
+        dropped_layers = [0 for _ in range(int(local_layers))]
+        added_layers = [0 for _ in range(int(local_layers))]
+    else:
+        keep_list: List[torch.Tensor] = []
+        add_list: List[torch.Tensor] = []
+
+    node_offset = 0
 
     for gi, data in enumerate(data_list):
-        # CLEAN tensors (keep as-is for unbiased mode)
         ei_clean = data.edge_index
 
         ea_clean = None
@@ -126,45 +139,119 @@ def _augment_batch_graphwise(
 
         aug = BernoulliEdgeAugmentor.from_graph(ei_clean, int(data.num_nodes), edge_attr=ea_clean)
 
-        ei_aug, ei_keep, ei_add, ea_aug, ea_keep, ea_add, st = aug.augment_edge_indices_with_attr(
-            p=float(p),
-            q=float(q),
-            mode=mode,
-            seed=int(seed) + 97 * gi,
-            device=torch.device("cpu"),  # build on CPU; move whole batch at end
-            safety_max_additions=int(safety_max_additions),
-        )
-
         if bool(unbiased):
-            # keep CLEAN topology for forward; attach masks for RADE convs
-            data.edge_index = ei_clean.to(torch.long)  # keep clean
-            data.edge_index_keep = ei_keep.to(torch.long)
-            data.edge_index_add = ei_add.to(torch.long)
-
-            # keep clean edge_attr aligned with clean edge_index
+            data.edge_index = ei_clean.to(torch.long)
             if use_edge_attr and ea_clean is not None:
                 data.edge_attr = ea_clean
+
+            if mask_sharing == "shared":
+                _, ei_keep, ei_add, _, _, _, st = aug.augment_edge_indices_with_attr(
+                    p=float(p),
+                    q=float(q),
+                    mode=mode,
+                    seed=int(seed) + 97 * gi,
+                    device=torch.device("cpu"),
+                    safety_max_additions=int(safety_max_additions),
+                )
+                ei_keep = ei_keep.to(torch.long)
+                ei_add = ei_add.to(torch.long)
+
+                if ei_keep.numel() > 0:
+                    keep_list.append(ei_keep + int(node_offset))
+                if ei_add.numel() > 0:
+                    add_list.append(ei_add + int(node_offset))
+
+                dropped_total += int(st.get("dropped_undir", 0))
+                added_total += int(st.get("added_undir", 0))
+
+            else:
+                for layer in range(int(local_layers)):
+                    _, ei_keep_l, ei_add_l, _, _, _, st_l = aug.augment_edge_indices_with_attr(
+                        p=float(p),
+                        q=float(q),
+                        mode=mode,
+                        seed=int(seed) + 97 * gi + 1_000_000 * int(layer),
+                        device=torch.device("cpu"),
+                        safety_max_additions=int(safety_max_additions),
+                    )
+                    ei_keep_l = ei_keep_l.to(torch.long)
+                    ei_add_l = ei_add_l.to(torch.long)
+
+                    if ei_keep_l.numel() > 0:
+                        keep_layers[layer].append(ei_keep_l + int(node_offset))
+                    if ei_add_l.numel() > 0:
+                        add_layers[layer].append(ei_add_l + int(node_offset))
+
+                    dropped_layers[layer] += int(st_l.get("dropped_undir", 0))
+                    added_layers[layer] += int(st_l.get("added_undir", 0))
+
         else:
-            # baseline perturbation: overwrite topology (and attrs) to augmented graph
+            ei_aug, _, _, ea_aug, _, _, st = aug.augment_edge_indices_with_attr(
+                p=float(p),
+                q=float(q),
+                mode=mode,
+                seed=int(seed) + 97 * gi,
+                device=torch.device("cpu"),
+                safety_max_additions=int(safety_max_additions),
+            )
             data.edge_index = ei_aug.to(torch.long)
             if use_edge_attr and (ea_aug is not None):
                 data.edge_attr = ea_aug
 
-        dropped_total += int(st.get("dropped_undir", 0))
-        added_total += int(st.get("added_undir", 0))
+            dropped_total += int(st.get("dropped_undir", 0))
+            added_total += int(st.get("added_undir", 0))
+
+        node_offset += int(data.num_nodes)
 
     batch_out = PyGBatch.from_data_list(data_list).to(device)
-    stats = {
-        "graphs": int(getattr(batch_out, "num_graphs", len(data_list))),
-        "dropped_undir": int(dropped_total),
-        "added_undir": int(added_total),
-        "p": float(p),
-        "q": float(q),
-        "mode": mode,
-        "unbiased": bool(unbiased),
-    }
-    return batch_out, stats
 
+    keep_obj: Optional[EdgeIndexObj] = None
+    add_obj: Optional[EdgeIndexObj] = None
+
+    if bool(unbiased):
+        if mask_sharing == "shared":
+            keep_obj = _cat_edge_indices(keep_list).to(device)
+            add_obj = _cat_edge_indices(add_list).to(device)
+            stats = {
+                "graphs": int(graphs_in_batch),
+                "dropped_undir": int(dropped_total),
+                "added_undir": int(added_total),
+                "p": float(p),
+                "q": float(q),
+                "mode": mode,
+                "unbiased": True,
+                "mask_sharing": "shared",
+            }
+        else:
+            keep_obj = [_cat_edge_indices(keep_layers[l]).to(device) for l in range(int(local_layers))]
+            add_obj = [_cat_edge_indices(add_layers[l]).to(device) for l in range(int(local_layers))]
+
+            dropped_avg = float(sum(dropped_layers)) / float(max(int(local_layers), 1))
+            added_avg = float(sum(added_layers)) / float(max(int(local_layers), 1))
+
+            stats = {
+                "graphs": int(graphs_in_batch),
+                "dropped_undir_avg": float(dropped_avg),
+                "added_undir_avg": float(added_avg),
+                "p": float(p),
+                "q": float(q),
+                "mode": mode,
+                "unbiased": True,
+                "mask_sharing": "layerwise",
+            }
+    else:
+        stats = {
+            "graphs": int(graphs_in_batch),
+            "dropped_undir": int(dropped_total),
+            "added_undir": int(added_total),
+            "p": float(p),
+            "q": float(q),
+            "mode": mode,
+            "unbiased": False,
+            "mask_sharing": "na",
+        }
+
+    return batch_out, stats, keep_obj, add_obj
 
 
 def _mean(xs) -> float:
@@ -172,23 +259,35 @@ def _mean(xs) -> float:
         return 0.0
     return float(sum(xs) / len(xs))
 
+
 def print_training_banner(args, model) -> None:
+    aug_tech = str(getattr(args, "aug_tech", "rade")).lower().strip()
     aug_mode = str(getattr(args, "aug_mode", "none")).lower().strip()
     p0 = float(getattr(args, "p", 0.0))
     q0 = float(getattr(args, "q", 0.0))
-    aug_on = (aug_mode != "none") and ((p0 > 0.0) or (q0 > 0.0))
 
     unbiased = bool(getattr(args, "unbiased", False))
     unbiased_mode = str(getattr(args, "unbiased_mode", "rade")).lower().strip() if unbiased else "off"
     pq_on = bool(getattr(args, "pq_gradnorm", False))
+    mask_sharing = str(getattr(args, "mask_sharing", "shared")).lower().strip()
+    if not (unbiased and aug_tech == "rade" and aug_mode != "none" and ((p0 > 0.0) or (q0 > 0.0))):
+        mask_sharing = "na"
 
     gnn = getattr(getattr(model, "cfg", None), "gnn", None) or getattr(args, "gnn", "unknown")
 
+    extra = ""
+    if aug_tech == "dropmessage":
+        extra = f" | dropmessage_rate={float(getattr(args, 'dropmessage_rate', 0.0)):.3f}"
+    elif aug_tech == "dropnode":
+        extra = f" | dropnode_rate={float(getattr(args, 'dropnode_rate', 0.0)):.3f}"
+
     print(
-        f"[GC] model={model.__class__.__name__} gnn={gnn} | "
-        f"aug={'ON' if aug_on else 'OFF'}(mode={aug_mode}, p={p0:.4g}, q={q0:.4g}) | "
+        f"[GC] tech={aug_tech} model={model.__class__.__name__} gnn={gnn} | "
+        f"aug_mode={aug_mode}(p={p0:.4g}, q={q0:.4g}) | "
         f"unbiased={'ON' if unbiased else 'OFF'}({unbiased_mode}) | "
+        f"mask={mask_sharing} | "
         f"gradnorm={'ON' if pq_on else 'OFF'}"
+        f"{extra}"
     )
     print(model, flush=True)
 
@@ -197,6 +296,45 @@ def main():
     parser = argparse.ArgumentParser()
     parser_add_gc_args(parser)
     args = parser.parse_args()
+
+    # Defensive linear enforcement
+    if getattr(args, "linear", False):
+        args.dropout = 0.0
+        if hasattr(args, "bn"):
+            args.bn = False
+
+    # -----------------------
+    # Augmentation technique routing (NC style)
+    # -----------------------
+    aug_tech = str(getattr(args, "aug_tech", "rade")).lower().strip()
+    if aug_tech not in {"rade", "dropmessage", "dropnode", "none"}:
+        raise ValueError(f"--aug_tech must be one of {{rade, dropmessage, dropnode, none}}. Got {aug_tech}")
+
+    def _force_disable_edge_aug() -> None:
+        # Always disable edge augmentation knobs (and zero p/q for clarity)
+        if str(getattr(args, "aug_mode", "none")).lower().strip() != "none":
+            args.aug_mode = "none"
+        if hasattr(args, "p"):
+            args.p = 0.0
+        if hasattr(args, "q"):
+            args.q = 0.0
+
+    if aug_tech in {"dropmessage", "dropnode"}:
+        # Keep strict exclusions (unbiased/pq/linear) but *auto-fix* aug_mode.
+        if bool(getattr(args, "unbiased", False)):
+            raise ValueError(f"--aug_tech={aug_tech} must be used with --unbiased False.")
+        if bool(getattr(args, "pq_gradnorm", False)):
+            raise ValueError(f"--aug_tech={aug_tech} must be used with --pq_gradnorm False.")
+        if bool(getattr(args, "linear", False)):
+            raise ValueError(f"--aug_tech={aug_tech} is incompatible with --linear (strict linearity).")
+        _force_disable_edge_aug()
+
+    elif aug_tech == "none":
+        args.unbiased = False
+        args.pq_gradnorm = False
+        _force_disable_edge_aug()
+
+    # else: aug_tech == "rade" -> leave args as-is
 
     # device
     if args.cpu or (not torch.cuda.is_available()):
@@ -236,23 +374,25 @@ def main():
     if loss_type == "ce":
         criterion = nn.CrossEntropyLoss()
     elif loss_type == "bce":
-        criterion = nn.BCEWithLogitsLoss(reduction="none")  # training uses masked_bce_with_logits
+        criterion = nn.BCEWithLogitsLoss(reduction="none")
     else:
         raise ValueError(f"Unsupported loss={loss_type}")
 
-    # augmentation config (safe defaults if parse_gc not updated yet)
+    # augmentation config (RADE only)
     aug_mode = str(getattr(args, "aug_mode", "none")).lower().strip()
     safety_max_additions = int(getattr(args, "safety_max_additions", 2_000_000))
+    mask_sharing = str(getattr(args, "mask_sharing", "shared")).lower().strip()
+    if mask_sharing not in {"shared", "layerwise"}:
+        raise ValueError(f"mask_sharing must be 'shared' or 'layerwise'. Got {mask_sharing}")
 
-    # p/q initialization (support both new and legacy flag names)
-    p_init = float(getattr(args, "p_init", getattr(args, "p", 0.0)))
-    q_init = float(getattr(args, "q_init", getattr(args, "q", 0.0)))
-
-    # RADE variant label (used for PQ tuner; defaults to 'rade')
+    p_init = float(getattr(args, "p", 0.0))
+    q_init = float(getattr(args, "q", 0.0))
     unbiased_mode = str(getattr(args, "unbiased_mode", "rade")).lower().strip()
 
-    # PQ-GradNorm settings (safe defaults if parse_gc not updated yet)
+    # PQ-GradNorm settings (RADE only)
     pq_enabled = bool(getattr(args, "pq_gradnorm", False))
+    if pq_enabled and aug_tech != "rade":
+        raise ValueError("--pq_gradnorm is only valid with --aug_tech=rade.")
     pq_warmup = int(getattr(args, "pq_warmup_epochs", 0))
     pq_every = int(getattr(args, "pq_update_every", 1))
     pq_grid = int(getattr(args, "pq_grid_size", 11))
@@ -260,24 +400,22 @@ def main():
     pq_q_max = float(getattr(args, "pq_q_max", 1e-3))
     pq_ema = float(getattr(args, "pq_ema", 0.9))
 
-    if pq_enabled and (PQGradNormTunerGC is None or PQTunerGCConfig is None):
-        raise RuntimeError("pq_gradnorm requested but pq_gradnorm_gc.py is not importable.")
-
     all_best_tests = []
 
     for run in range(int(args.runs)):
         fix_seed(int(args.seed) + run)
 
+        # IMPORTANT: pass aug_tech into model via parse_method_gc(cfg.aug_tech)
         model = parse_method_gc(args, in_channels=in_dim, out_channels=out_dim, device=device)
         print_training_banner(args, model)
 
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-        # model behavior flags
         use_ogb_encoders = bool(getattr(args, "use_ogb_encoders", False))
         use_edge_attr = bool(getattr(args, "use_edge_attr", False))
 
-        # PQ tuner (run-level)
+        local_layers = int(getattr(getattr(model, "cfg", None), "local_layers", getattr(args, "local_layers", 3)))
+
         pq_tuner = None
         if pq_enabled:
             pq_cfg = PQTunerGCConfig(
@@ -289,12 +427,11 @@ def main():
             )
             pq_tuner = PQGradNormTunerGC(
                 gnn=str(args.gnn),
-                variant=unbiased_mode,   # 'rade' or 'rade-ic'
+                variant=unbiased_mode,
                 pooling=str(args.pooling),
                 cfg=pq_cfg,
             )
 
-        # epoch-wise p/q state (used for augmentation THIS epoch; updated for NEXT epoch)
         p_cur = float(p_init)
         q_cur = float(q_init)
 
@@ -307,30 +444,40 @@ def main():
             loss_sum = 0.0
             n_graphs = 0
 
-            # enforce aug_mode
+            # enforce aug_mode (only relevant for RADE)
             p = float(p_cur)
             q = float(q_cur)
-            if aug_mode == "drop":
-                q = 0.0
-            elif aug_mode == "add":
-                p = 0.0
-            elif aug_mode == "none":
+            if aug_tech != "rade":
                 p, q = 0.0, 0.0
+            else:
+                if aug_mode == "drop":
+                    q = 0.0
+                elif aug_mode == "add":
+                    p = 0.0
+                elif aug_mode == "none":
+                    p, q = 0.0, 0.0
 
-            dropped_epoch = 0
-            added_epoch = 0
+            dropped_epoch_acc = 0.0
+            added_epoch_acc = 0.0
             seen_graphs_epoch = 0
+            stats_are_layer_avg = (bool(getattr(args, "unbiased", False)) and (mask_sharing == "layerwise"))
+
+            dropmessage_rate = float(getattr(args, "dropmessage_rate", 0.0)) if aug_tech == "dropmessage" else 0.0
+            dropnode_rate = float(getattr(args, "dropnode_rate", 0.0)) if aug_tech == "dropnode" else 0.0
 
             for step, batch in enumerate(loaders["train"]):
                 optimizer.zero_grad(set_to_none=True)
 
-                # keep batch on CPU for augmentation; move to device after
                 _maybe_cast_batch_for_linear(batch, use_ogb_encoders=use_ogb_encoders, use_edge_attr=use_edge_attr)
 
-                # Apply augmentation (training only)
-                if aug_mode != "none" and ((p > 0.0) or (q > 0.0)):
+                edge_index_keep_obj: Optional[EdgeIndexObj] = None
+                edge_index_add_obj: Optional[EdgeIndexObj] = None
+
+                # Apply RADE augmentation only if selected
+                do_aug = (aug_tech == "rade") and (aug_mode != "none") and ((p > 0.0) or (q > 0.0))
+                if do_aug:
                     seed_step = int(args.seed) + 10_000 * run + 1_000 * epoch + step
-                    batch, st = _augment_batch_graphwise(
+                    batch, st, edge_index_keep_obj, edge_index_add_obj = _augment_batch_graphwise(
                         batch,
                         p=p,
                         q=q,
@@ -338,33 +485,69 @@ def main():
                         seed=seed_step,
                         device=device,
                         use_edge_attr=use_edge_attr,
-                        unbiased=bool(args.unbiased),
+                        unbiased=bool(getattr(args, "unbiased", False)),
+                        mask_sharing=mask_sharing,
+                        local_layers=local_layers,
                         safety_max_additions=safety_max_additions,
                     )
-                    dropped_epoch += int(st.get("dropped_undir", 0))
-                    added_epoch += int(st.get("added_undir", 0))
+
+                    if "dropped_undir" in st:
+                        dropped_epoch_acc += float(st["dropped_undir"])
+                        added_epoch_acc += float(st["added_undir"])
+                        stats_are_layer_avg = False
+                    elif "dropped_undir_avg" in st:
+                        dropped_epoch_acc += float(st["dropped_undir_avg"])
+                        added_epoch_acc += float(st["added_undir_avg"])
+                        stats_are_layer_avg = True
+
                     seen_graphs_epoch += int(st.get("graphs", 0))
                 else:
                     batch = batch.to(device)
 
                 _maybe_cast_batch_for_linear(batch, use_ogb_encoders=use_ogb_encoders, use_edge_attr=use_edge_attr)
-
                 edge_attr = batch.edge_attr if (use_edge_attr and hasattr(batch, "edge_attr")) else None
 
-                # If unbiased: pass keep/add masks so RADE path runs (expectation-preserving)
-                edge_index_keep = getattr(batch, "edge_index_keep", None)
-                edge_index_add = getattr(batch, "edge_index_add", None)
+                edge_index_keep_pass = None
+                edge_index_add_pass = None
+                if bool(getattr(args, "unbiased", False)) and do_aug:
+                    edge_index_keep_pass = edge_index_keep_obj
+                    edge_index_add_pass = edge_index_add_obj
 
-                out = model(
-                    batch.x,
-                    batch.edge_index,  # CLEAN for unbiased=True; AUG for unbiased=False baseline
-                    batch.batch,
-                    edge_attr=edge_attr,
-                    edge_index_keep=edge_index_keep,
-                    edge_index_add=edge_index_add,
-                    p=float(p),
-                    q=float(q),
-                )
+                # -------------------------
+                # Forward routing
+                # -------------------------
+                if aug_tech == "dropmessage":
+                    out = model(
+                        batch.x,
+                        batch.edge_index,
+                        batch.batch,
+                        edge_attr=edge_attr,
+                        dropmessage_rate=float(dropmessage_rate),
+                        p=0.0,
+                        q=0.0,
+                    )
+                elif aug_tech == "dropnode":
+                    out = model(
+                        batch.x,
+                        batch.edge_index,
+                        batch.batch,
+                        edge_attr=edge_attr,
+                        dropnode_rate=float(dropnode_rate),
+                        p=0.0,
+                        q=0.0,
+                    )
+                else:
+                    # RADE (unbiased or baseline augmented-edge)
+                    out = model(
+                        batch.x,
+                        batch.edge_index,
+                        batch.batch,
+                        edge_attr=edge_attr,
+                        edge_index_keep=edge_index_keep_pass,
+                        edge_index_add=edge_index_add_pass,
+                        p=float(p),
+                        q=float(q),
+                    )
 
                 y = batch.y
                 if loss_type == "ce":
@@ -388,6 +571,11 @@ def main():
 
             train_loss = loss_sum / max(n_graphs, 1)
 
+            # For eval: keep p/q only for RADE-IC correction when relevant, otherwise 0 is fine.
+            p_eval, q_eval = 0.0, 0.0
+            if (aug_tech == "rade") and bool(getattr(args, "unbiased", False)) and (unbiased_mode == "rade-ic"):
+                p_eval, q_eval = float(p), float(q)
+
             train_score, valid_score, test_score, valid_loss = evaluate_splits(
                 model,
                 loaders,
@@ -396,8 +584,8 @@ def main():
                 metric=metric,
                 use_edge_attr=use_edge_attr,
                 device=device,
-                p=float(p),
-                q=float(q),
+                p=float(p_eval),
+                q=float(q_eval),
             )
 
             if valid_score > best_valid:
@@ -407,9 +595,7 @@ def main():
                 if args.save_model:
                     _save_checkpoint(args, model, optimizer, run=run + 1, epoch=epoch, best_valid=best_valid)
 
-            # -------------------------
-            # PQ-GradNorm update (end of epoch): batch-wise solve, epoch average -> (p_cur,q_cur) for NEXT epoch
-            # -------------------------
+            # PQ-GradNorm update (RADE only)
             pq_info = None
             if pq_enabled and (epoch >= pq_warmup) and (pq_every > 0) and ((epoch % pq_every) == 0):
                 p_bests, q_bests = [], []
@@ -417,7 +603,9 @@ def main():
 
                 for b, batch_tune in enumerate(loaders["train"]):
                     batch_tune = batch_tune.to(device)
-                    _maybe_cast_batch_for_linear(batch_tune, use_ogb_encoders=use_ogb_encoders, use_edge_attr=use_edge_attr)
+                    _maybe_cast_batch_for_linear(
+                        batch_tune, use_ogb_encoders=use_ogb_encoders, use_edge_attr=use_edge_attr
+                    )
 
                     p_b, q_b, info = pq_tuner.suggest_pq_batch(
                         model=model,
@@ -440,7 +628,6 @@ def main():
                 p_next = float(pq_ema) * float(p_cur) + (1.0 - float(pq_ema)) * float(p_hat)
                 q_next = float(pq_ema) * float(q_cur) + (1.0 - float(pq_ema)) * float(q_hat)
 
-                # enforce aug_mode
                 if aug_mode == "drop":
                     q_next = 0.0
                 elif aug_mode == "add":
@@ -448,7 +635,6 @@ def main():
                 elif aug_mode == "none":
                     p_next, q_next = 0.0, 0.0
 
-                # clamp
                 p_next = float(max(0.0, min(p_next, float(pq_p_max))))
                 q_next = float(max(0.0, min(q_next, float(pq_q_max))))
 
@@ -464,20 +650,33 @@ def main():
 
                 p_cur, q_cur = p_next, q_next
 
-            # -------------------------
             # print / wandb
-            # -------------------------
             if (epoch % int(args.display_step)) == 0:
                 msg = (
-                    f"[GC] run={run+1:02d} epoch={epoch:03d} "
+                    f"[GC] tech={aug_tech} run={run+1:02d} epoch={epoch:03d} "
                     f"loss={train_loss:.4f} "
                     f"train_{metric}={train_score:.4f} "
                     f"valid_{metric}={valid_score:.4f} "
                     f"test_{metric}={test_score:.4f} "
                     f"best_valid={best_valid:.4f} best_test@best={best_test:.4f} (ep={best_epoch})"
                 )
-                if aug_mode != "none" and ((p > 0.0) or (q > 0.0)):
-                    msg += f" | drop/add(undir): -{dropped_epoch} +{added_epoch} (p={p:.4g}, q={q:.4g})"
+
+                if aug_tech == "rade" and aug_mode != "none" and ((p > 0.0) or (q > 0.0)):
+                    if stats_are_layer_avg:
+                        msg += (
+                            f" | drop/add(avg per layer, undir): -{dropped_epoch_acc:.1f} +{added_epoch_acc:.1f} "
+                            f"(p={p:.4g}, q={q:.4g})"
+                        )
+                    else:
+                        msg += (
+                            f" | drop/add(undir): -{int(dropped_epoch_acc)} +{int(added_epoch_acc)} "
+                            f"(p={p:.4g}, q={q:.4g})"
+                        )
+                elif aug_tech == "dropmessage":
+                    msg += f" | dropmessage={dropmessage_rate:.3f}"
+                elif aug_tech == "dropnode":
+                    msg += f" | dropnode={dropnode_rate:.3f}"
+
                 if pq_info is not None:
                     msg += (
                         f"\n[PQ-GradNorm-GC] epoch={epoch:03d} "
@@ -493,6 +692,7 @@ def main():
                 log_obj = {
                     "epoch": epoch,
                     "run": run,
+                    "aug/tech": str(aug_tech),
                     "train/loss": train_loss,
                     "valid/loss": valid_loss,
                     f"train/{metric}": train_score,
@@ -501,18 +701,31 @@ def main():
                     f"best/valid_{metric}": best_valid,
                     f"best/test_at_best_valid_{metric}": best_test,
                     "best/epoch": best_epoch,
-                    "aug/mode": aug_mode,
-                    "aug/p_epoch": float(p),
-                    "aug/q_epoch": float(q),
                 }
-                if aug_mode != "none" and ((p > 0.0) or (q > 0.0)):
+
+                if aug_tech == "rade":
                     log_obj.update(
                         {
-                            "aug/dropped_undir_epoch": int(dropped_epoch),
-                            "aug/added_undir_epoch": int(added_epoch),
-                            "aug/graphs_epoch": int(seen_graphs_epoch),
+                            "aug/mode": aug_mode,
+                            "aug/p_epoch": float(p),
+                            "aug/q_epoch": float(q),
+                            "aug/mask_sharing": str(mask_sharing),
                         }
                     )
+                    if aug_mode != "none" and ((p > 0.0) or (q > 0.0)):
+                        log_obj["aug/graphs_epoch"] = int(seen_graphs_epoch)
+                        if stats_are_layer_avg:
+                            log_obj["aug/dropped_undir_avg_epoch"] = float(dropped_epoch_acc)
+                            log_obj["aug/added_undir_avg_epoch"] = float(added_epoch_acc)
+                        else:
+                            log_obj["aug/dropped_undir_epoch"] = int(dropped_epoch_acc)
+                            log_obj["aug/added_undir_epoch"] = int(added_epoch_acc)
+
+                elif aug_tech == "dropmessage":
+                    log_obj["aug/dropmessage_rate"] = float(dropmessage_rate)
+                elif aug_tech == "dropnode":
+                    log_obj["aug/dropnode_rate"] = float(dropnode_rate)
+
                 if pq_info is not None:
                     log_obj.update(
                         {
@@ -525,6 +738,7 @@ def main():
                             "pq/q_next": float(pq_info["q_next"]),
                         }
                     )
+
                 wandb.log(log_obj)
 
         all_best_tests.append(best_test)

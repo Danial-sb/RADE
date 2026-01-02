@@ -14,12 +14,14 @@ def parse_method_gc(args, in_channels: int, out_channels: int, device):
         local_layers=args.local_layers,
         hidden_channels=args.hidden_channels,
         dropout=args.dropout,
-        bn=bool(getattr(args, "bn", False)),  # <--- NEW
-        use_ogb_encoders=args.use_ogb_encoders,
-        use_edge_attr=args.use_edge_attr,
-        unbiased=bool(args.unbiased),
-        unbiased_mode=str(args.unbiased_mode),
+        bn=bool(getattr(args, "bn", False)),
+        use_ogb_encoders=bool(getattr(args, "use_ogb_encoders", False)),
+        use_edge_attr=bool(getattr(args, "use_edge_attr", False)),
+        unbiased=bool(getattr(args, "unbiased", False)),
+        unbiased_mode=str(getattr(args, "unbiased_mode", "rade")),
         correct_self_loop=True,
+        linear=bool(getattr(args, "linear", False)),
+        aug_tech=str(getattr(args, "aug_tech", "rade")),
     )
     model = GraphMPNN(in_channels=in_channels, out_channels=out_channels, cfg=cfg).to(device)
     return model
@@ -64,14 +66,48 @@ def parser_add_gc_args(parser):
     parser.add_argument("--hidden_channels", type=int, default=32)
     parser.add_argument("--local_layers", type=int, default=3)
     parser.add_argument("--dropout", type=float, default=0.0)
-
-    parser.add_argument("--bn", action="store_true", help="Enable BatchNorm1d after each conv.")  # <--- NEW
-
+    parser.add_argument("--bn", action="store_true", help="Enable BatchNorm1d after each conv.")
+    parser.add_argument(
+        "--linear",
+        action="store_true",
+        help="Use the linear version of the model (no activations, no BN, no dropout; GIN uses linear MLP).",
+    )
     parser.add_argument("--use_ogb_encoders", action="store_true")
     parser.add_argument("--use_edge_attr", action="store_true")
 
+    # -----------------------
+    # Augmentation selector (NC style)
+    # -----------------------
+    parser.add_argument(
+        "--aug_tech",
+        type=str,
+        default="none",
+        choices=["rade", "dropmessage", "dropnode", "none"],
+        help="Which augmentation family to use. "
+             "'rade' uses your edge drop/add pipeline. "
+             "'dropmessage' uses message dropout (no RADE/unbiased/gradnorm). "
+             "'dropnode' uses node-wise feature masking (no RADE/unbiased/gradnorm). "
+             "'none' is clean training.",
+    )
+
+    # DropMessage hyperparameter
+    parser.add_argument(
+        "--dropmessage_rate",
+        type=float,
+        default=0.4,
+        help="DropMessage rate (message dropout probability). Used only when --aug_tech=dropmessage.",
+    )
+
+    # DropNode hyperparameter (your current style: node-wise feature masking + rescale)
+    parser.add_argument(
+        "--dropnode_rate",
+        type=float,
+        default=0.5,
+        help="DropNode rate (node dropout probability). Used only when --aug_tech=dropnode.",
+    )
+
     # -----------------
-    # augmentation (training-time only; applied in main_gc.py)
+    # RADE augmentation
     # -----------------
     parser.add_argument(
         "--aug_mode",
@@ -90,19 +126,28 @@ def parser_add_gc_args(parser):
     )
 
     # RADE controls (GC)
-    parser.add_argument("--unbiased", action="store_true")
+    parser.add_argument("--unbiased", action="store_true",
+                        help="Use expectation-preserving (unbiased) RADE aggregation.")
     parser.add_argument("--unbiased_mode", type=str, default="rade-ic", choices=["rade", "rade-ic"])
+    parser.add_argument(
+        "--mask_sharing",
+        type=str,
+        default="shared",
+        choices=["shared", "layerwise"],
+        help="RADE only: 'shared' uses one keep/add mask across all layers; "
+             "'layerwise' samples independent keep/add per layer per epoch.",
+    )
 
-    # PQ-GradNorm (graph classification)
+    # PQ-GradNorm (graph classification) -- RADE only
     parser.add_argument("--pq_gradnorm", action="store_true",
-                        help="Enable PQ-GradNorm tuning for graph classification.")
-    parser.add_argument("--pq_warmup_epochs", type=int, default=0,
+                        help="Enable PQ-GradNorm tuning for graph classification (RADE only).")
+    parser.add_argument("--pq_warmup_epochs", type=int, default=10,
                         help="Warmup epochs before PQ tuning starts.")
     parser.add_argument("--pq_update_every", type=int, default=1,
                         help="Run PQ tuning every K epochs.")
     parser.add_argument("--pq_grid_size", type=int, default=11,
                         help="Grid resolution for p and q.")
-    parser.add_argument("--pq_p_max", type=float, default=0.8,
+    parser.add_argument("--pq_p_max", type=float, default=0.5,
                         help="Maximum p searched by PQ tuner.")
     parser.add_argument("--pq_q_max", type=float, default=1e-3,
                         help="Maximum q searched by PQ tuner.")

@@ -1,0 +1,36 @@
+program: main_gc.py
+method: grid
+metric:
+  name: valid/metric
+  goal: maximize
+parameters:
+  dataset:
+    values: [mutag]
+  gnn:
+    values: [gin, gcn]
+  pooling:
+    values: [sum]
+  hidden_channels:
+    values: [32]
+  local_layers:
+    values: [3]
+  lr:
+    values: [0.001]
+  weight_decay:
+    values: [0.0]
+  aug_mode:
+    values: [both]
+  p:
+    values: [0.05]
+  q:
+    values: [1e-4]
+command:
+  - ${env}
+  - python
+  - main_gc.py
+  - --wandb
+  - --wandb_project
+  - rade-gc
+  - --runs
+  - "1"
+  - ${args}
