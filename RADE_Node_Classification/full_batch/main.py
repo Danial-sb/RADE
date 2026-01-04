@@ -235,6 +235,9 @@ for run in range(args.runs):
 
     best_val = float("-inf")
     best_test = float("-inf")
+    patience = int(getattr(args, "patience", 100))
+    epochs_no_improve = 0
+    best_epoch = -1
 
     if args.save_model:
         save_model(args, model, optimizer, run)
@@ -355,11 +358,16 @@ for run in range(args.runs):
         )
         logger.add_result(run, result[:4])
 
-        if result[1] > best_val:
-            best_val = result[1]
-            best_test = result[2]
+        improved = (result[1] > best_val)
+        if improved:
+            best_val = float(result[1])
+            best_test = float(result[2])
+            best_epoch = int(epoch)
+            epochs_no_improve = 0
             if args.save_model:
                 save_model(args, model, optimizer, run)
+        else:
+            epochs_no_improve += 1
 
         # -----------------------
         # wandb logging
@@ -437,6 +445,34 @@ for run in range(args.runs):
                 f"Best Test: {100 * best_test:.2f}%"
                 f"{aug_str}"
             )
+
+        # -----------------------
+        # Early stopping trigger
+        # -----------------------
+        if patience > 0 and epochs_no_improve >= patience:
+            stop_epoch = epoch + 1
+            best_epoch_disp = best_epoch + 1 if best_epoch >= 0 else -1
+            msg = (
+                f"[EarlyStop] run={run + 1:02d} stopping at epoch {stop_epoch:03d} "
+                f"(no val improvement for {patience} epochs). "
+                f"Best val={best_val:.4f} at epoch {best_epoch_disp:03d}, "
+                f"test@best={best_test:.4f}."
+            )
+            print(msg)
+
+            if wandb_run is not None:
+                step = epoch + run * int(args.epochs)
+                wandb.log(
+                    {
+                        "early_stop/patience": int(patience),
+                        "early_stop/stop_epoch": int(stop_epoch),
+                        "early_stop/best_epoch": int(best_epoch_disp),
+                        "early_stop/best_val": float(best_val),
+                        "early_stop/best_test_at_best_val": float(best_test),
+                    },
+                    step=step,
+                )
+            break
 
         # -----------------------
         # PQ-GradNorm update (RADE only)

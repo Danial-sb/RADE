@@ -28,20 +28,30 @@ class Logger(object):
             print(f'Final Train: {result[ind, 0]:.2f}')
             print(f'Final Test: {result[ind, 2]:.2f}')
             self.test=result[ind, 2]
-        else:
-            result = 100 * torch.tensor(self.results)
 
+        else:
+            # NOTE: runs may have different lengths under early stopping.
+            # Do NOT do torch.tensor(self.results) (ragged list). Handle per-run.
             best_results = []
-            for r in result:
+
+            for run_list in self.results:
+                if len(run_list) == 0:
+                    raise RuntimeError("Logger has an empty run (no epochs logged).")
+
+                r = 100 * torch.tensor(run_list)  # shape: [T, 4], T can vary per run
+
                 train1 = r[:, 0].max().item()
                 test1 = r[:, 2].max().item()
                 valid = r[:, 1].max().item()
+
                 if mode == 'max_acc':
-                    train2 = r[r[:, 1].argmax(), 0].item()
-                    test2 = r[r[:, 1].argmax(), 2].item()
+                    idx = r[:, 1].argmax().item()
                 else:
-                    train2 = r[r[:, 3].argmin(), 0].item()
-                    test2 = r[r[:, 3].argmin(), 2].item()
+                    idx = r[:, 3].argmin().item()
+
+                train2 = r[idx, 0].item()
+                test2 = r[idx, 2].item()
+
                 best_results.append((train1, test1, valid, train2, test2))
 
             best_result = torch.tensor(best_results)
@@ -58,13 +68,14 @@ class Logger(object):
             r = best_result[:, 4]
             print(f'   Final Test: {r.mean():.2f} ± {r.std():.2f}')
 
-            self.test=r.mean()
+            self.test = r.mean()
             return best_result[:, 4]
 
+
     def output(self,out_path,info):
-        with open(out_path,'a') as f:
-            f.write(info)
-            f.write(f'test acc:{self.test}\n')
+            with open(out_path,'a') as f:
+                f.write(info)
+                f.write(f'test acc:{self.test}\n')
 
 import os
 def save_model(args, model, optimizer, run):
