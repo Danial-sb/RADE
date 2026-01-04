@@ -166,7 +166,7 @@ class PQGradNormTunerGC:
     """
     Batch-wise PQ-GradNorm matcher for graph classification.
 
-    - For each mini-batch: find (p_b, q_b) by matching ||∇L_data|| and ||∇R(p,q)||.
+    - For each mini_batch: find (p_b, q_b) by matching ||∇L_data|| and ||∇R(p,q)||.
     - Caller should average batch-wise solutions across the epoch to obtain (p^{t+1}, q^{t+1}).
 
     Notes:
@@ -335,7 +335,7 @@ class PQGradNormTunerGC:
         seed: int,
     ) -> Tuple[float, float, Dict[str, float]]:
         """
-        Returns (p_best, q_best, info) for THIS mini-batch.
+        Returns (p_best, q_best, info) for THIS mini_batch.
 
         Caller should average (p_best, q_best) across batches to obtain epoch-level (p^{t+1}, q^{t+1}).
         """

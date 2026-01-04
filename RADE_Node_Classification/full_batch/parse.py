@@ -30,8 +30,8 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--dataset",
         type=str,
-        default="citeseer",
-        choices=["cora", "citeseer", "pubmed", "computer", "cs", "physics", "flickr", "ogbn-arxiv"],
+        default="cora",
+        choices=["cora", "citeseer", "pubmed", "cs", "computer", "physics", "flickr", "ogbn-arxiv"],
         help="Dataset name (must match nc_datasets_simple.py)",
     )
     parser.add_argument(
@@ -42,12 +42,12 @@ def parser_add_main_args(parser):
     )
 
     # system
-    parser.add_argument("--device", type=int, default=0, help="GPU id (default: 0)")
+    parser.add_argument("--device", type=int, default=3, help="GPU id (default: 0)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cpu", action="store_true")
 
     # training schedule
-    parser.add_argument("--epochs", type=int, default=500, help="number of training epochs")
+    parser.add_argument("--epochs", type=int, default=1000, help="number of training epochs")
     parser.add_argument("--runs", type=int, default=5, help="number of distinct runs")
 
     # split control (used only for datasets that are random-split in the loader)
@@ -69,9 +69,9 @@ def parser_add_main_args(parser):
     # model
     parser.add_argument("--model", type=str, default="MPNN", choices=["MPNN"])
     parser.add_argument("--gnn", type=str, default="gin", choices=["gcn", "gin"])
-    parser.add_argument("--hidden_channels", type=int, default=512)
-    parser.add_argument("--local_layers", type=int, default=2)
-    parser.add_argument("--pre_linear", action="store_true")
+    parser.add_argument("--hidden_channels", type=int, default=256)
+    parser.add_argument("--local_layers", type=int, default=3)
+    parser.add_argument("--pre_linear", type=bool, default=True)
     parser.add_argument("--res", action="store_true")
     parser.add_argument("--ln", action="store_true")
     parser.add_argument("--bn", action="store_true")
@@ -120,12 +120,12 @@ def parser_add_main_args(parser):
     )
 
     # RADE augmentation args
-    parser.add_argument("--aug_mode", type=str, default="both",
+    parser.add_argument("--aug_mode", type=str, default="none",
                         choices=["none", "drop", "add", "both"],
                         help="Graph augmentation mode per epoch.")
     parser.add_argument("--p", type=float, default=0.1,
                         help="Edge drop probability for edges (i,j) in E.")
-    parser.add_argument("--q", type=float, default=0.000143,
+    parser.add_argument("--q", type=float, default=0.0000143,
                         help="Non-edge add probability for pairs (i,j) not in E (per-non-edge rate).")
     parser.add_argument("--unbiased", type=bool, default=False,
                         help="Use expectation-preserving (unbiased) aggregation for drop/add (RADE-style).")
@@ -133,7 +133,7 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--mask_sharing",
         type=str,
-        default="shared",
+        default="layerwise",
         choices=["shared", "layerwise"],
         help="RADE only: 'shared' uses one keep/add mask across all layers; "
              "'layerwise' samples independent keep/add per layer per epoch."
@@ -142,7 +142,7 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--unbiased_mode",
         type=str,
-        default="rade",
+        default="rade-ic",
         choices=["rade", "rade-ic"],
         help="When --unbiased=True: "
              "'rade' uses train-time centering for additions (clean inference). "

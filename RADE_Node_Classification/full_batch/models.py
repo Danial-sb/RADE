@@ -62,12 +62,13 @@ class MPNNs(torch.nn.Module):
         if self.aug_tech not in {"rade", "dropmessage", "dropnode", "none"}:
             raise ValueError(f"aug_tech must be one of {{rade, dropmessage, dropnode, none}}. Got {self.aug_tech}")
 
+        self.lin_in = torch.nn.Linear(in_channels, hidden_channels) if self.pre_linear else None
+
         self.local_convs = torch.nn.ModuleList()
         self.lins = torch.nn.ModuleList() if self.res else None
         self.lns = torch.nn.ModuleList() if self.ln else None
         self.bns = torch.nn.ModuleList() if self.bn else None
 
-        self.lin_in = torch.nn.Linear(in_channels, hidden_channels) if self.pre_linear else None
 
         # ----- helpers for GIN -----
         def make_gin_mlp(in_dim: int, out_dim: int) -> nn.Module:

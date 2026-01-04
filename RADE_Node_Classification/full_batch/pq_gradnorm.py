@@ -37,7 +37,7 @@ def _dot(grads_a, grads_b) -> float:
 
 
 def _pick_subset(idx: torch.Tensor, k: int, seed: int) -> torch.Tensor:
-    # k==0 means: use full idx (full-batch setting)
+    # k==0 means: use full idx (full_batch setting)
     if k <= 0 or k >= idx.numel():
         return idx
     g = torch.Generator(device=idx.device)
