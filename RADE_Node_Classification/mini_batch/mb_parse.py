@@ -11,7 +11,7 @@ Key differences vs full_batch parse.py:
   reuse sweep configs with minimal changes.
 """
 
-from mb_models import MPNNsMB
+from .mb_models import MPNNsMB
 
 
 def parse_method(args, num_nodes, num_classes, in_dim, device):
@@ -44,8 +44,8 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--dataset",
         type=str,
-        default="flickr",
-        choices=["computer", "cs", "physics", "flickr", "ogbn-arxiv"],
+        default="ogbn-arxiv",
+        choices=["flickr", "ogbn-arxiv"],
         help="Dataset name",
     )
     parser.add_argument(
@@ -65,7 +65,7 @@ def parser_add_main_args(parser):
     # -----------------
     # training schedule
     # -----------------
-    parser.add_argument("--epochs", type=int, default=500, help="number of training epochs")
+    parser.add_argument("--epochs", type=int, default=1000, help="number of training epochs")
     parser.add_argument("--runs", type=int, default=5, help="number of distinct runs")
 
     # split control (used only for datasets that are random-split in the loader)
@@ -140,7 +140,7 @@ def parser_add_main_args(parser):
     # -----------------
     parser.add_argument("--model", type=str, default="MPNN", choices=["MPNN"])
     parser.add_argument("--gnn", type=str, default="gin", choices=["gcn", "gin"])
-    parser.add_argument("--hidden_channels", type=int, default=16)
+    parser.add_argument("--hidden_channels", type=int, default=256)
     parser.add_argument("--local_layers", type=int, default=2)
     parser.add_argument("--pre_linear", type=bool, default=True)
     parser.add_argument("--res", action="store_true")

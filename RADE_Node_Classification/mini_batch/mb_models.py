@@ -8,8 +8,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, GINConv
 
-from mb_rade_convs import BatchGraphCache, RADEGCNConvMB, RADEGINConvMB
-from RADE_Node_Classification.full_batch.dropmessage_convs import DropMessageGCNConv, DropMessageGINConv
+from .mb_rade_convs import BatchGraphCache, RADEGCNConvMB, RADEGINConvMB
+from ..full_batch.dropmessage_convs import DropMessageGCNConv, DropMessageGINConv
 
 EdgeIndexObj = Union[torch.Tensor, List[torch.Tensor]]
 

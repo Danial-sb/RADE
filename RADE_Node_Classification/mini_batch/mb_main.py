@@ -11,16 +11,16 @@ import torch
 import torch.nn as nn
 import wandb
 
-from RADE_Node_Classification.full_batch.logger import Logger, save_model, save_result
-from RADE_Node_Classification.full_batch.dataset import load_nc_dataset
-from RADE_Node_Classification.full_batch.data_utils import eval_acc_nc, class_rand_splits, make_random_split_idx
+from ..full_batch.logger import Logger, save_model, save_result
+from ..full_batch.dataset import load_nc_dataset
+from ..full_batch.data_utils import eval_acc_nc, class_rand_splits, make_random_split_idx, eval_f1_nc
 
-from mb_parse import parse_method, parser_add_main_args
-from mb_loaders import build_neighbor_loaders, NeighborLoaderConfig
-from mb_eval import evaluate_minibatch
-from mb_augmentation import BatchBernoulliEdgeAugmentor
+from .mb_parse import parse_method, parser_add_main_args
+from .mb_loaders import build_neighbor_loaders, NeighborLoaderConfig
+from .mb_eval import evaluate_minibatch
+from .mb_augmentation import BatchBernoulliEdgeAugmentor
 
-from mb_pq_gradnorm import PQGradNormTunerMB, PQTunerMBConfig
+from .mb_pq_gradnorm import PQGradNormTunerMB, PQTunerMBConfig
 
 
 def fix_seed(seed: int = 42) -> None:
@@ -189,7 +189,7 @@ for run in range(int(args.runs)):
 # -----------------------
 model = parse_method(args, n, c, d, device)
 criterion = nn.CrossEntropyLoss()
-eval_func = eval_acc_nc
+eval_func = eval_f1_nc if args.dataset.lower() == "flickr" else eval_acc_nc
 logger = Logger(int(args.runs), args)
 
 print("MODEL:", model)
