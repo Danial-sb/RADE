@@ -1,11 +1,21 @@
 # graph_classification/parse_gc.py
 from __future__ import annotations
+import argparse
 
 try:
     from .models_gc import GraphMPNN, GraphMPNNConfig
 except Exception:
     from models_gc import GraphMPNN, GraphMPNNConfig
 
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean, got '{v}'")
 
 def parse_method_gc(args, in_channels: int, out_channels: int, device):
     cfg = GraphMPNNConfig(
@@ -17,6 +27,7 @@ def parse_method_gc(args, in_channels: int, out_channels: int, device):
         bn=bool(getattr(args, "bn", False)),
         use_ogb_encoders=bool(getattr(args, "use_ogb_encoders", False)),
         use_edge_attr=bool(getattr(args, "use_edge_attr", False)),
+        pre_linear=bool(getattr(args, "pre_linear", False)),
         unbiased=bool(getattr(args, "unbiased", False)),
         unbiased_mode=str(getattr(args, "unbiased_mode", "rade")),
         correct_self_loop=True,
@@ -53,25 +64,35 @@ def parser_add_gc_args(parser):
     # -----------------
     # training
     # -----------------
-    parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--runs", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=500)
+    parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--patience", type=int, default=100, help="Early stopping patience in epochs based on "
+                                                                  "validation accuracy. Set <=0 to disable "
+                                                                  "early stopping.",)
 
     # -----------------
     # model
     # -----------------
-    parser.add_argument("--gnn", type=str, default="gin", choices=["gcn", "gin"])
+    parser.add_argument("--gnn", type=str, default="gcn", choices=["gcn", "gin"])
     parser.add_argument("--pooling", type=str, default="sum", choices=["mean", "sum"])
     parser.add_argument("--hidden_channels", type=int, default=32)
     parser.add_argument("--local_layers", type=int, default=3)
-    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--dropout", type=float, default=0.9)
     parser.add_argument("--bn", action="store_true", help="Enable BatchNorm1d after each conv.")
     parser.add_argument(
         "--linear",
-        action="store_true",
+        type=str2bool, default=False,
         help="Use the linear version of the model (no activations, no BN, no dropout; GIN uses linear MLP).",
     )
+
+    parser.add_argument(
+        "--pre_linear",
+        action="store_true",
+        help="Apply a pre-linear projection from input dim to hidden dim before message passing (NC-style).",
+    )
+
     parser.add_argument("--use_ogb_encoders", action="store_true")
     parser.add_argument("--use_edge_attr", action="store_true")
 
@@ -94,7 +115,7 @@ def parser_add_gc_args(parser):
     parser.add_argument(
         "--dropmessage_rate",
         type=float,
-        default=0.4,
+        default=0.0,
         help="DropMessage rate (message dropout probability). Used only when --aug_tech=dropmessage.",
     )
 
@@ -102,7 +123,7 @@ def parser_add_gc_args(parser):
     parser.add_argument(
         "--dropnode_rate",
         type=float,
-        default=0.5,
+        default=0.0,
         help="DropNode rate (node dropout probability). Used only when --aug_tech=dropnode.",
     )
 
@@ -112,7 +133,7 @@ def parser_add_gc_args(parser):
     parser.add_argument(
         "--aug_mode",
         type=str,
-        default="both",
+        default="none",
         choices=["none", "drop", "add", "both"],
         help="Graph topology augmentation mode on training batches.",
     )
@@ -126,9 +147,9 @@ def parser_add_gc_args(parser):
     )
 
     # RADE controls (GC)
-    parser.add_argument("--unbiased", action="store_true",
+    parser.add_argument("--unbiased", type=str2bool, default=False,
                         help="Use expectation-preserving (unbiased) RADE aggregation.")
-    parser.add_argument("--unbiased_mode", type=str, default="rade-ic", choices=["rade", "rade-ic"])
+    parser.add_argument("--unbiased_mode", type=str, default="rade", choices=["rade", "rade-ic"])
     parser.add_argument(
         "--mask_sharing",
         type=str,
@@ -139,7 +160,7 @@ def parser_add_gc_args(parser):
     )
 
     # PQ-GradNorm (graph classification) -- RADE only
-    parser.add_argument("--pq_gradnorm", action="store_true",
+    parser.add_argument("--pq_gradnorm", type=str2bool, default=False,
                         help="Enable PQ-GradNorm tuning for graph classification (RADE only).")
     parser.add_argument("--pq_warmup_epochs", type=int, default=10,
                         help="Warmup epochs before PQ tuning starts.")

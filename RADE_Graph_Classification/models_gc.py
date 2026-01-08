@@ -33,6 +33,8 @@ class GraphMPNNConfig:
     use_ogb_encoders: bool = False
     use_edge_attr: bool = False
 
+    pre_linear: bool = False
+
     # RADE
     unbiased: bool = False
     unbiased_mode: str = "rade"      # 'rade' or 'rade-ic'
@@ -92,6 +94,10 @@ class GraphMPNN(nn.Module):
 
         ic_mode = (cfg.unbiased and cfg.unbiased_mode == "rade-ic")
 
+        # optional pre-linear projection
+        self.lin_in = nn.Linear(in_channels, H) if bool(cfg.pre_linear) else None
+        first_in = H if self.lin_in is not None else int(in_channels)
+
         self.convs = nn.ModuleList()
 
         # -------------------------
@@ -101,14 +107,14 @@ class GraphMPNN(nn.Module):
             # RADE convs
             if cfg.gnn == "gcn":
                 self.convs.append(
-                    RADEGCNConvGC(in_channels, H, correct_self_loop=cfg.correct_self_loop, ic_mode=ic_mode)
+                    RADEGCNConvGC(first_in, H, correct_self_loop=cfg.correct_self_loop, ic_mode=ic_mode)
                 )
                 for _ in range(L - 1):
                     self.convs.append(
                         RADEGCNConvGC(H, H, correct_self_loop=cfg.correct_self_loop, ic_mode=ic_mode)
                     )
             else:
-                mlp0 = _make_gin_mlp(in_channels, H, hidden_dim=H, dropout=cfg.dropout, linear=cfg.linear)
+                mlp0 = _make_gin_mlp(first_in, H, hidden_dim=H, dropout=cfg.dropout, linear=cfg.linear)
                 self.convs.append(RADEGINConvGC(mlp=mlp0, eps=0.0, train_eps=False, ic_mode=ic_mode))
                 for _ in range(L - 1):
                     mlp = _make_gin_mlp(H, H, hidden_dim=H, dropout=cfg.dropout, linear=cfg.linear)
@@ -118,11 +124,11 @@ class GraphMPNN(nn.Module):
             # baselines / clean
             if cfg.aug_tech == "dropmessage":
                 if cfg.gnn == "gcn":
-                    self.convs.append(DropMessageGCNConvGC(in_channels, H, bias=True))
+                    self.convs.append(DropMessageGCNConvGC(first_in, H, bias=True))
                     for _ in range(L - 1):
                         self.convs.append(DropMessageGCNConvGC(H, H, bias=True))
                 else:
-                    mlp0 = _make_gin_mlp(in_channels, H, hidden_dim=H, dropout=cfg.dropout, linear=cfg.linear)
+                    mlp0 = _make_gin_mlp(first_in, H, hidden_dim=H, dropout=cfg.dropout, linear=cfg.linear)
                     self.convs.append(DropMessageGINConvGC(mlp=mlp0, eps=0.0, train_eps=False))
                     for _ in range(L - 1):
                         mlp = _make_gin_mlp(H, H, hidden_dim=H, dropout=cfg.dropout, linear=cfg.linear)
@@ -130,11 +136,11 @@ class GraphMPNN(nn.Module):
             else:
                 # clean model (or DropNode, which is applied on x, not in conv)
                 if cfg.gnn == "gcn":
-                    self.convs.append(GCNConv(in_channels, H, cached=False, normalize=True))
+                    self.convs.append(GCNConv(first_in, H, cached=False, normalize=True))
                     for _ in range(L - 1):
                         self.convs.append(GCNConv(H, H, cached=False, normalize=True))
                 else:
-                    mlp0 = _make_gin_mlp(in_channels, H, hidden_dim=H, dropout=cfg.dropout, linear=cfg.linear)
+                    mlp0 = _make_gin_mlp(first_in, H, hidden_dim=H, dropout=cfg.dropout, linear=cfg.linear)
                     self.convs.append(GINConv(mlp0))
                     for _ in range(L - 1):
                         mlp = _make_gin_mlp(H, H, hidden_dim=H, dropout=cfg.dropout, linear=cfg.linear)
@@ -150,6 +156,8 @@ class GraphMPNN(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
+        if self.lin_in is not None:
+            self.lin_in.reset_parameters()
         for c in self.convs:
             if hasattr(c, "reset_parameters"):
                 c.reset_parameters()
@@ -200,6 +208,11 @@ class GraphMPNN(nn.Module):
 
         edge_index = edge_index.to(torch.long)
         batch = batch.to(torch.long)
+
+        if self.lin_in is not None:
+            x = self.lin_in(x)
+            if (not self.cfg.linear) and (float(self.cfg.dropout) > 0.0):
+                x = F.dropout(x, p=float(self.cfg.dropout), training=self.training)
 
         # DropNode baseline: apply on x before message passing (only when selected)
         if (not self.cfg.unbiased) and (self.cfg.aug_tech == "dropnode"):
