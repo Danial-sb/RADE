@@ -8,35 +8,63 @@ metric:
 
 parameters:
   dataset:
-    values: [computer]
+    values: [cora]
   gnn:
-    values: [gcn, gin]
+    values: [gcn]
   local_layers:
-    values: [2]
+    values: [3]
   hidden_channels:
-    values: [16,32,64,128]
+    values: [512]
   lr:
-    values: [0.0005, 0.001]
+    values: [0.001]
+
   dropout:
     values: [0.0]
-  aug_tech:
-    values: [none]
+
+  aug_tech: #Dropmessage, Dropnode, RADE
+    values: [rade]
   aug_mode:
-    values: [none] # only when rade (both, add, drop)
-#  unbiased_mode:
-#    values: [rade]
-#  mask_sharing:
-#    values: [shared]
+    values: [both] # only when rade (both, add, drop)
+  p:
+    values: [0.5]
+  q:
+    values: [0.000721] #CORA: 0.000721
+
+  dropmessage_rate:
+    values: [0.0]
+
+  dropnode_rate:
+    values: [0.0]
+
   unbiased:
-    values: [false]
+    values: [true]
   pq_gradnorm:
-    values: [false]
+    values: [true]
+  mask_sharing:
+    values: [layerwise]
+  linear:
+    values: [true]
+  unbiased_mode:
+    values: [rade]
+  p_max:
+    values: [0.7]
+  q_max:
+    values: [0.001442]  #Cora: 0.001442
+  pq_grid_size:
+    values: [5]
+  pq_warmup_epochs:
+    values: [20]
+  pq_data_anchor:
+    values: [aug]
+
   device:
-    values: [3]
-#  p:
-#    values: [0.2]
-#  q:
-#    values: [0.0002]
+    values: [0]
+  runs:
+    values: [5]
+  epochs:
+    values: [500]
+  patience:
+    values: [100] # 200 for computer
 
 command:
   - ${env}

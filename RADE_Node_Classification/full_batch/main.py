@@ -11,7 +11,7 @@ import wandb
 
 from logger import Logger, save_model, save_result
 from dataset import load_nc_dataset
-from data_utils import eval_acc_nc, class_rand_splits, make_random_split_idx
+from data_utils import eval_acc_nc, class_rand_splits, make_random_split_idx, eval_f1_nc
 from eval import evaluate
 from parse import parse_method, parser_add_main_args
 from augmentation import BernoulliEdgeAugmentor
@@ -178,7 +178,7 @@ if getattr(args, "unbiased", False):
     model.set_graph(data.edge_index, int(data.num_nodes))
 
 criterion = nn.CrossEntropyLoss()
-eval_func = eval_acc_nc
+eval_func = eval_f1_nc if args.dataset.lower() == "flickr" else eval_acc_nc
 logger = Logger(args.runs, args)
 
 print("MODEL:", model)
@@ -224,6 +224,7 @@ for run in range(args.runs):
             eps=float(getattr(args, "pq_eps", 1e-12)),
             subset_nodes=int(getattr(args, "pq_subset_nodes", 1024)),
             seed=int(getattr(args, "pq_seed", 0)),
+            data_anchor=str(getattr(args, "pq_data_anchor", "clean")).lower().strip()
         )
         pq_tuner = PQGradNormTuner(
             edge_index_clean=data.edge_index,
@@ -495,7 +496,10 @@ for run in range(args.runs):
                     current_q=q_eff,
                     aug_mode=str(args.aug_mode).lower().strip(),
                     epoch_seed=epoch_seed,
+                    mask_sharing=str(getattr(args, "mask_sharing", "shared")).lower().strip(),
+                    num_layers=int(getattr(args, "local_layers", 1)),
                 )
+
 
                 if not prev_mode_training:
                     model.eval()

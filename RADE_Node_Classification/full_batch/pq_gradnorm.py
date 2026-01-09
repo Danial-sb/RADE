@@ -7,6 +7,7 @@ from typing import Dict, Tuple, List
 
 import torch
 import torch.nn as nn
+from augmentation import BernoulliEdgeAugmentor
 
 from rade_convs import (
     GraphCache,
@@ -79,6 +80,7 @@ class PQTunerConfig:
     eps: float = 1e-12
     subset_nodes: int = 0   # 0 => full train_idx
     seed: int = 0
+    data_anchor: str = "clean"
 
 
 class PQGradNormTuner:
@@ -95,6 +97,14 @@ class PQGradNormTuner:
         self.variant = str(variant).lower().strip() # 'rade' or 'rade-ic'
         self.cache = GraphCache.from_edge_index(edge_index_clean, int(num_nodes))
         self.N = int(num_nodes)
+
+        self.edge_index_clean = edge_index_clean
+        self.augmentor = BernoulliEdgeAugmentor.from_edge_index(edge_index_clean, num_nodes=self.N)
+
+        da = str(getattr(cfg, "data_anchor", "clean")).lower().strip()
+        if da not in {"clean", "aug"}:
+            raise ValueError(f"PQTunerConfig.data_anchor must be 'clean' or 'aug', got {da}")
+        self.data_anchor = da
 
     @torch.no_grad()
     def _messages_detached(self, emb: torch.Tensor, W: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -180,6 +190,8 @@ class PQGradNormTuner:
         current_q: float,
         aug_mode: str,
         epoch_seed: int,
+        mask_sharing: str = "shared",
+        num_layers: int = 1,
     ) -> Tuple[float, float, Dict[str, float]]:
         cfg = self.cfg
         eps = cfg.eps
@@ -207,21 +219,87 @@ class PQGradNormTuner:
             model.zero_grad(set_to_none=True)
 
             # clean forward (no RADE masks, no inference correction)
-            logits, emb = model(data.x, data.edge_index, p=0.0, q=0.0, return_embeddings=True)
+            # -------------------------
+            # 1) Anchor data gradient norm (clean or aug)
+            # -------------------------
+            def _sample_masks_for_anchor(p0: float, q0: float):
+                mode0 = str(aug_mode).lower().strip()
+                ms = str(mask_sharing).lower().strip()
+                L = max(1, int(num_layers))
 
-            # data grad norm
-            loss_data = criterion(logits[idx], data.y[idx])
+                if mode0 == "none" or (p0 <= 0.0 and q0 <= 0.0):
+                    return None, None
+
+                base_seed = int(epoch_seed) + 777_000  # disjoint from other RNG uses inside this fork
+
+                if ms == "shared":
+                    _, ei_keep, ei_add, _ = self.augmentor.augment_edge_indices(
+                        p=float(p0),
+                        q=float(q0),
+                        mode=mode0,
+                        seed=base_seed,
+                        device=data.x.device,
+                    )
+                    return ei_keep, ei_add
+
+                if ms == "layerwise":
+                    keep_list, add_list = [], []
+                    for layer in range(L):
+                        _, ei_keep_l, ei_add_l, _ = self.augmentor.augment_edge_indices(
+                            p=float(p0),
+                            q=float(q0),
+                            mode=mode0,
+                            seed=base_seed + 1_000_000 * layer,
+                            device=data.x.device,
+                        )
+                        keep_list.append(ei_keep_l)
+                        add_list.append(ei_add_l)
+                    return keep_list, add_list
+
+                raise ValueError(f"mask_sharing must be 'shared' or 'layerwise', got {ms}")
+
+            model.zero_grad(set_to_none=True)
+
+            if self.data_anchor == "aug":
+                # Use the SAME kind of stochastic training forward that SGD sees (one draw of masks),
+                # anchored at the CURRENT (p,q), not the candidate (p_try,q_try).
+                ei_keep0, ei_add0 = _sample_masks_for_anchor(float(current_p), float(current_q))
+
+                if ei_keep0 is None and ei_add0 is None:
+                    logits_anchor = model(data.x, data.edge_index, p=0.0, q=0.0)
+                else:
+                    logits_anchor = model(
+                        data.x,
+                        data.edge_index,
+                        edge_index_keep=ei_keep0,
+                        edge_index_add=ei_add0,
+                        p=float(current_p),
+                        q=float(current_q),
+                    )
+            else:
+                # Clean anchor
+                logits_anchor = model(data.x, data.edge_index, p=0.0, q=0.0)
+
+            loss_data = criterion(logits_anchor[idx], data.y[idx])
             params = [p for p in model.parameters() if p.requires_grad]
-            g_data = torch.autograd.grad(loss_data, params, retain_graph=True, create_graph=False, allow_unused=True)
+            g_data = torch.autograd.grad(loss_data, params, retain_graph=False, create_graph=False, allow_unused=True)
             G_data = _grad_norm(g_data)
             logGd = math.log(G_data + eps)
 
-            # detached message stats (Var detached per your paper convention)
+            # -------------------------
+            # 2) Snapshot for regularizer proxy (keep your existing convention)
+            #    Always compute from a clean forward (theoretical reference),
+            #    while Var remains detached.
+            # -------------------------
+            model.zero_grad(set_to_none=True)
+            logits, emb = model(data.x, data.edge_index, p=0.0, q=0.0, return_embeddings=True)
+
             W = model.pred_local.weight
             m, m_sq = self._messages_detached(emb, W)
 
-            # z(1-z)-like weights (multiclass)
-            w = _w_multiclass(logits)  # differentiable; Var remains detached
+            # z(1-z)-like weights (multiclass); differentiable; Var stays detached
+            w = _w_multiclass(logits)
+
 
             # bounds / grids (respect aug_mode)
             aug_mode = str(aug_mode).lower().strip()

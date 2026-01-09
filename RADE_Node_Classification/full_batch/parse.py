@@ -30,7 +30,7 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--dataset",
         type=str,
-        default="cora",
+        default="computer",
         choices=["cora", "citeseer", "pubmed", "cs", "computer", "physics", "flickr", "ogbn-arxiv"],
         help="Dataset name (must match nc_datasets_simple.py)",
     )
@@ -42,7 +42,7 @@ def parser_add_main_args(parser):
     )
 
     # system
-    parser.add_argument("--device", type=int, default=3, help="GPU id (default: 0)")
+    parser.add_argument("--device", type=int, default=1, help="GPU id (default: 0)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cpu", action="store_true")
 
@@ -68,15 +68,15 @@ def parser_add_main_args(parser):
 
     # model
     parser.add_argument("--model", type=str, default="MPNN", choices=["MPNN"])
-    parser.add_argument("--gnn", type=str, default="gin", choices=["gcn", "gin"])
-    parser.add_argument("--hidden_channels", type=int, default=256)
-    parser.add_argument("--local_layers", type=int, default=3)
+    parser.add_argument("--gnn", type=str, default="gcn", choices=["gcn", "gin"])
+    parser.add_argument("--hidden_channels", type=int, default=128)
+    parser.add_argument("--local_layers", type=int, default=2)
     parser.add_argument("--pre_linear", type=bool, default=True)
     parser.add_argument("--res", action="store_true")
     parser.add_argument("--ln", action="store_true")
     parser.add_argument("--bn", action="store_true")
     parser.add_argument("--jk", action="store_true")
-    parser.add_argument("--linear", action="store_true", help="Use strictly linear model: disables ReLU/Dropout/BN/LN,"
+    parser.add_argument("--linear", type=bool, default=False, help="Use strictly linear model: disables ReLU/Dropout/BN/LN,"
                                                               "and makes GIN MLP linear.")
 
     # optimization
@@ -84,7 +84,7 @@ def parser_add_main_args(parser):
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--dropout", type=float, default=0.0)
     # early stopping
-    parser.add_argument("--patience", type=int, default=100, help="Early stopping patience in epochs based on "
+    parser.add_argument("--patience", type=int, default=200, help="Early stopping patience in epochs based on "
                                                                   "validation accuracy. Set <=0 to disable "
                                                                   "early stopping.",)
 
@@ -142,7 +142,7 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--unbiased_mode",
         type=str,
-        default="rade-ic",
+        default="rade",
         choices=["rade", "rade-ic"],
         help="When --unbiased=True: "
              "'rade' uses train-time centering for additions (clean inference). "
@@ -175,6 +175,16 @@ def parser_add_main_args(parser):
     parser.add_argument("--pq_seed", type=int, default=0,
                         help="Seed for selecting the subset of nodes for pq selection.")
 
+    parser.add_argument(
+        "--pq_data_anchor",
+        type=str,
+        default="aug",
+        choices=["clean", "aug"],
+        help="PQ-GradNorm: which data-loss gradient norm to anchor against. "
+             "'clean' uses gradients from clean forward (p=q=0). "
+             "'aug' uses gradients from one stochastic RADE-augmented forward using current (p,q) "
+             "and the same mask_sharing policy (shared/layerwise).",
+    )
 
     # -----------------------
     # Weights & Biases (wandb)
