@@ -106,6 +106,13 @@ class PQGradNormTuner:
             raise ValueError(f"PQTunerConfig.data_anchor must be 'clean' or 'aug', got {da}")
         self.data_anchor = da
 
+    def _num_non_edges_undirected(self) -> int:
+        # Assumes edge_index_clean_dir contains both directions for each undirected edge.
+        m_dir = int(self.cache.edge_index_clean_dir.size(1))
+        m_undir = m_dir // 2
+        n = int(self.N)
+        return n * (n - 1) // 2 - m_undir
+
     @torch.no_grad()
     def _messages_detached(self, emb: torch.Tensor, W: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         h = emb.detach()
@@ -309,9 +316,32 @@ class PQGradNormTuner:
             p_grid = [0.0] if p_max <= 0 else torch.linspace(
                 0.0, float(p_max), steps=int(cfg.grid_size), device=data.x.device
             ).tolist()
-            q_grid = [0.0] if q_max <= 0 else torch.linspace(
-                0.0, float(q_max), steps=int(cfg.grid_size), device=data.x.device
-            ).tolist()
+
+            # --- REPLACE q_grid linspace with a K_add-based grid (prevents "q floor" / fixed added edges) ---
+            if q_max <= 0.0:
+                q_grid = [0.0]
+            else:
+                M_undir = max(1, self._num_non_edges_undirected())  # number of undirected non-edges
+                K_max = int(round(float(q_max) * float(M_undir)))   # max expected undirected additions under q_max
+
+                if K_max <= 0:
+                    q_grid = [0.0]
+                else:
+                    # Always include very small expected-add counts so q can go below q_max/(grid_size-1)
+                    K_core = [0, 1, 2, 5, 10, 20, 50]
+                    K_core = [k for k in K_core if k <= K_max]
+
+                    target = int(cfg.grid_size)
+                    remaining = max(0, target - len(K_core))
+
+                    K_lin = []
+                    if remaining > 0:
+                        lin = torch.linspace(0.0, float(K_max), steps=remaining + 2, device="cpu")
+                        K_lin = [int(round(x)) for x in lin.tolist()[1:-1]]
+
+                    K_list = sorted(set(K_core + K_lin))[:target]
+                    q_grid = [float(k) / float(M_undir) for k in K_list]
+
 
             best_obj = float("inf")
             best_p, best_q = 0.0, 0.0
