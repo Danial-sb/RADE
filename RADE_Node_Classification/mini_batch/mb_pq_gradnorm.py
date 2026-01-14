@@ -8,7 +8,7 @@ from typing import Dict, Tuple, List, Iterable, Any, Optional
 import torch
 import torch.nn as nn
 
-from mb_rade_convs import (
+from .mb_rade_convs import (
     BatchGraphCache,
     _scatter_add_rows,
     _delta_E_inv_sqrt_caseA,
