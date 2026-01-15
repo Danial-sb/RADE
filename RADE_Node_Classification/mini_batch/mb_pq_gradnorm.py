@@ -72,6 +72,17 @@ def _restore_batchnorm_buffers(states: List[Tuple[nn.Module, bool]]) -> None:
     for m, was_training in states:
         m.train(was_training)
 
+def _num_non_edges_undirected_from_dir_edges(num_nodes: int, edge_index_dir: torch.Tensor) -> int:
+    """
+    Approximate #undirected non-edges in the induced batch graph.
+
+    If your NeighborLoader batch edge_index is NOT symmetrized, this will be off. In that case,
+    either symmetrize before calling the tuner or replace this with a unique-undirected counter.
+    """
+    m_dir = int(edge_index_dir.size(1))
+    m_undir = m_dir // 2
+    n = int(num_nodes)
+    return n * (n - 1) // 2 - m_undir
 
 # -------------------------
 # config
@@ -281,9 +292,31 @@ class PQGradNormTunerMB:
             p_grid = [0.0] if p_max <= 0 else torch.linspace(
                 0.0, float(p_max), steps=int(cfg.grid_size), device=x_b.device
             ).tolist()
-            q_grid = [0.0] if q_max <= 0 else torch.linspace(
-                0.0, float(q_max), steps=int(cfg.grid_size), device=x_b.device
-            ).tolist()
+            # --- K_add-based q grid (prevents "q floor" / fixed added edges) ---
+            if q_max <= 0.0:
+                q_grid = [0.0]
+            else:
+                # number of undirected non-edges in the induced batch graph
+                M_undir = max(1, _num_non_edges_undirected_from_dir_edges(B, edge_index_b_clean))
+                K_max = int(round(float(q_max) * float(M_undir)))  # max expected undirected additions at q_max
+
+                if K_max <= 0:
+                    q_grid = [0.0]
+                else:
+                    # Always include tiny K so q can go below q_max/(grid_size-1)
+                    K_core = [0, 1, 2, 5, 10, 20, 50]
+                    K_core = [k for k in K_core if k <= K_max]
+
+                    target = int(cfg.grid_size)
+                    remaining = max(0, target - len(K_core))
+
+                    K_lin = []
+                    if remaining > 0:
+                        lin = torch.linspace(0.0, float(K_max), steps=remaining + 2, device="cpu")
+                        K_lin = [int(round(x)) for x in lin.tolist()[1:-1]]
+
+                    K_list = sorted(set(K_core + K_lin))[:target]
+                    q_grid = [float(k) / float(M_undir) for k in K_list]
 
             best_obj = float("inf")
             best_p, best_q = 0.0, 0.0

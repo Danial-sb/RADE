@@ -55,6 +55,23 @@ def _restore_batchnorm_buffers(states: List[Tuple[nn.Module, bool]]) -> None:
     for m, was_training in states:
         m.train(was_training)
 
+def _num_non_edges_undirected_total(cache: BatchGraphCache) -> int:
+    """
+    Total #undirected non-edges across graphs in this disjoint-union batch.
+
+    Then:
+      M_total = sum_g [ C(n_g,2) - m_g ]
+    where sum_g C(n_g,2) is computed from cache.nodes_per_graph.
+    """
+    n_per_g = cache.nodes_per_graph  # [num_graphs] float
+    total_pairs = (n_per_g * (n_per_g - 1.0) * 0.5).sum().item()
+
+    m_dir = int(cache.edge_index_clean_dir.size(1))
+    m_undir = m_dir // 2
+
+    M_total = int(round(total_pairs)) - int(m_undir)
+    return max(1, M_total)
+
 
 class BatchGraphCache:
     """
@@ -393,9 +410,29 @@ class PQGradNormTunerGC:
             p_grid = [0.0] if p_max_eff <= 0 else torch.linspace(
                 0.0, float(p_max_eff), steps=int(cfg.grid_size), device=m.device
             ).tolist()
-            q_grid = [0.0] if q_max_eff <= 0 else torch.linspace(
-                0.0, float(q_max_eff), steps=int(cfg.grid_size), device=m.device
-            ).tolist()
+            # --- K_add-based q grid (prevents "q floor" / fixed added edges) ---
+            if q_max_eff <= 0.0:
+                q_grid = [0.0]
+            else:
+                M_total = _num_non_edges_undirected_total(cache)  # total undirected non-edges across graphs in batch
+                K_max = int(round(float(q_max_eff) * float(M_total)))
+
+                if K_max <= 0:
+                    q_grid = [0.0]
+                else:
+                    K_core = [0, 1, 2, 5, 10, 20, 50]
+                    K_core = [k for k in K_core if k <= K_max]
+
+                    target = int(cfg.grid_size)
+                    remaining = max(0, target - len(K_core))
+
+                    K_lin = []
+                    if remaining > 0:
+                        lin = torch.linspace(0.0, float(K_max), steps=remaining + 2, device="cpu")
+                        K_lin = [int(round(x)) for x in lin.tolist()[1:-1]]
+
+                    K_list = sorted(set(K_core + K_lin))[:target]
+                    q_grid = [float(k) / float(M_total) for k in K_list]
 
             best_obj = float("inf")
             best_p, best_q, best_Greg = 0.0, 0.0, 0.0
