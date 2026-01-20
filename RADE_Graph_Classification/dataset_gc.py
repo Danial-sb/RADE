@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 import torch_geometric.transforms as T
 from torch_geometric.data import Data
+from torch_geometric.datasets import LRGBDataset
 from torch_geometric.datasets import TUDataset
 from torch_geometric.utils import (
     coalesce,
@@ -42,6 +43,8 @@ def _canon_name(name: str) -> str:
         "molhiv": "ogbg-molhiv",
         "ogbg-molpcba": "ogbg-molpcba",
         "molpcba": "ogbg-molpcba",
+        "peptides-func": "peptides-func",
+        "peptides": "peptides-func",
     }
     return aliases.get(n, n)
 
@@ -56,6 +59,23 @@ def _tu_official_name(canon: str) -> str:
     if canon == "imdb-m":
         return "IMDB-MULTI"
     raise ValueError(f"Not a TU dataset canon name: {canon}")
+
+def _load_lrgb_peptides(root: str, name: str):
+    # name can be "Peptides-func" / PyG lowercases internally
+    train_ds = LRGBDataset(root=root, name=name, split="train")
+    val_ds   = LRGBDataset(root=root, name=name, split="val")
+    test_ds  = LRGBDataset(root=root, name=name, split="test")
+
+    # Concatenate into one dataset (keeps PyG Dataset interface)
+    dataset = train_ds + val_ds + test_ds
+
+    n_tr, n_va, n_te = len(train_ds), len(val_ds), len(test_ds)
+    split_idx = {
+        "train": torch.arange(0, n_tr, dtype=torch.long),
+        "valid": torch.arange(n_tr, n_tr + n_va, dtype=torch.long),
+        "test":  torch.arange(n_tr + n_va, n_tr + n_va + n_te, dtype=torch.long),
+    }
+    return dataset, split_idx
 
 
 def _random_split_graphs(
@@ -291,7 +311,30 @@ def load_gc_dataset(
 
         return ds, split_idx, meta
 
+    if canon in ["peptides-func"]:
+        pyg_name = "Peptides-func"
+        dataset, split_idx = _load_lrgb_peptides(root, pyg_name)
+
+        def pep_transform(data: Data) -> Data:
+            if data.x is not None and not torch.is_floating_point(data.x):
+                data.x = data.x.to(torch.float32)
+            if getattr(data, "y", None) is not None:
+                data.y = data.y.to(torch.float32)
+            data.edge_index = data.edge_index.to(torch.long)
+            if hasattr(data, "edge_attr") and (data.edge_attr is not None) and (
+            not torch.is_floating_point(data.edge_attr)):
+                data.edge_attr = data.edge_attr.to(torch.float32)
+            return data
+
+        dataset.transform = pep_transform
+
+        in_dim = dataset[0].x.size(-1)
+        out_dim = 10
+        meta = {"in_dim": in_dim, "out_dim": out_dim, "task": "multilabel", "loss": "bce", "metric": "ap"}
+        return dataset, split_idx, meta
+
     raise ValueError(
         f"Unsupported dataset: {name}. "
-        f"Supported: mutag, proteins, imdb-b, imdb-m, ogbg-molhiv, ogbg-molpcba."
+        f"Supported: mutag, proteins, imdb-b, imdb-m, ogbg-molhiv, ogbg-molpcba, peptides-func."
     )
+

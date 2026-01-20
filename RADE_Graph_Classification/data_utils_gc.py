@@ -130,7 +130,6 @@ def eval_ogb_ap(y_true: torch.Tensor, logits: torch.Tensor) -> float:
         return float("nan")
     return float(np.mean(ap_list))
 
-
 def get_primary_metric(dataset_name: str) -> str:
     """
     Defines the single metric you optimize/track as 'best/...' in wandb.
@@ -138,25 +137,23 @@ def get_primary_metric(dataset_name: str) -> str:
     name = dataset_name.lower().strip()
     if name in {"ogbg-molhiv"}:
         return "rocauc"
-    if name in {"ogbg-molpcba"}:
+    if name in {"ogbg-molpcba", "peptides-func"}:
         return "ap"
-    # TU graph classification benchmarks commonly report accuracy
     return "acc"
 
 
 def eval_graph_metric(dataset_name: str, y_true: torch.Tensor, logits: torch.Tensor) -> float:
     """
     Unified entry-point for evaluation.
-
-    TU: accuracy
-    molhiv: ROC-AUC
-    molpcba: AP
     """
     metric = get_primary_metric(dataset_name)
+
     if metric == "acc":
         return eval_acc_graph(y_true, logits)
     if metric == "rocauc":
         return eval_ogb_rocauc(y_true, logits)
     if metric == "ap":
         return eval_ogb_ap(y_true, logits)
+
     raise ValueError(f"Unknown metric '{metric}' for dataset '{dataset_name}'.")
+

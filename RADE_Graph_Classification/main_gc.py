@@ -291,6 +291,8 @@ def print_training_banner(args, model) -> None:
     )
     print(model, flush=True)
 
+def count_trainable_params(model: torch.nn.Module) -> int:
+    return int(sum(p.numel() for p in model.parameters() if p.requires_grad))
 
 def main():
     parser = argparse.ArgumentParser()
@@ -402,6 +404,8 @@ def main():
         fix_seed(int(args.seed) + run)
 
         model = parse_method_gc(args, in_channels=in_dim, out_channels=out_dim, device=device)
+        n_params = count_trainable_params(model)
+        print(f"[GC] Trainable params: {n_params:,}")
         print_training_banner(args, model)
 
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)

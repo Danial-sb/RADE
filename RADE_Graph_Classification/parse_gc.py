@@ -45,8 +45,8 @@ def parser_add_gc_args(parser):
     parser.add_argument(
         "--dataset",
         type=str,
-        default="mutag",
-        choices=["mutag", "proteins", "imdb-b", "imdb-m", "ogbg-molhiv", "ogbg-molpcba"],
+        default="peptides-func",
+        choices=["mutag", "proteins", "imdb-b", "imdb-m", "ogbg-molhiv", "ogbg-molpcba", "peptides-func"],
     )
     parser.add_argument("--data_dir", type=str, default="./data/")
     parser.add_argument("--seed", type=int, default=42)
@@ -58,7 +58,7 @@ def parser_add_gc_args(parser):
     # -----------------
     # system
     # -----------------
-    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--device", type=int, default=2)
     parser.add_argument("--cpu", action="store_true")
 
     # -----------------
@@ -66,7 +66,7 @@ def parser_add_gc_args(parser):
     # -----------------
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--runs", type=int, default=5)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--patience", type=int, default=100, help="Early stopping patience in epochs based on "
                                                                   "validation accuracy. Set <=0 to disable "
@@ -77,9 +77,9 @@ def parser_add_gc_args(parser):
     # -----------------
     parser.add_argument("--gnn", type=str, default="gcn", choices=["gcn", "gin"])
     parser.add_argument("--pooling", type=str, default="sum", choices=["mean", "sum"])
-    parser.add_argument("--hidden_channels", type=int, default=32)
-    parser.add_argument("--local_layers", type=int, default=3)
-    parser.add_argument("--dropout", type=float, default=0.9)
+    parser.add_argument("--hidden_channels", type=int, default=256)
+    parser.add_argument("--local_layers", type=int, default=4)
+    parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--bn", action="store_true", help="Enable BatchNorm1d after each conv.")
     parser.add_argument(
         "--linear",
@@ -93,7 +93,7 @@ def parser_add_gc_args(parser):
         help="Apply a pre-linear projection from input dim to hidden dim before message passing (NC-style).",
     )
 
-    parser.add_argument("--use_ogb_encoders", action="store_true")
+    parser.add_argument("--use_ogb_encoders", type=str2bool, default=False)
     parser.add_argument("--use_edge_attr", action="store_true")
 
     # -----------------------
@@ -102,7 +102,7 @@ def parser_add_gc_args(parser):
     parser.add_argument(
         "--aug_tech",
         type=str,
-        default="none",
+        default="rade",
         choices=["rade", "dropmessage", "dropnode", "none"],
         help="Which augmentation family to use. "
              "'rade' uses your edge drop/add pipeline. "
@@ -133,11 +133,11 @@ def parser_add_gc_args(parser):
     parser.add_argument(
         "--aug_mode",
         type=str,
-        default="none",
+        default="drop",
         choices=["none", "drop", "add", "both"],
         help="Graph topology augmentation mode on training batches.",
     )
-    parser.add_argument("--p", type=float, default=0.02, help="Edge drop probability for clean edges (0<=p<1).")
+    parser.add_argument("--p", type=float, default=0.2, help="Edge drop probability for clean edges (0<=p<1).")
     parser.add_argument("--q", type=float, default=0.01, help="Non-edge add probability over clean complement (0<=q<=1).")
     parser.add_argument(
         "--safety_max_additions",
@@ -153,7 +153,7 @@ def parser_add_gc_args(parser):
     parser.add_argument(
         "--mask_sharing",
         type=str,
-        default="shared",
+        default="layerwise",
         choices=["shared", "layerwise"],
         help="RADE only: 'shared' uses one keep/add mask across all layers; "
              "'layerwise' samples independent keep/add per layer per epoch.",
@@ -184,8 +184,11 @@ def parser_add_gc_args(parser):
     # -----------------
     # loss / metric override (auto is resolved in main)
     # -----------------
-    parser.add_argument("--loss", type=str, default="auto", choices=["auto", "ce", "bce"])
-    parser.add_argument("--metric", type=str, default="auto", choices=["auto", "acc", "rocauc", "ap"])
+    parser.add_argument("--metric", type=str, default="auto",
+                        choices=["auto", "acc", "rocauc", "ap"])
+
+    parser.add_argument("--loss", type=str, default="auto",
+                        choices=["auto", "ce", "bce"])
 
     # -----------------
     # wandb
