@@ -75,7 +75,6 @@ def _make_gin_mlp(in_dim: int, out_dim: int, *, hidden_dim: int, dropout: float,
     layers.append(nn.Linear(hidden_dim, out_dim))
     return nn.Sequential(*layers)
 
-
 class GraphMPNN(nn.Module):
     """
     Graph classification MPNN:
@@ -208,7 +207,8 @@ class GraphMPNN(nn.Module):
 
         edge_index = edge_index.to(torch.long)
         batch = batch.to(torch.long)
-
+        if not torch.is_floating_point(x):
+            x = x.float()
         if self.lin_in is not None:
             x = self.lin_in(x)
             if (not self.cfg.linear) and (float(self.cfg.dropout) > 0.0):

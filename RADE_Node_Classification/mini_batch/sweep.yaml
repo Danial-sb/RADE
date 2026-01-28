@@ -1,19 +1,20 @@
-program: main_gc.py
+project: rade-nc
+entity: danial-saber
+
 method: grid
 metric:
-  name: valid/metric
+  name: best/valid_acc
   goal: maximize
+
 parameters:
   dataset:
-    values: [mutag]
+    values: [ogbn-arxiv]
   gnn:
-    values: [gcn]
-  batch_size:
-    values: [32,16]
+    values: [gcn,gin]
   local_layers:
-    values: [4,3]
+    values: [2]
   hidden_channels:
-    values: [16,32]
+    values: [256]
   lr:
     values: [0.001]
 
@@ -25,9 +26,9 @@ parameters:
   aug_mode:
     values: [both] # only when rade (both, add, drop)
   p:
-    values: [0.2] #Proteins: 0.8
+    values: [0.2,0.5,0.8] #ogbn-arxiv: 0.2, flickr: 0.2
   q:
-    values: [0.027] #mutagenicity: 0.027, proteins: 0.0324, imdb-b: 0.1354, imdb-m: 0.26809, ogbg-molhiv: 0.02691, peptides: 0.002083
+    values: [0.000013446,0.000033615,0.000053784] #Flickr: 0.0000136, ogbn-arxiv: 0.000013446
 
   dropmessage_rate:
     values: [0.0]
@@ -38,38 +39,39 @@ parameters:
   unbiased:
     values: [True]
   pq_gradnorm:
-    values: [True]
+    values: [False]
   mask_sharing:
-    values: [shared]
+    values: [layerwise]
   linear:
     values: [False]
   unbiased_mode:
-    values: [rade]
-  pq_p_max:
+    values: [rade,rade-ic]
+  p_max:
     values: [0.8]
-  pq_q_max:
-    values: [0.054] #proteins: 0.0162, imdb-b: 0.270864, imdb-m: 0.53618, ogbg-molhiv: 0.05382, peptides: 0.004166
+  q_max:
+    values: [0.000026892]  #Flickr: 0.0000718, ogbn-arxiv: 0.000026892
   pq_grid_size:
-    values: [5]
+    values: [11]
   pq_warmup_epochs:
     values: [20]
-#  pq_data_anchor:
+#  pq_data_anchor: # TO BE ADDED LATER
 #    values: [aug]
 
   device:
-    values: [2]
+    values: [1]
   runs:
     values: [5]
   epochs:
-    values: [500]
+    values: [2000] # 1000 for flickr
   patience:
-    values: [100]
+    values: [200] # 100 for flickr
 
 command:
   - ${env}
   - python
-  - main_gc.py
+  - -m
+  - RADE_Node_Classification.mini_batch.mb_main
   - --wandb
   - --wandb_project
-  - rade-gc
+  - rade-nc
   - ${args}

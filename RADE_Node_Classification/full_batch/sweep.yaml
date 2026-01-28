@@ -12,9 +12,9 @@ parameters:
   gnn:
     values: [gcn]
   local_layers:
-    values: [3]
+    values: [2]
   hidden_channels:
-    values: [512]
+    values: [512] #GCN 256 pubmed, CS 64 for GCN and 256 for GIN
   lr:
     values: [0.001]
 
@@ -26,9 +26,9 @@ parameters:
   aug_mode:
     values: [both] # only when rade (both, add, drop)
   p:
-    values: [0.5]
+    values: [0.8]
   q:
-    values: [0.000721] #CORA: 0.000721
+    values: [0.0011536] #CORA: 0.000721, CITESEER: 0.000164, PUBMED: 0.0000456, CS: 0.0000957, PHYSICS: 0.0000834, COMPUTER: 0.001303
 
   dropmessage_rate:
     values: [0.0]
@@ -37,28 +37,31 @@ parameters:
     values: [0.0]
 
   unbiased:
-    values: [true]
+    values: [True]
   pq_gradnorm:
-    values: [true]
+    values: [False]
   mask_sharing:
     values: [layerwise]
   linear:
-    values: [true]
+    values: [False]
   unbiased_mode:
     values: [rade]
   p_max:
-    values: [0.7]
+    values: [0.8]
   q_max:
-    values: [0.001442]  #Cora: 0.001442
+    values: [0.0023072]  #Cora: 0.001442, CITESEER: 0.000328, PUBMED: 0.0000912, CS: 0.000195, PHYSICS: 0.000166, COMPUTER: 0.0026070
+#    [0.0005768] #0.001442,0.0023072]
   pq_grid_size:
     values: [5]
   pq_warmup_epochs:
     values: [20]
   pq_data_anchor:
-    values: [aug]
+    values: [clean]
+  pq_subset_nodes:
+    values: [1024]
 
   device:
-    values: [0]
+    values: [1]
   runs:
     values: [5]
   epochs:

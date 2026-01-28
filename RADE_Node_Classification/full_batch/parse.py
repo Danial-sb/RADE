@@ -30,7 +30,7 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--dataset",
         type=str,
-        default="computer",
+        default="citeseer",
         choices=["cora", "citeseer", "pubmed", "cs", "computer", "physics", "flickr", "ogbn-arxiv"],
         help="Dataset name (must match nc_datasets_simple.py)",
     )
@@ -42,12 +42,12 @@ def parser_add_main_args(parser):
     )
 
     # system
-    parser.add_argument("--device", type=int, default=1, help="GPU id (default: 0)")
+    parser.add_argument("--device", type=int, default=0, help="GPU id (default: 0)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cpu", action="store_true")
 
     # training schedule
-    parser.add_argument("--epochs", type=int, default=1000, help="number of training epochs")
+    parser.add_argument("--epochs", type=int, default=500, help="number of training epochs")
     parser.add_argument("--runs", type=int, default=5, help="number of distinct runs")
 
     # split control (used only for datasets that are random-split in the loader)
@@ -68,15 +68,15 @@ def parser_add_main_args(parser):
 
     # model
     parser.add_argument("--model", type=str, default="MPNN", choices=["MPNN"])
-    parser.add_argument("--gnn", type=str, default="gcn", choices=["gcn", "gin"])
-    parser.add_argument("--hidden_channels", type=int, default=128)
+    parser.add_argument("--gnn", type=str, default="gin", choices=["gcn", "gin"])
+    parser.add_argument("--hidden_channels", type=int, default=256)
     parser.add_argument("--local_layers", type=int, default=2)
     parser.add_argument("--pre_linear", type=bool, default=True)
     parser.add_argument("--res", action="store_true")
     parser.add_argument("--ln", action="store_true")
     parser.add_argument("--bn", action="store_true")
     parser.add_argument("--jk", action="store_true")
-    parser.add_argument("--linear", type=bool, default=False, help="Use strictly linear model: disables ReLU/Dropout/BN/LN,"
+    parser.add_argument("--linear", type=bool, default=True, help="Use strictly linear model: disables ReLU/Dropout/BN/LN,"
                                                               "and makes GIN MLP linear.")
 
     # optimization
@@ -84,7 +84,7 @@ def parser_add_main_args(parser):
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--dropout", type=float, default=0.0)
     # early stopping
-    parser.add_argument("--patience", type=int, default=200, help="Early stopping patience in epochs based on "
+    parser.add_argument("--patience", type=int, default=100, help="Early stopping patience in epochs based on "
                                                                   "validation accuracy. Set <=0 to disable "
                                                                   "early stopping.",)
 
@@ -94,7 +94,7 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--aug_tech",
         type=str,
-        default="none",
+        default="rade",
         choices=["rade", "dropmessage", "dropnode", "none"],
         help="Which augmentation family to use. "
              "'rade' uses your current edge drop/add pipeline. "
@@ -120,14 +120,15 @@ def parser_add_main_args(parser):
     )
 
     # RADE augmentation args
-    parser.add_argument("--aug_mode", type=str, default="none",
+    parser.add_argument("--aug_mode", type=str, default="both",
                         choices=["none", "drop", "add", "both"],
                         help="Graph augmentation mode per epoch.")
-    parser.add_argument("--p", type=float, default=0.1,
+    parser.add_argument("--p", type=float, default=0.2,
                         help="Edge drop probability for edges (i,j) in E.")
-    parser.add_argument("--q", type=float, default=0.0000143,
+    parser.add_argument("--q", type=float, default=0.000164,
                         help="Non-edge add probability for pairs (i,j) not in E (per-non-edge rate).")
-    parser.add_argument("--unbiased", type=bool, default=False,
+
+    parser.add_argument("--unbiased", type=bool, default=True,
                         help="Use expectation-preserving (unbiased) aggregation for drop/add (RADE-style).")
     # augmentation (Bernoulli drop/add)
     parser.add_argument(
@@ -150,12 +151,12 @@ def parser_add_main_args(parser):
     )
 
     # ---- GradNorm p/q tuning (epoch-wise) ----
-    parser.add_argument("--pq_gradnorm", type=bool, default=False,
+    parser.add_argument("--pq_gradnorm", type=bool, default=True,
                         help="Enable epoch-wise GradNorm matching to adapt (p,q).")
 
-    parser.add_argument("--p_max", type=float, default=0.6,
+    parser.add_argument("--p_max", type=float, default=0.8,
                         help="Upper bound for p during GradNorm tuning.")
-    parser.add_argument("--q_max", type=float, default=1e-3,
+    parser.add_argument("--q_max", type=float, default=0.000328,
                         help="Upper bound for q during GradNorm tuning.")
 
     parser.add_argument("--pq_grid_size", type=int, default=11,
@@ -178,7 +179,7 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--pq_data_anchor",
         type=str,
-        default="aug",
+        default="clean",
         choices=["clean", "aug"],
         help="PQ-GradNorm: which data-loss gradient norm to anchor against. "
              "'clean' uses gradients from clean forward (p=q=0). "

@@ -8,9 +8,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    from .data_utils_gc import eval_acc_graph, eval_ogb_rocauc, eval_ogb_ap, get_primary_metric
+    from .data_utils_gc import eval_acc_graph, eval_ogb_rocauc, eval_ogb_ap, get_primary_metric, eval_graph_metric
 except Exception:
-    from data_utils_gc import eval_acc_graph, eval_ogb_rocauc, eval_ogb_ap, get_primary_metric
+    from data_utils_gc import eval_acc_graph, eval_ogb_rocauc, eval_ogb_ap, get_primary_metric, eval_graph_metric
 
 
 def forward_model(model: nn.Module, batch, *, use_edge_attr: bool, p: float = 0.0, q: float = 0.0) -> torch.Tensor:
@@ -45,9 +45,11 @@ def masked_bce_with_logits(logits: torch.Tensor, y: torch.Tensor) -> torch.Tenso
 
 
 def _eval_metric(metric: str, dataset_name: str, y_true: torch.Tensor, logits: torch.Tensor) -> float:
-    m = metric
-    if m == "auto":
-        m = get_primary_metric(dataset_name)
+    if metric == "auto":
+        # uses get_primary_metric() internally
+        return eval_graph_metric(dataset_name, y_true, logits)
+
+    m = str(metric).lower().strip()
     if m == "acc":
         return eval_acc_graph(y_true, logits)
     if m == "rocauc":
@@ -93,11 +95,13 @@ def evaluate_loader(
             if out.dim() == 1:
                 out = out.view(-1, 1)
             loss = masked_bce_with_logits(out, y)
-        else:
+        elif isinstance(criterion, nn.CrossEntropyLoss):
             if y.dim() == 2 and y.size(1) == 1:
                 y = y.squeeze(1)
             y = y.view(-1).to(torch.long)
             loss = criterion(out, y)
+        else:
+            raise ValueError(f"Unsupported criterion type: {type(criterion)}")
 
         bsz = int(batch.num_graphs) if hasattr(batch, "num_graphs") else int(y.size(0))
         total_loss += float(loss.item()) * bsz

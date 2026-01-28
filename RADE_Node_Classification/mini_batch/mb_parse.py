@@ -149,7 +149,7 @@ def parser_add_main_args(parser):
     parser.add_argument("--jk", action="store_true")
     parser.add_argument(
         "--linear",
-        action="store_true",
+        type=bool, default=False,
         help="Use strictly linear model: disables ReLU/Dropout/BN/LN, and makes GIN MLP linear.",
     )
 
