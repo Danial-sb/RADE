@@ -186,7 +186,7 @@ class BernoulliEdgeAugmentor:
       - keep edges by dropping each clean edge w.p. p
       - add edges by sampling k_add ≈ round(q * |Ebar|) undirected non-edges from the CLEAN complement
 
-    Outputs are directed edge_index tensors (both directions), matching your RADE conv interfaces.
+    Outputs are directed edge_index tensors (both directions), matching RADE conv interfaces.
     """
     edge_u: torch.Tensor                 # [M] CPU long (u<v)
     edge_v: torch.Tensor                 # [M] CPU long (u<v)

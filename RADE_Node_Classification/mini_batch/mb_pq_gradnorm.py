@@ -76,7 +76,7 @@ def _num_non_edges_undirected_from_dir_edges(num_nodes: int, edge_index_dir: tor
     """
     Approximate #undirected non-edges in the induced batch graph.
 
-    If your NeighborLoader batch edge_index is NOT symmetrized, this will be off. In that case,
+    If NeighborLoader batch edge_index is NOT symmetrized, this will be off. In that case,
     either symmetrize before calling the tuner or replace this with a unique-undirected counter.
     """
     m_dir = int(edge_index_dir.size(1))
@@ -110,7 +110,7 @@ class PQTunerMBConfig:
 
 class PQGradNormTunerMB:
     """
-    Mini-batch PQ-GradNorm tuner implementing your epoch-level aggregation rule:
+    Mini-batch PQ-GradNorm tuner implementing epoch-level aggregation rule:
 
       For each batch b:
         (p_b, q_b) = argmin_{p,q in grid} ( log||∇ L_data(B_b)|| - log||∇ R(p,q;B_b)|| )^2
@@ -119,7 +119,7 @@ class PQGradNormTunerMB:
 
     IMPORTANT SEMANTICS:
     - This tuner is *batch-local*: it builds a GraphCache on the induced subgraph and computes
-      Var(δ_i) w.r.t. the batch graph (local complements). This matches your mini_batch RADE
+      Var(δ_i) w.r.t. the batch graph (local complements). This matches mini_batch RADE
       semantics when mb_rade_mode="local".
     """
 

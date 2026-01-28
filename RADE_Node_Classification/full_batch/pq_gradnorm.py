@@ -294,7 +294,7 @@ class PQGradNormTuner:
             logGd = math.log(G_data + eps)
 
             # -------------------------
-            # 2) Snapshot for regularizer proxy (keep your existing convention)
+            # 2) Snapshot for regularizer proxy (keep existing convention)
             #    Always compute from a clean forward (theoretical reference),
             #    while Var remains detached.
             # -------------------------

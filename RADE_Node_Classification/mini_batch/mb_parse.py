@@ -7,7 +7,7 @@ Mini-batch parse utilities for node classification.
 Key differences vs full_batch parse.py:
 - Imports mb_models.MPNNsMB (mini_batch model wrapper) instead of models.MPNNs.
 - Adds mini_batch knobs (batch_size, shuffle, num_workers, pin_memory, full_eval_cpu).
-- Keeps your original argument names for model/RADE/DropMessage/DropNode/GradNorm so you can
+- Keeps original argument names for model/RADE/DropMessage/DropNode/GradNorm so you can
   reuse sweep configs with minimal changes.
 """
 
@@ -72,7 +72,7 @@ def parser_add_main_args(parser):
     parser.add_argument("--train_prop", type=float, default=0.6, help="training proportion (random-split datasets)")
     parser.add_argument("--valid_prop", type=float, default=0.2, help="validation proportion (random-split datasets)")
 
-    # Optional overrides (ONLY if your mb_main.py implements them explicitly)
+    # Optional overrides (ONLY if mb_main.py implements them explicitly)
     parser.add_argument(
         "--rand_split",
         action="store_true",
@@ -109,7 +109,7 @@ def parser_add_main_args(parser):
         "--mb_num_workers",
         type=int,
         default=4,
-        help="DataLoader workers (used only if your mb_main uses DataLoader; safe to keep).",
+        help="DataLoader workers (used only if mb_main uses DataLoader; safe to keep).",
     )
     parser.add_argument(
         "--mb_pin_memory",
@@ -177,7 +177,7 @@ def parser_add_main_args(parser):
         default="none",
         choices=["rade", "dropmessage", "dropnode", "none"],
         help="Which augmentation family to use. "
-             "'rade' uses your edge drop/add pipeline (mini_batch semantics controlled by --mb_rade_mode). "
+             "'rade' uses edge drop/add pipeline (mini_batch semantics controlled by --mb_rade_mode). "
              "'dropmessage' uses message dropout. "
              "'dropnode' uses node-wise feature masking. "
              "'none' is clean training.",

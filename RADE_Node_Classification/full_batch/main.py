@@ -95,11 +95,11 @@ def _require_no_rade_contrib(name: str) -> None:
     if getattr(args, "linear", False):
         raise ValueError(f"--aug_tech={name} is incompatible with --linear (strict linearity).")
 
-# DropMessage must NOT use your RADE contributions
+# DropMessage must NOT use RADE contributions
 if aug_tech == "dropmessage":
     _require_no_rade_contrib("dropmessage")
 
-# DropNode must NOT use your RADE contributions
+# DropNode must NOT use RADE contributions
 if aug_tech == "dropnode":
     _require_no_rade_contrib("dropnode")
 

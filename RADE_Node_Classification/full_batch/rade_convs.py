@@ -67,7 +67,7 @@ class GraphCache:
         """
         Weighted centering for GCN case:
         μ_i = (∑_{j∈C(i)} w_j x_j) / (∑_{j∈C(i)} w_j),
-        where w_j depends only on j (your decoupled approximation reduces weights to node-wise terms).
+        where w_j depends only on j (decoupled approximation reduces weights to node-wise terms).
         """
         N = self.num_nodes
         row, col = self.edge_index_clean_dir.to(x.device)

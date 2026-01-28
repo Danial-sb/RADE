@@ -123,7 +123,7 @@ class BernoulliEdgeAugmentor:
       - drop edges with prob p
       - add non-edges with prob q (interpreted as per-non-edge probability)
 
-    Designed for undirected graphs (your loader makes graphs undirected).
+    Designed for undirected graphs (the loader makes graphs undirected).
     """
     edge_u: torch.Tensor              # undirected unique edges u < v (CPU)
     edge_v: torch.Tensor              # undirected unique edges u < v (CPU)

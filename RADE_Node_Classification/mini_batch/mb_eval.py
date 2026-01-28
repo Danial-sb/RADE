@@ -165,7 +165,7 @@ def evaluate_minibatch(
     forward_kwargs: Optional[dict] = None,
 ) -> Tuple[float, float, float, float, Optional[torch.Tensor]]:
     """
-    Mini-batch analogue of your full_batch evaluate(...).
+    Mini-batch analogue of full_batch evaluate(...).
 
     Returns:
       train_metric, valid_metric, test_metric, valid_loss, out_return

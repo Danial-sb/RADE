@@ -180,7 +180,7 @@
 #     """
 #     Monte Carlo estimate on a real dataset:
 #       E[biased output] and E[unbiased output] vs clean
-#     Uses your BernoulliEdgeAugmentor.
+#     Uses BernoulliEdgeAugmentor.
 #     """
 #     from dataset import load_nc_dataset
 #     from augmentation import BernoulliEdgeAugmentor
@@ -422,7 +422,7 @@
 #     """
 #     Enumerate ALL keep/add masks on a tiny graph and compute exact expectations for a 2-layer stack.
 #
-#     - No nonlinearities: GIN uses Identity MLP, eps=0; GCN uses bias=False and your RADEGCNConv.
+#     - No nonlinearities: GIN uses Identity MLP, eps=0; GCN uses bias=False and RADEGCNConv.
 #     - If share_mask=True: same (keep/add) mask is used in both layers.
 #       If share_mask=False: independent masks per layer (recommended for testing composition).
 #     """
@@ -597,7 +597,7 @@
 
 
 # diagnostics_unbiased_model.py
-# Compare "biased" vs "RADE (unbiased aggregation)" for your FULL MPNNs model.
+# Compare "biased" vs "RADE (unbiased aggregation)" for FULL MPNNs model.
 #
 # Usage examples:
 #   python diagnostics_unbiased_model.py --mode toy --gnn gin --p 0.3 --q 0.2
@@ -620,7 +620,7 @@
 # import torch
 #
 # from rade_convs import RADEGCNConv  # to toggle correct_self_loop inside the model
-# from models import MPNNs  # your model.py must expose MPNNs
+# from models import MPNNs  # model.py must expose MPNNs
 #
 #
 # # ----------------------------
@@ -694,7 +694,7 @@
 #         if isinstance(conv, RADEGCNConv):
 #             conv.correct_self_loop = bool(correct_self_loop)
 #
-#     # Keep training=True so RADE path can trigger (your model checks self.training)
+#     # Keep training=True so RADE path can trigger (model checks self.training)
 #     # With dropout=0 and no BN/LN, this is deterministic.
 #     model.train()
 #     return model
@@ -824,7 +824,7 @@
 #     dropout: float,
 #     device: str,
 # ) -> None:
-#     # Import your project utilities
+#     # Import project utilities
 #     from dataset import load_nc_dataset
 #     from augmentation import BernoulliEdgeAugmentor
 #
@@ -984,7 +984,7 @@
 
 
 # unbiasedness_layerwise_check.py
-# Copy-paste this file into your project root (same level as dataset.py, augmentation.py, models.py, rade_convs.py)
+# Copy-paste this file into project root (same level as dataset.py, augmentation.py, models.py, rade_convs.py)
 #
 # Examples:
 #   (1) Toy, exact, shared mask across layers (fast)
@@ -1000,7 +1000,7 @@
 # Notes:
 # - For a strict expectation-preserving check, use: --linear_check true
 #   (it removes outer ReLU/dropout by bypassing model.forward and applying only linear steps).
-# - For GIN, strict unbiasedness will generally NOT hold if your GIN MLP contains ReLU inside the conv.
+# - For GIN, strict unbiasedness will generally NOT hold if GIN MLP contains ReLU inside the conv.
 #   So for strict checks, prefer --gnn gcn.
 
 import argparse
@@ -1013,7 +1013,7 @@ import torch
 from torch_geometric.utils import coalesce
 
 from rade_convs import RADEGCNConv  # to toggle correct_self_loop inside the model
-from models import MPNNs  # your model.py must expose MPNNs
+from models import MPNNs  # model.py must expose MPNNs
 
 
 # ----------------------------
@@ -1110,7 +1110,7 @@ def build_model(
         if isinstance(conv, RADEGCNConv):
             conv.correct_self_loop = bool(correct_self_loop)
 
-    # Keep training=True so your model's RADE gating (self.training) can trigger if you use model.forward
+    # Keep training=True so model's RADE gating (self.training) can trigger if you use model.forward
     model.train()
     return model
 
@@ -1239,7 +1239,7 @@ def exact_expectation_toy(
     if linear_check:
         y_clean = forward_clean_linear(model, x, edge_index_clean)
     else:
-        y_clean = model(x, edge_index_clean)  # includes outer relu/dropout in your MPNNs
+        y_clean = model(x, edge_index_clean)  # includes outer relu/dropout in MPNNs
 
     m = len(edges_undir)
     M = len(nonedges_undir)
@@ -1598,7 +1598,7 @@ def main() -> None:
     if args.gnn == "gin" and args.linear_check:
         print(
             "WARNING: You are using gnn=gin with linear_check=true.\n"
-            "If your GIN MLP contains ReLU inside the conv (common), exact expectation preservation generally will NOT hold.\n"
+            "If GIN MLP contains ReLU inside the conv (common), exact expectation preservation generally will NOT hold.\n"
             "For strict checks, prefer gnn=gcn.\n"
         )
 

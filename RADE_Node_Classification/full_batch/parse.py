@@ -54,7 +54,7 @@ def parser_add_main_args(parser):
     parser.add_argument("--train_prop", type=float, default=0.6, help="training proportion (random-split datasets)")
     parser.add_argument("--valid_prop", type=float, default=0.2, help="validation proportion (random-split datasets)")
 
-    # Optional overrides (ONLY if your main script implements them explicitly)
+    # Optional overrides (ONLY if the main script implements them explicitly)
     parser.add_argument("--rand_split", action="store_true",
                         help="Override loader split with a fresh random split (requires main-script support).")
     parser.add_argument("--rand_split_class", action="store_true",
@@ -97,7 +97,7 @@ def parser_add_main_args(parser):
         default="rade",
         choices=["rade", "dropmessage", "dropnode", "none"],
         help="Which augmentation family to use. "
-             "'rade' uses your current edge drop/add pipeline. "
+             "'rade' uses the current edge drop/add pipeline. "
              "'dropmessage' uses message dropout (no RADE/unbiased/gradnorm). "
              "'dropnode' uses node-wise feature masking (no RADE/unbiased/gradnorm). "
              "'none' is clean training.",

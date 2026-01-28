@@ -187,7 +187,6 @@ class PQGradNormTunerGC:
     - Caller should average batch-wise solutions across the epoch to obtain (p^{t+1}, q^{t+1}).
 
     Notes:
-    - Assumes your GC model exposes:
         * model.pred.weight  (graph-level prediction head)
         * forward(..., return_embeddings=True) -> (logits_graph [B,C], node_emb [N,H])
     - Uses within-graph complements via BatchGraphCache (correct for disjoint union batching).
@@ -288,7 +287,7 @@ class PQGradNormTunerGC:
     @torch.no_grad()
     def _var_gcn(self, cache: BatchGraphCache, p: float, q: float, m: torch.Tensor, m_sq: torch.Tensor) -> torch.Tensor:
         """
-        Per-node variance for GCN symmetric normalization via your mixed-binomial/delta approximations.
+        Per-node variance for GCN symmetric normalization via mixed-binomial/delta approximations.
         Returned tensor is detached.
         """
         eps = self.cfg.eps

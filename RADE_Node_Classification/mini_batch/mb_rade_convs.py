@@ -31,7 +31,7 @@ class BatchGraphCache:
     Assumes edge_index_clean corresponds to the current mini_batch node set and is relabeled
     to [0..N_batch-1].
 
-    - edge_index_clean_dir: directed (both directions if your batch graph is undirected), no self-loops
+    - edge_index_clean_dir: directed (both directions if batch graph is undirected), no self-loops
     - deg_clean: clean degree d_i in the batch (excluding self-loop)
     - comp_size: |C_batch(i)| = N_batch - 1 - d_i   (complement inside the batch node set)
     """

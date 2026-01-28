@@ -21,7 +21,7 @@ class NeighborLoaderConfig:
     Configuration for PyG NeighborLoader.
 
     num_neighbors:
-      - length should typically match your number of message-passing layers
+      - length should typically match the number of message-passing layers
       - use small fanouts to control memory (e.g., (15,10,5))
       - setting a value to -1 means "all neighbors" at that hop (often defeats mini_batch benefits)
 

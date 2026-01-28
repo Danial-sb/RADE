@@ -263,7 +263,7 @@ for run in range(int(args.runs)):
             eps=float(getattr(args, "pq_eps", 1e-12)),
             subset_nodes=int(getattr(args, "pq_subset_nodes", 1024)),
             seed=int(getattr(args, "pq_seed", 0)),
-            # optional speed knob (not in your parser by default)
+            # optional speed knob (not in parser by default)
             max_batches_for_tuning=int(getattr(args, "pq_max_batches_for_tuning", 0)),
         )
         pq_tuner = PQGradNormTunerMB(

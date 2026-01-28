@@ -158,19 +158,3 @@ def eval_f1_nc(y_true: torch.Tensor, logits: torch.Tensor, average: str = "micro
     y_true_np = y_true.view(-1).detach().cpu().numpy()
     pred_np = logits.argmax(dim=-1).detach().cpu().numpy()
     return float(f1_score(y_true_np, pred_np, average=average))
-
-
-# ---------------------------------------------------------------------
-# (Optional) Legacy / extra datasets support
-# ---------------------------------------------------------------------
-# Your current pipeline (nc_datasets_simple.py) does NOT require fixed-split loaders
-# for WikiCS / geom-gcn / pokec / etc. If you later decide to add those datasets,
-# implement them in a separate module (e.g., extra_splits.py) to avoid mixing contracts.
-
-
-# Kept only if you still download extra datasets elsewhere; not used by the core contract.
-# dataset_drive_url = {
-#     "snap-patents": "1ldh23TSY1PwXia6dU0MYcpyEgX-w3Hia",
-#     "pokec": "1dNs5E7BrWJbgcHeQ_zuy5Ozp2tRCWG0y",
-#     "yelp-chi": "1fAXtTVQS4CfEk4asqrFw9EPmlUPGbGtJ",
-# }

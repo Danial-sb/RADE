@@ -105,7 +105,7 @@ def parser_add_gc_args(parser):
         default="rade",
         choices=["rade", "dropmessage", "dropnode", "none"],
         help="Which augmentation family to use. "
-             "'rade' uses your edge drop/add pipeline. "
+             "'rade' uses edge drop/add pipeline. "
              "'dropmessage' uses message dropout (no RADE/unbiased/gradnorm). "
              "'dropnode' uses node-wise feature masking (no RADE/unbiased/gradnorm). "
              "'none' is clean training.",
@@ -119,7 +119,7 @@ def parser_add_gc_args(parser):
         help="DropMessage rate (message dropout probability). Used only when --aug_tech=dropmessage.",
     )
 
-    # DropNode hyperparameter (your current style: node-wise feature masking + rescale)
+    # DropNode hyperparameter (node-wise feature masking + rescale)
     parser.add_argument(
         "--dropnode_rate",
         type=float,

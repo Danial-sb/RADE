@@ -190,7 +190,7 @@ def _delta_E_inv_self(deg_clean: torch.Tensor, comp_size: torch.Tensor, p: float
 
 class RADEGCNConvGC(nn.Module):
     """
-    Batched-GC version of your RADEGCNConv:
+    Batched-GC version of RADEGCNConv:
       - complements and sizes are computed within each graph in the batch.
     """
     def __init__(
@@ -327,7 +327,7 @@ class RADEGCNConvGC(nn.Module):
 
 class RADEGINConvGC(nn.Module):
     """
-    Batched-GC version of your RADEGINConv (sum aggregation).
+    Batched-GC version of RADEGINConv (sum aggregation).
     """
     def __init__(self, mlp: nn.Module, eps: float = 0.0, train_eps: bool = False, ic_mode: bool = False):
         super().__init__()
