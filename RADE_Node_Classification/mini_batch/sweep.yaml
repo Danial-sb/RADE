@@ -1,5 +1,5 @@
 project: rade-nc
-entity: danial-saber
+entity: removed-to-preserve-anonymity
 
 method: grid
 metric:
@@ -64,7 +64,7 @@ parameters:
   epochs:
     values: [2000] # 1000 for flickr
   patience:
-    values: [200] # 100 for flickr
+    values: [100] # 100 for flickr
 
 command:
   - ${env}
