@@ -1,10 +1,7 @@
-# augmentation.py
-# Efficiency for the candidate set
-# p and q for citeseer.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Optional, Tuple, Set, List
+from typing import Literal, Optional, Tuple, Set, List, Union
 
 import torch
 from torch_geometric.utils import coalesce, remove_self_loops
@@ -14,13 +11,16 @@ AugMode = Literal["none", "drop", "add", "both"]
 
 def _unique_undirected_edges(edge_index: torch.Tensor, num_nodes: int) -> Tuple[torch.Tensor, torch.Tensor, Set[int]]:
     """
-    Convert possibly-directed edge_index into a unique undirected edge list (u < v),
+    Convert a possibly-directed edge_index into a unique undirected clean edge list (u < v),
     returning (u, v, key_set), where key = u * num_nodes + v.
+
     Self-loops are removed.
+
+    This corresponds to the clean undirected edge set E used by RADE.
     """
     edge_index = edge_index.to(torch.long)
 
-    # remove self-loops
+    # Remove self-loops.
     edge_index, _ = remove_self_loops(edge_index)
 
     row, col = edge_index[0], edge_index[1]
@@ -34,13 +34,19 @@ def _unique_undirected_edges(edge_index: torch.Tensor, num_nodes: int) -> Tuple[
     u = keys // num_nodes
     v = keys % num_nodes
 
-    key_set = set(keys.tolist())  # cached membership structure (CPU-side)
+    # Cached CPU-side membership structure for clean-edge lookup.
+    key_set = set(keys.tolist())
     return u, v, key_set
 
 
-def _build_undirected_edge_index(u: torch.Tensor, v: torch.Tensor, num_nodes: int, device: torch.device) -> torch.Tensor:
+def _build_undirected_edge_index(
+    u: torch.Tensor,
+    v: torch.Tensor,
+    num_nodes: int,
+    device: torch.device,
+) -> torch.Tensor:
     """
-    Build symmetric (undirected) edge_index from undirected pairs (u < v).
+    Build a symmetric directed edge_index from undirected pairs (u < v).
     """
     u = u.to(torch.long)
     v = v.to(torch.long)
@@ -59,12 +65,17 @@ def _sample_non_edges_uniform(
     max_batches: int = 200,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Uniformly sample k undirected non-edges (u < v) without replacement, rejecting:
+    Uniformly sample k undirected clean non-edges (u < v) without replacement, rejecting:
       - self-loops
-      - existing edges
+      - clean edges
       - duplicates within the sampled set
 
-    Returns u_add, v_add on CPU (long).
+    Returns:
+        u_add, v_add on CPU (long)
+
+    This is the practical fixed-size sampling scheme used in code in place of
+    independent Bernoulli(q) sampling per non-edge. It matches the paper's
+    implementation note that uses a fixed expected number of additions.
     """
     if k <= 0:
         return torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long)
@@ -73,12 +84,11 @@ def _sample_non_edges_uniform(
     us: List[int] = []
     vs: List[int] = []
 
-    # Rejection sampling in batches
+    # Batched rejection sampling.
     for _ in range(max_batches):
         if len(added_keys) >= k:
             break
 
-        # oversample to reduce number of batches; factor 20 is conservative
         need = k - len(added_keys)
         bsz = min(batch_size, max(10_000, 20 * need))
 
@@ -121,15 +131,22 @@ def _sample_non_edges_uniform(
 @dataclass
 class BernoulliEdgeAugmentor:
     """
-    Caches the original (clean) edge set and supports per-epoch augmentation:
-      - drop edges with prob p
-      - add non-edges with prob q (interpreted as per-non-edge probability)
+    Cache the clean undirected edge set and support per-epoch RADE perturbations:
+      - drop clean edges with probability p
+      - add clean non-edges with rate q
 
-    Designed for undirected graphs (the loader makes graphs undirected).
+    Important paper-consistency note:
+      - The idealized paper model uses independent Bernoulli(q) sampling over clean non-edges.
+      - This implementation instead uses a fixed expected number of additions
+            k_add = round(q * |non-edges|)
+        sampled uniformly without replacement from the clean complement.
+      - This matches the paper's practical implementation note.
+
+    The class is designed for undirected graphs.
     """
-    edge_u: torch.Tensor              # undirected unique edges u < v (CPU)
-    edge_v: torch.Tensor              # undirected unique edges u < v (CPU)
-    edge_keys: Set[int]               # python set of undirected keys (CPU)
+    edge_u: torch.Tensor              # clean undirected unique edges u < v (CPU)
+    edge_v: torch.Tensor              # clean undirected unique edges u < v (CPU)
+    edge_keys: Set[int]               # python set of clean undirected keys (CPU)
     num_nodes: int
 
     @classmethod
@@ -147,23 +164,28 @@ class BernoulliEdgeAugmentor:
         device: Optional[torch.device] = None,
         safety_max_additions: int = 2_000_000,
         return_stats: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[dict]]:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, dict]]:
         """
-        Returns an augmented undirected edge_index (on `device` if provided).
+        Return an augmented undirected edge_index.
 
-        If return_stats=True, returns (edge_index, stats_dict).
+        Returns:
+          - edge_index                          if return_stats=False
+          - (edge_index, stats_dict)            if return_stats=True
 
         Notes:
-          - Drops are applied on the undirected edge set (u < v) so symmetry is preserved.
-          - Adds are sampled uniformly from the complement using expected count round(q * |Ebar|).
-          - Stats (when requested) are in UNDIRECTED unique edges (u < v).
+          - Drops are sampled only from the clean edge set E.
+          - Adds are sampled only from the clean complement Ebar.
+          - A dropped clean edge is NOT eligible to be re-added in the same epoch.
+          - Added pairs are sampled uniformly from the clean complement using
+                k_add = round(q * |Ebar|),
+            i.e. the fixed-size approximation used in the paper's implementation note.
+          - Reported stats are in UNDIRECTED unique edges (u < v).
         """
         if device is None:
             device = torch.device("cpu")
 
         m_clean_undir = int(self.edge_u.numel())
 
-        # Default stats (only used/returned if return_stats=True)
         dropped_undir = 0
         added_undir = 0
         kept_undir = m_clean_undir
@@ -191,7 +213,9 @@ class BernoulliEdgeAugmentor:
         if seed is not None:
             g.manual_seed(int(seed))
 
-        # ---- DROP (on undirected unique edges) ----
+        # -----------------------
+        # DROP from the clean undirected edge set E
+        # -----------------------
         u_keep = self.edge_u
         v_keep = self.edge_v
         if mode in ("drop", "both") and p > 0.0:
@@ -202,7 +226,9 @@ class BernoulliEdgeAugmentor:
             kept_undir = int(u_keep.numel())
             dropped_undir = m_clean_undir - kept_undir
 
-        # ---- ADD (sample from complement) ----
+        # -----------------------
+        # ADD from the clean complement edges
+        # -----------------------
         u_add = torch.empty(0, dtype=torch.long)
         v_add = torch.empty(0, dtype=torch.long)
         if mode in ("add", "both") and q > 0.0:
@@ -221,12 +247,14 @@ class BernoulliEdgeAugmentor:
                 u_add, v_add = _sample_non_edges_uniform(
                     num_nodes=n,
                     k=k_add,
-                    existing_keys=self.edge_keys,
+                    existing_keys=self.edge_keys,  # exclude clean edges
                     generator=g,
                 )
                 added_undir = int(u_add.numel())
 
-        # ---- Combine and return symmetric edge_index ----
+        # -----------------------
+        # Build final symmetric edge_index
+        # -----------------------
         u_final = torch.cat([u_keep, u_add], dim=0)
         v_final = torch.cat([v_keep, v_add], dim=0)
         ei = _build_undirected_edge_index(u_final, v_final, self.num_nodes, device)
@@ -243,28 +271,34 @@ class BernoulliEdgeAugmentor:
             }
             return ei, stats
 
-        return ei, None
+        return ei
 
     def augment_edge_indices(
-            self,
-            *,
-            p: float,
-            q: float,
-            mode: str,
-            seed: Optional[int] = None,
-            device: Optional[torch.device] = None,
-            safety_max_additions: int = 2_000_000,
+        self,
+        *,
+        p: float,
+        q: float,
+        mode: str,
+        seed: Optional[int] = None,
+        device: Optional[torch.device] = None,
+        safety_max_additions: int = 2_000_000,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """
-        Returns:
+        Return:
           edge_index_aug:  [2, E_aug_dir]
-          edge_index_keep: [2, E_keep_dir]  (directed, both directions)
-          edge_index_add:  [2, E_add_dir]   (directed, both directions)
+          edge_index_keep: [2, E_keep_dir]  retained clean edges, directed both ways
+          edge_index_add:  [2, E_add_dir]   sampled clean non-edges, directed both ways
           stats: dict
 
-        Notes (matches RADE sampling model):
-          - Drops are sampled only from clean edges (E).
-          - Adds are sampled only from clean non-edges (Ebar), i.e., we NEVER add a clean edge even if it was dropped.
+        This is the representation needed by the corrected RADE-OF / RADE-OFS
+        convolution layers.
+
+        Notes:
+          - Drops are sampled only from clean edges E.
+          - Adds are sampled only from clean non-edges Ebar.
+          - A clean edge that is dropped is never re-added in the same epoch.
+          - Adds use the fixed-size sampling approximation
+                k_add = round(q * |Ebar|).
         """
         mode = mode.lower().strip()
         if device is None:
@@ -282,12 +316,12 @@ class BernoulliEdgeAugmentor:
             g.manual_seed(int(seed))
 
         n = int(self.num_nodes)
-        u = self.edge_u  # undirected unique edges u<v (CPU)
-        v = self.edge_v  # undirected unique edges u<v (CPU)
+        u = self.edge_u  # clean undirected unique edges u<v (CPU)
+        v = self.edge_v  # clean undirected unique edges u<v (CPU)
         m_clean_undir = int(u.numel())
 
         # -----------------------
-        # DROP (on clean undirected edges)
+        # DROP from clean undirected edges E
         # -----------------------
         u_keep, v_keep = u, v
         dropped_undir = 0
@@ -300,7 +334,7 @@ class BernoulliEdgeAugmentor:
         kept_undir = int(u_keep.numel())
 
         # -----------------------
-        # ADD (sample from clean complement)
+        # ADD from clean complement edges
         # -----------------------
         u_add = torch.empty(0, dtype=torch.long, device="cpu")
         v_add = torch.empty(0, dtype=torch.long, device="cpu")
@@ -320,7 +354,7 @@ class BernoulliEdgeAugmentor:
                 u_add, v_add = _sample_non_edges_uniform(
                     num_nodes=n,
                     k=k_add,
-                    existing_keys=self.edge_keys,  # exclude CLEAN edges (correct for RADE)
+                    existing_keys=self.edge_keys,  # exclude clean edges (RADE-consistent)
                     generator=g,
                 )
                 added_undir = int(u_add.numel())

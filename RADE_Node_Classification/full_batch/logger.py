@@ -1,13 +1,9 @@
-
-#logger.py
-
 import os
-
 import torch
 
 
 class Logger(object):
-    """ Adapted from https://github.com/snap-stanford/ogb/ """
+    """Adapted from https://github.com/snap-stanford/ogb/"""
 
     def __init__(self, runs, info=None):
         self.info = info
@@ -16,11 +12,11 @@ class Logger(object):
 
     def add_result(self, run, result):
         assert len(result) == 4
-        assert run >= 0 and run < len(self.results)
+        assert 0 <= run < len(self.results)
         self.results[run].append(result)
 
     def add_runtime(self, run, epoch_time):
-        assert run >= 0 and run < len(self.runtime_results)
+        assert 0 <= run < len(self.runtime_results)
         self.runtime_results[run].append(float(epoch_time))
 
     def get_runtime_summary(self):

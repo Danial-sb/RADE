@@ -1,11 +1,7 @@
-# parse.py
-
 from models import MPNNs
 
-def parse_method(args, num_nodes, num_classes, in_dim, device):
-    gnn = str(args.gnn).lower().strip()
 
-    # --- standard MPNN path ---
+def parse_method(args, num_nodes, num_classes, in_dim, device):
     model = MPNNs(
         in_channels=in_dim,
         hidden_channels=args.hidden_channels,
@@ -18,13 +14,12 @@ def parse_method(args, num_nodes, num_classes, in_dim, device):
         bn=args.bn,
         jk=args.jk,
         gnn=args.gnn,  # 'gcn' or 'gin'
-        unbiased=args.unbiased,
-        unbiased_mode=args.unbiased_mode,
+        ep_correction=args.ep_correction,
+        rade_variant=args.rade_variant,
         linear=bool(getattr(args, "linear", False)),
         aug_tech=str(getattr(args, "aug_tech", "rade")),
     ).to(device)
     return model
-
 
 
 def parser_add_main_args(parser):
@@ -32,7 +27,7 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--dataset",
         type=str,
-        default="computer",
+        default="cora",
         choices=["cora", "citeseer", "pubmed", "cs", "computer", "physics", "flickr", "ogbn-arxiv"],
         help="Dataset name (must match nc_datasets_simple.py)",
     )
@@ -49,23 +44,28 @@ def parser_add_main_args(parser):
     parser.add_argument("--cpu", action="store_true")
 
     # training schedule
-    parser.add_argument("--epochs", type=int, default=1000, help="number of training epochs")
+    parser.add_argument("--epochs", type=int, default=500, help="number of training epochs")
     parser.add_argument("--runs", type=int, default=5, help="number of distinct runs")
 
-    # split control (used only for datasets that are random-split in the loader)
+    # split control
     parser.add_argument("--train_prop", type=float, default=0.6, help="training proportion (random-split datasets)")
     parser.add_argument("--valid_prop", type=float, default=0.2, help="validation proportion (random-split datasets)")
 
-    # Optional overrides (ONLY if the main script implements them explicitly)
-    parser.add_argument("--rand_split", action="store_true",
-                        help="Override loader split with a fresh random split (requires main-script support).")
-    parser.add_argument("--rand_split_class", action="store_true",
-                        help="Override loader split with class-balanced split (requires main-script support).")
+    parser.add_argument(
+        "--rand_split",
+        action="store_true",
+        help="Override loader split with a fresh random split (requires main-script support).",
+    )
+    parser.add_argument(
+        "--rand_split_class",
+        action="store_true",
+        help="Override loader split with class-balanced split (requires main-script support).",
+    )
     parser.add_argument("--label_num_per_class", type=int, default=20)
     parser.add_argument("--valid_num", type=int, default=500)
     parser.add_argument("--test_num", type=int, default=1000)
 
-    # metric (for these datasets, accuracy is the expected default)
+    # metric
     parser.add_argument("--metric", type=str, default="acc", choices=["acc"], help="evaluation metric")
 
     # model
@@ -84,17 +84,24 @@ def parser_add_main_args(parser):
     parser.add_argument("--ln", action="store_true")
     parser.add_argument("--bn", action="store_true")
     parser.add_argument("--jk", action="store_true")
-    parser.add_argument("--linear", type=bool, default=False, help="Use strictly linear model: disables ReLU/Dropout/BN/LN,"
-                                                              "and makes GIN MLP linear.")
+    parser.add_argument(
+        "--linear",
+        type=bool,
+        default=False,
+        help="Use strictly linear model: disables ReLU/Dropout/BN/LN and makes GIN MLP linear.",
+    )
 
     # optimization
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--dropout", type=float, default=0.0)
-    # early stopping
-    parser.add_argument("--patience", type=int, default=200, help="Early stopping patience in epochs based on "
-                                                                  "validation accuracy. Set <=0 to disable "
-                                                                  "early stopping.",)
+
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=200,
+        help="Early stopping patience in epochs based on validation accuracy. Set <=0 to disable early stopping.",
+    )
 
     # -----------------------
     # Augmentation selector
@@ -105,84 +112,101 @@ def parser_add_main_args(parser):
         default="rade",
         choices=["rade", "dropmessage", "dropnode", "none"],
         help="Which augmentation family to use. "
-             "'rade' uses the current edge drop/add pipeline. "
-             "'dropmessage' uses message dropout (no RADE/unbiased/gradnorm). "
-             "'dropnode' uses node-wise feature masking (no RADE/unbiased/gradnorm). "
+             "'rade' uses the edge drop/add RADE pipeline. "
+             "'dropmessage' uses message dropout. "
+             "'dropnode' uses node-wise feature masking. "
              "'none' is clean training.",
     )
 
-    # DropMessage hyperparameter
     parser.add_argument(
         "--dropmessage_rate",
         type=float,
         default=0.9,
-        help="DropMessage rate (message dropout probability). Used only when --aug_tech=dropmessage.",
+        help="DropMessage rate. Used only when --aug_tech=dropmessage.",
     )
 
-    # DropNode hyperparameter
     parser.add_argument(
         "--dropnode_rate",
         type=float,
         default=0.9,
-        help="DropNode rate (node dropout probability). Used only when --aug_tech=dropnode.",
+        help="DropNode rate. Used only when --aug_tech=dropnode.",
     )
 
-    # RADE augmentation args
-    parser.add_argument("--aug_mode", type=str, default="both",
-                        choices=["none", "drop", "add", "both"],
-                        help="Graph augmentation mode per epoch.")
-    parser.add_argument("--p", type=float, default=0.5,
-                        help="Edge drop probability for edges (i,j) in E.")
-    parser.add_argument("--q", type=float, default=0.001303,
-                        help="Non-edge add probability for pairs (i,j) not in E (per-non-edge rate).")
+    # RADE perturbation args
+    parser.add_argument(
+        "--aug_mode",
+        type=str,
+        default="both",
+        choices=["none", "drop", "add", "both"],
+        help="Per-epoch graph perturbation mode.",
+    )
+    parser.add_argument(
+        "--p",
+        type=float,
+        default=0.2,
+        help="Edge-drop probability for clean edges (i,j) in E.",
+    )
+    parser.add_argument(
+        "--q",
+        type=float,
+        default=0.001303,
+        help="Non-edge-add probability for clean non-edges (i,j) not in E.",
+    )
 
-    parser.add_argument("--unbiased", type=bool, default=True,
-                        help="Use expectation-preserving (unbiased) aggregation for drop/add (RADE-style).")
-    # augmentation (Bernoulli drop/add)
+    parser.add_argument(
+        "--ep_correction",
+        type=bool,
+        default=False,
+        help="Use expectation-preserving aggregation correction for RADE.",
+    )
+
     parser.add_argument(
         "--mask_sharing",
         type=str,
         default="layerwise",
         choices=["shared", "layerwise"],
         help="RADE only: 'shared' uses one keep/add mask across all layers; "
-             "'layerwise' samples independent keep/add per layer per epoch."
+             "'layerwise' samples independent keep/add masks per layer per epoch.",
     )
 
     parser.add_argument(
-        "--unbiased_mode",
+        "--rade_variant",
         type=str,
-        default="rade",
-        choices=["rade", "rade-ic"],
-        help="When --unbiased=True: "
-             "'rade' uses train-time centering for additions (clean inference). "
-             "'rade-ic' uses no centering at train and applies inference correction.",
+        default="rade-of",
+        choices=["rade-of", "rade-ofs"],
+        help="RADE variant. "
+             "'rade-of' is the overfitting-oriented variant "
+             "(center additions at train; clean inference). "
+             "'rade-ofs' is the joint overfitting + over-squashing variant "
+             "(uncentered additions at train; inference-time augmentation correction).",
     )
 
     # ---- GradNorm p/q tuning (epoch-wise) ----
-    parser.add_argument("--pq_gradnorm", type=bool, default=False,
-                        help="Enable epoch-wise GradNorm matching to adapt (p,q).")
-
-    parser.add_argument("--p_max", type=float, default=0.8,
-                        help="Upper bound for p during GradNorm tuning.")
-    parser.add_argument("--q_max", type=float, default=0.001442,
-                        help="Upper bound for q during GradNorm tuning.")
-
-    parser.add_argument("--pq_grid_size", type=int, default=5,
-                        help="Grid size for (p,q) search. Use 11 for GIN; use 3-5 for GCN (costlier).")
-
-    parser.add_argument("--pq_subset_nodes", type=int, default=1024,
-                        help="Number of train nodes used to estimate GradNorm norms.")
-    parser.add_argument("--pq_ema", type=float, default=0.9,
-                        help="EMA smoothing for p,q updates (stability).")
-
-    parser.add_argument("--pq_update_every", type=int, default=1,
-                        help="Update (p,q) every k epochs.")
-    parser.add_argument("--pq_warmup_epochs", type=int, default=0,
-                        help="Number of initial epochs to skip pq updates.")
-    parser.add_argument("--pq_eps", type=float, default=1e-12,
-                        help="Small epsilon for log/denominator stabilizers.")
-    parser.add_argument("--pq_seed", type=int, default=0,
-                        help="Seed for selecting the subset of nodes for pq selection.")
+    parser.add_argument(
+        "--pq_gradnorm",
+        type=bool,
+        default=False,
+        help="Enable epoch-wise GradNorm matching to adapt (p,q).",
+    )
+    parser.add_argument("--p_max", type=float, default=0.8, help="Upper bound for p during GradNorm tuning.")
+    parser.add_argument("--q_max", type=float, default=0.001442, help="Upper bound for q during GradNorm tuning.")
+    parser.add_argument(
+        "--pq_grid_size",
+        type=int,
+        default=5,
+        help="Grid size for (p,q) search. Use 11 for GIN; use 3-5 for GCN (costlier).",
+    )
+    parser.add_argument(
+        "--pq_subset_nodes",
+        type=int,
+        default=1024,
+        help="Number of train nodes used to estimate GradNorm norms.",
+    )
+    parser.add_argument("--pq_ema", type=float, default=0.9, help="EMA smoothing for p,q updates (stability).")
+    parser.add_argument("--pq_update_every", type=int, default=1, help="Update (p,q) every k epochs.")
+    parser.add_argument("--pq_warmup_epochs", type=int, default=0, help="Number of initial epochs to skip pq updates.")
+    parser.add_argument("--pq_eps", type=float, default=1e-12, help="Small epsilon for log/denominator stabilizers.")
+    parser.add_argument("--pq_seed", type=int, default=0, help="Seed for selecting the subset of nodes for pq selection.")
 
     parser.add_argument(
         "--pq_data_anchor",
@@ -196,7 +220,7 @@ def parser_add_main_args(parser):
     )
 
     # -----------------------
-    # Weights & Biases (wandb)
+    # Weights & Biases
     # -----------------------
     parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
     parser.add_argument("--wandb_project", type=str, default="rade-nc")

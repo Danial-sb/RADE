@@ -1,13 +1,14 @@
-# main.py
 import os
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
 import argparse
 import random
 import time
+from typing import Tuple
+
 import numpy as np
 import torch
 import torch.nn as nn
-from typing import Tuple
 import wandb
 
 from logger import Logger, save_model, save_result
@@ -17,7 +18,6 @@ from eval import evaluate
 from parse import parse_method, parser_add_main_args
 from augmentation import BernoulliEdgeAugmentor
 from viz_pq import save_pq_plots
-
 from pq_gradnorm import PQGradNormTuner, PQTunerConfig
 
 
@@ -48,6 +48,7 @@ if getattr(args, "linear", False):
         args.bn = False
     if hasattr(args, "ln"):
         args.ln = False
+
 
 # -----------------------
 # wandb init (optional)
@@ -80,6 +81,7 @@ if getattr(args, "wandb", False):
         if hasattr(args, "ln"):
             args.ln = False
 
+
 # -----------------------
 # Linear-backbone routing
 # -----------------------
@@ -87,19 +89,19 @@ gnn_raw = str(getattr(args, "gnn", "gcn")).lower().strip()
 args.gnn_raw = gnn_raw  # keep for tagging/logging
 
 if gnn_raw == "sgc":
-    # SGC = linearized version of GCN stack (no nonlinearity, no aug)
+    # SGC = linearized version of GCN stack (no nonlinearity, no augmentation)
     args.gnn = "gcn"
     args.linear = True
 elif gnn_raw == "gin-linear":
-    # GIN-Linear = linearized version of GIN stack (no nonlinearity, no aug)
+    # GIN-Linear = linearized version of GIN stack (no nonlinearity, no augmentation)
     args.gnn = "gin"
     args.linear = True
 
-# If we routed to a linear backbone, hard-disable augmentation + stochastic layers
+# If routed to a strict linear backbone, disable stochastic augmentation / tuning
 if getattr(args, "linear", False) and gnn_raw in {"sgc", "gin-linear"}:
     args.aug_tech = "none"
     args.aug_mode = "none"
-    args.unbiased = False
+    args.ep_correction = False
     args.pq_gradnorm = False
 
     args.dropout = 0.0
@@ -116,9 +118,10 @@ aug_tech = str(getattr(args, "aug_tech", "rade")).lower().strip()
 if aug_tech not in {"rade", "dropmessage", "dropnode", "none"}:
     raise ValueError(f"--aug_tech must be one of {{rade, dropmessage, dropnode, none}}. Got {aug_tech}")
 
+
 def _require_no_rade_contrib(name: str) -> None:
-    if getattr(args, "unbiased", False):
-        raise ValueError(f"--aug_tech={name} must be used with --unbiased False.")
+    if getattr(args, "ep_correction", False):
+        raise ValueError(f"--aug_tech={name} must be used with --ep_correction False.")
     if getattr(args, "pq_gradnorm", False):
         raise ValueError(f"--aug_tech={name} must be used with --pq_gradnorm False.")
     if str(getattr(args, "aug_mode", "none")).lower().strip() != "none":
@@ -126,11 +129,12 @@ def _require_no_rade_contrib(name: str) -> None:
     if getattr(args, "linear", False):
         raise ValueError(f"--aug_tech={name} is incompatible with --linear (strict linearity).")
 
-# DropMessage must NOT use RADE contributions
+
+# DropMessage must NOT use RADE-specific contributions
 if aug_tech == "dropmessage":
     _require_no_rade_contrib("dropmessage")
 
-# DropNode must NOT use RADE contributions
+# DropNode must NOT use RADE-specific contributions
 if aug_tech == "dropnode":
     _require_no_rade_contrib("dropnode")
 
@@ -138,12 +142,14 @@ if aug_tech == "none":
     args.aug_mode = "none"
 
 print(
-    f"[CONFIG] dataset={args.dataset} | backbone_raw={getattr(args,'gnn_raw',args.gnn)} -> backbone={args.gnn} | "
-    f"linear={bool(getattr(args,'linear',False))} | aug_tech={args.aug_tech} aug_mode={args.aug_mode} | "
-    f"unbiased={bool(getattr(args,'unbiased',False))}({getattr(args,'unbiased_mode','-')}) | "
-    f"pq_gradnorm={bool(getattr(args,'pq_gradnorm',False))} | "
-    f"p={float(getattr(args,'p',0.0)):.4f} q={float(getattr(args,'q',0.0)):.6f} | "
-    f"mask_sharing={getattr(args,'mask_sharing','-')} "
+    f"[CONFIG] dataset={args.dataset} | backbone_raw={getattr(args, 'gnn_raw', args.gnn)} -> backbone={args.gnn} | "
+    f"linear={bool(getattr(args, 'linear', False))} | "
+    f"aug_tech={args.aug_tech} aug_mode={args.aug_mode} | "
+    f"ep_correction={bool(getattr(args, 'ep_correction', False))} "
+    f"(variant={getattr(args, 'rade_variant', '-')}) | "
+    f"pq_gradnorm={bool(getattr(args, 'pq_gradnorm', False))} | "
+    f"p={float(getattr(args, 'p', 0.0)):.4f} q={float(getattr(args, 'q', 0.0)):.6f} | "
+    f"mask_sharing={getattr(args, 'mask_sharing', '-')}"
 )
 
 fix_seed(args.seed)
@@ -186,6 +192,7 @@ augmentor = None
 if aug_tech == "rade":
     augmentor = BernoulliEdgeAugmentor.from_edge_index(data.edge_index, num_nodes=int(data.num_nodes))
 
+
 # -----------------------
 # Build split list for runs
 # -----------------------
@@ -197,7 +204,11 @@ for run in range(args.runs):
         split_idx = make_random_split_idx(n, args.train_prop, args.valid_prop, seed=args.seed + run)
     elif args.rand_split_class:
         split_idx = class_rand_splits(
-            data.y, args.label_num_per_class, valid_num=args.valid_num, test_num=args.test_num, seed=args.seed + run
+            data.y,
+            args.label_num_per_class,
+            valid_num=args.valid_num,
+            test_num=args.test_num,
+            seed=args.seed + run,
         )
     else:
         split_idx = base_split_idx
@@ -207,6 +218,7 @@ for run in range(args.runs):
 
 # Move data once
 data = data.to(device)
+
 
 def _enforce_aug_mode(p_val: float, q_val: float, aug_mode: str) -> Tuple[float, float]:
     aug_mode = str(aug_mode).lower().strip()
@@ -229,7 +241,7 @@ def _sync_for_timing(device: torch.device) -> None:
 # -----------------------
 model = parse_method(args, n, c, d, device)
 
-# IMPORTANT for RADE-GCN/RADE-GIN:
+# IMPORTANT for RADE-GCN / RADE-GIN:
 if aug_tech == "rade":
     if not hasattr(model, "set_graph"):
         raise RuntimeError("aug_tech=rade but model has no set_graph(). Add it to your model class.")
@@ -253,19 +265,20 @@ for run in range(args.runs):
     model.reset_parameters()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    # (p,q) used for THIS run
+    # (p, q) used for this run
     p_eff, q_eff = _enforce_aug_mode(float(args.p), float(args.q), args.aug_mode)
-    # record p,q used at each epoch (values used in THAT epoch's training)
+
+    # Record p, q used at each epoch
     p_trace = []
     q_trace = []
 
-    # Create a fresh tuner per run
+    # Fresh tuner per run
     pq_tuner = None
     if getattr(args, "pq_gradnorm", False):
         if str(args.aug_mode).lower().strip() == "none":
             raise ValueError("--pq_gradnorm requires --aug_mode != none.")
-        if not getattr(args, "unbiased", False):
-            raise ValueError("--pq_gradnorm currently implemented for RADE/RADE-IC only (use --unbiased True).")
+        if not getattr(args, "ep_correction", False):
+            raise ValueError("--pq_gradnorm currently requires --ep_correction True.")
 
         cfg = PQTunerConfig(
             p_max=float(getattr(args, "p_max", 0.5)),
@@ -275,13 +288,13 @@ for run in range(args.runs):
             eps=float(getattr(args, "pq_eps", 1e-12)),
             subset_nodes=int(getattr(args, "pq_subset_nodes", 1024)),
             seed=int(getattr(args, "pq_seed", 0)),
-            data_anchor=str(getattr(args, "pq_data_anchor", "clean")).lower().strip()
+            data_anchor=str(getattr(args, "pq_data_anchor", "clean")).lower().strip(),
         )
         pq_tuner = PQGradNormTuner(
             edge_index_clean=data.edge_index,
             num_nodes=int(data.num_nodes),
             gnn=str(args.gnn),
-            variant=str(args.unbiased_mode),
+            rade_variant=str(args.rade_variant),
             cfg=cfg,
         )
 
@@ -300,6 +313,7 @@ for run in range(args.runs):
 
         model.train()
         optimizer.zero_grad(set_to_none=True)
+
         p_trace.append(float(p_eff))
         q_trace.append(float(q_eff))
 
@@ -307,7 +321,6 @@ for run in range(args.runs):
         # Augment per epoch
         # -----------------------
         aug_stats = None
-        edge_index_aug = data.edge_index
         edge_index_keep = None
         edge_index_add = None
 
@@ -331,7 +344,6 @@ for run in range(args.runs):
                     seed=base_seed,
                     device=device,
                 )
-                edge_index_aug = data.edge_index
             else:
                 edge_index_keep = []
                 edge_index_add = []
@@ -353,7 +365,6 @@ for run in range(args.runs):
                     "dropped_undir_avg": float(sum(s["dropped_undir"] for s in stats_list)) / float(len(stats_list)),
                     "added_undir_avg": float(sum(s["added_undir"] for s in stats_list)) / float(len(stats_list)),
                 }
-                edge_index_aug = data.edge_index
 
         # -----------------------
         # Forward
@@ -387,7 +398,7 @@ for run in range(args.runs):
                 logits_eval = model(data.x, data.edge_index, dropmessage_rate=0.0)
             elif aug_tech == "dropnode":
                 logits_eval = model(data.x, data.edge_index, dropnode_rate=0.0)
-            elif getattr(args, "unbiased", False) and str(getattr(args, "unbiased_mode", "rade")) == "rade-ic":
+            elif getattr(args, "ep_correction", False) and str(getattr(args, "rade_variant", "rade-of")) == "rade-ofs":
                 logits_eval = model(data.x, data.edge_index, p=p_eff, q=q_eff)
             else:
                 logits_eval = model(data.x, data.edge_index)
@@ -402,7 +413,9 @@ for run in range(args.runs):
             result=logits_eval,
             device=device,
         )
+
         logger.add_result(run, result[:4])
+
         _sync_for_timing(device)
         epoch_time = time.perf_counter() - epoch_time
         logger.add_runtime(run, epoch_time)
@@ -435,13 +448,14 @@ for run in range(args.runs):
                 "valid/loss": float(result[3].item()) if hasattr(result[3], "item") else float(result[3]),
                 "best/valid_acc": float(best_val),
                 "best/test_acc_at_best_valid": float(best_test),
+                "runtime/epoch_sec": float(epoch_time),
             }
-
-            log_dict["runtime/epoch_sec"] = float(epoch_time)
 
             if aug_tech == "rade":
                 log_dict["aug/p"] = float(p_eff)
                 log_dict["aug/q"] = float(q_eff)
+                log_dict["rade/ep_correction"] = bool(getattr(args, "ep_correction", False))
+                log_dict["rade/variant"] = str(getattr(args, "rade_variant", "rade-of"))
 
                 if aug_stats is not None:
                     if "dropped_undir" in aug_stats:
@@ -477,7 +491,12 @@ for run in range(args.runs):
                         dU = aug_stats["dropped_undir_avg"]
                         aU = aug_stats["added_undir_avg"]
                         aug_str = f", Drop/Add(avg per layer): -{dU:.1f} +{aU:.1f} edges"
-                aug_str += f" (p={p_eff:.4f}, q={q_eff:.6f})"
+
+                aug_str += (
+                    f" (p={p_eff:.4f}, q={q_eff:.6f}, "
+                    f"ep_correction={bool(getattr(args, 'ep_correction', False))}, "
+                    f"variant={getattr(args, 'rade_variant', 'rade-of')})"
+                )
 
             elif aug_tech == "dropmessage":
                 aug_str = f" (dropmessage={dropmessage_rate:.3f})"
@@ -552,7 +571,6 @@ for run in range(args.runs):
                     num_layers=int(getattr(args, "local_layers", 1)),
                 )
 
-
                 if not prev_mode_training:
                     model.eval()
 
@@ -560,7 +578,7 @@ for run in range(args.runs):
                 p_eff, q_eff = p_new, q_new
 
                 print(
-                    f"[PQ-GradNorm] run={run+1:02d} epoch={epoch+1:03d} "
+                    f"[PQ-GradNorm] run={run + 1:02d} epoch={epoch + 1:03d} "
                     f"G_data={info['G_data']:.3e} G_reg_best={info['G_reg_best']:.3e} "
                     f"p(best->new)={info['p_best']:.4f}->{info['p_new']:.4f} "
                     f"q(best->new)={info['q_best']:.6f}->{info['q_new']:.6f} obj={info['obj']:.2e}"
@@ -587,14 +605,14 @@ for run in range(args.runs):
 
 results = logger.print_statistics()
 runtime_summary = logger.get_runtime_summary()
+
 # Save GradNorm p/q schedules (mean±std over runs) when pq_gradnorm is enabled
 if getattr(args, "pq_gradnorm", False) and str(getattr(args, "aug_tech", "rade")).lower().strip() == "rade":
     dataset_tag = str(args.dataset).lower().strip()
     gnn_tag = str(getattr(args, "gnn_raw", getattr(args, "gnn", "gcn"))).lower().strip()
-    mode_tag = str(getattr(args, "unbiased_mode", "rade")).lower().strip()  # "rade" or "rade-ic"
-    mode_tag = "radeic" if mode_tag == "rade-ic" else mode_tag              # filename-friendly
+    variant_tag = str(getattr(args, "rade_variant", "rade-of")).lower().strip().replace("-", "")
 
-    tag = f"{dataset_tag}_{gnn_tag}_{mode_tag}"  # e.g., "cora_gcn_rade" or "cora_gcn_radeic"
+    tag = f"{dataset_tag}_{gnn_tag}_{variant_tag}"  # e.g. "cora_gcn_radeof" or "cora_gcn_radeofs"
 
     save_pq_plots(
         p_histories,
@@ -603,7 +621,6 @@ if getattr(args, "pq_gradnorm", False) and str(getattr(args, "aug_tech", "rade")
         out_dir="visualization",
         show_runs=True,
     )
-
 
 save_result(args, results, runtime_summary=runtime_summary)
 

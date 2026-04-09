@@ -1,4 +1,3 @@
-#models.py
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
@@ -26,8 +25,8 @@ class MPNNs(torch.nn.Module):
         bn=False,
         jk=False,
         gnn="gcn",
-        unbiased: bool = False,
-        unbiased_mode: str = "rade",
+        ep_correction: bool = False,
+        rade_variant: str = "rade-of",
         linear: bool = False,
         aug_tech: str = "rade",
     ):
@@ -35,8 +34,10 @@ class MPNNs(torch.nn.Module):
 
         assert gnn in ("gcn", "gin"), "gnn must be 'gcn' or 'gin'"
         assert local_layers >= 1, "local_layers must be >= 1"
-        if unbiased_mode not in ("rade", "rade-ic"):
-            raise ValueError(f"unbiased_mode must be 'rade' or 'rade-ic'. Got {unbiased_mode}")
+        if rade_variant not in ("rade-of", "rade-ofs"):
+            raise ValueError(
+                f"rade_variant must be one of {{'rade-of', 'rade-ofs'}}. Got {rade_variant}"
+            )
 
         self.linear = bool(linear)
 
@@ -56,12 +57,15 @@ class MPNNs(torch.nn.Module):
         self.bn = bool(bn)
         self.jk = bool(jk)
         self.gnn = gnn
-        self.unbiased = bool(unbiased)
-        self.unbiased_mode = str(unbiased_mode)
+
+        self.ep_correction = bool(ep_correction)
+        self.rade_variant = str(rade_variant)
 
         self.aug_tech = str(aug_tech).lower().strip()
         if self.aug_tech not in {"rade", "dropmessage", "dropnode", "none"}:
-            raise ValueError(f"aug_tech must be one of {{rade, dropmessage, dropnode, none}}. Got {self.aug_tech}")
+            raise ValueError(
+                f"aug_tech must be one of {{rade, dropmessage, dropnode, none}}. Got {self.aug_tech}"
+            )
 
         self.lin_in = torch.nn.Linear(in_channels, hidden_channels) if self.pre_linear else None
 
@@ -70,8 +74,6 @@ class MPNNs(torch.nn.Module):
         self.lns = torch.nn.ModuleList() if self.ln else None
         self.bns = torch.nn.ModuleList() if self.bn else None
 
-
-        # ----- helpers for GIN -----
         def make_gin_mlp(in_dim: int, out_dim: int) -> nn.Module:
             if self.linear:
                 return nn.Linear(in_dim, out_dim)
@@ -83,8 +85,6 @@ class MPNNs(torch.nn.Module):
 
         first_in = hidden_channels if self.pre_linear else in_channels
         L = int(local_layers)
-
-        use_ic = (self.unbiased and self.unbiased_mode == "rade-ic")
 
         # -------------------------
         # Build layers
@@ -99,8 +99,8 @@ class MPNNs(torch.nn.Module):
                 if self.aug_tech == "rade":
                     conv = RADEGINConv(
                         mlp,
-                        ic_mode=use_ic,
-                        apply_corrections=self.unbiased,
+                        rade_variant=self.rade_variant,
+                        ep_correction=self.ep_correction,
                     )
                 elif self.aug_tech == "dropmessage":
                     conv = DropMessageGINConv(mlp)
@@ -114,8 +114,8 @@ class MPNNs(torch.nn.Module):
                         out_dim,
                         bias=True,
                         correct_self_loop=True,
-                        ic_mode=use_ic,
-                        apply_corrections=self.unbiased,
+                        rade_variant=self.rade_variant,
+                        ep_correction=self.ep_correction,
                     )
                 elif self.aug_tech == "dropmessage":
                     conv = DropMessageGCNConv(in_dim, out_dim, bias=True)
@@ -159,9 +159,7 @@ class MPNNs(torch.nn.Module):
     @staticmethod
     def _apply_dropnode(x: torch.Tensor, dropnode_rate: float, training: bool) -> torch.Tensor:
         """
-        DropNode = node-wise feature masking:
-          mask_i ~ Bernoulli(1 - r), shared across feature dims.
-        We rescale by 1/(1-r) so E[masked x] matches x (standard dropout-style).
+        DropNode baseline: node-wise feature masking.
         """
         r = float(dropnode_rate)
         if (not training) or r <= 0.0:
@@ -185,13 +183,13 @@ class MPNNs(torch.nn.Module):
         dropnode_rate: float = 0.0,
         return_embeddings: bool = False,
     ):
-        # Pre-linear (optional)
+        # Optional input projection
         if self.lin_in is not None:
             x = self.lin_in(x)
             if (not self.linear) and (self.dropout > 0.0):
                 x = F.dropout(x, p=self.dropout, training=self.training)
 
-        # DropNode (baseline): only when selected
+        # DropNode baseline
         if self.aug_tech == "dropnode":
             x = self._apply_dropnode(x, dropnode_rate=float(dropnode_rate), training=self.training)
 
@@ -200,6 +198,7 @@ class MPNNs(torch.nn.Module):
 
         L = len(self.local_convs)
 
+        # Active when training on sampled RADE views.
         rade_active = (
             self.aug_tech == "rade"
             and self.training
@@ -220,7 +219,7 @@ class MPNNs(torch.nn.Module):
         x_final = None
 
         for i, conv in enumerate(self.local_convs):
-            x_in = x  # for residual
+            x_in = x  # for residual path
 
             apply_rade_here = rade_active and hasattr(conv, "set_graph")
 
@@ -236,7 +235,7 @@ class MPNNs(torch.nn.Module):
                     q=q,
                 )
             else:
-                # RADE convs may use p,q in eval for RADE-IC inference correction
+                # RADE convs may still use p,q in eval for RADE-OFS inference correction.
                 if hasattr(conv, "set_graph"):
                     x = conv(x, edge_index_clean, p=p, q=q)
                 elif getattr(conv, "supports_dropmessage", False):

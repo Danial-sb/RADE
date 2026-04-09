@@ -1,4 +1,3 @@
-# pq_gradnorm.py
 from __future__ import annotations
 
 import math
@@ -7,8 +6,8 @@ from typing import Dict, Tuple, List
 
 import torch
 import torch.nn as nn
-from augmentation import BernoulliEdgeAugmentor
 
+from augmentation import BernoulliEdgeAugmentor
 from rade_convs import (
     GraphCache,
     _scatter_add_rows,
@@ -17,6 +16,15 @@ from rade_convs import (
     _delta_E_inv_caseA,
     _delta_E_inv_caseB,
 )
+
+
+def _validate_rade_variant(rade_variant: str) -> str:
+    rade_variant = str(rade_variant).lower().strip()
+    if rade_variant not in {"rade-of", "rade-ofs"}:
+        raise ValueError(
+            f"rade_variant must be one of {{'rade-of', 'rade-ofs'}}. Got {rade_variant}"
+        )
+    return rade_variant
 
 
 def _grad_norm(grads) -> float:
@@ -38,7 +46,7 @@ def _dot(grads_a, grads_b) -> float:
 
 
 def _pick_subset(idx: torch.Tensor, k: int, seed: int) -> torch.Tensor:
-    # k==0 means: use full idx (full_batch setting)
+    # k == 0 means: use full idx (full-batch setting)
     if k <= 0 or k >= idx.numel():
         return idx
     g = torch.Generator(device=idx.device)
@@ -85,16 +93,23 @@ class PQTunerConfig:
 
 class PQGradNormTuner:
     """
-    Epoch-wise GradNorm matcher for RADE / RADE-IC.
+    Epoch-wise GradNorm matcher for RADE-OF / RADE-OFS.
 
-    - GIN: fast (two base gradients).
-    - GCN: grid (each candidate does one autograd.grad on R).
+    - GIN: fast path via two base gradients
+    - GCN: grid search, each candidate does one autograd.grad on the detached-variance proxy
     """
 
-    def __init__(self, edge_index_clean: torch.Tensor, num_nodes: int, gnn: str, variant: str, cfg: PQTunerConfig):
+    def __init__(
+        self,
+        edge_index_clean: torch.Tensor,
+        num_nodes: int,
+        gnn: str,
+        rade_variant: str,
+        cfg: PQTunerConfig,
+    ):
         self.cfg = cfg
-        self.gnn = str(gnn).lower().strip()         # 'gin' or 'gcn'
-        self.variant = str(variant).lower().strip() # 'rade' or 'rade-ic'
+        self.gnn = str(gnn).lower().strip()                # 'gin' or 'gcn'
+        self.rade_variant = _validate_rade_variant(rade_variant)
         self.cache = GraphCache.from_edge_index(edge_index_clean, int(num_nodes))
         self.N = int(num_nodes)
 
@@ -117,22 +132,22 @@ class PQGradNormTuner:
     def _messages_detached(self, emb: torch.Tensor, W: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         h = emb.detach()
         W = W.detach()
-        m = h @ W.t()      # [N,C]
+        m = h @ W.t()      # [N, C]
         return m, m * m
 
     def _var_gin_bases(self, m: torch.Tensor, m_sq: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         row, col = self.cache.edge_index_clean_dir
-        neigh_sum_sq = _scatter_add_rows(m_sq[row], col, self.N)  # [N,C]
-        comp_sum_sq = self.cache.complement_sum_unweighted(m_sq)  # [N,C]
+        neigh_sum_sq = _scatter_add_rows(m_sq[row], col, self.N)  # [N, C]
+        comp_sum_sq = self.cache.complement_sum_unweighted(m_sq)  # [N, C]
 
-        if self.variant == "rade":
-            comp_sum_m = self.cache.complement_sum_unweighted(m)  # [N,C]
+        if self.rade_variant == "rade-of":
+            comp_sum_m = self.cache.complement_sum_unweighted(m)  # [N, C]
             comp_size = self.cache.comp_size.to(m.dtype).clamp_min(1.0).unsqueeze(1)
             mu = comp_sum_m / comp_size
             add_centered = comp_sum_sq - 2.0 * mu * comp_sum_m + comp_size * (mu * mu)
             return neigh_sum_sq, add_centered
 
-        # rade-ic
+        # RADE-OFS
         return neigh_sum_sq, comp_sum_sq
 
     @torch.no_grad()
@@ -144,7 +159,7 @@ class PQGradNormTuner:
         comp = self.cache.comp_size.to(torch.float32)
         d_hat = (deg + 1.0).clamp_min(1.0)
 
-        # --- edges (Case A) ---
+        # --- retained clean edges: Case A ---
         tA = _delta_E_inv_sqrt_caseA(deg, comp, p=p, q=q)
         uA = _delta_E_inv_caseA(deg, comp, p=p, q=q, eps=eps)
 
@@ -152,17 +167,17 @@ class PQGradNormTuner:
         E2 = (1.0 - p) * (uA[row] * uA[col])
         VarG = (E2 - E * E).clamp_min(0.0)
 
-        alpha_sq = 1.0 / (d_hat[row] * d_hat[col])  # alpha^2
+        alpha_sq = 1.0 / (d_hat[row] * d_hat[col])  # clean alpha^2
         factor = alpha_sq * (VarG / (E * E + eps))  # per-directed-edge
         neigh_var = _scatter_add_rows(factor.unsqueeze(1) * m_sq[row], col, self.N)
 
-        # --- non-edges (Case B) ---
+        # --- clean non-edges: Case B ---
         tB = _delta_E_inv_sqrt_caseB(deg, comp, p=p, q=q)
         uB = _delta_E_inv_caseB(deg, comp, p=p, q=q, eps=eps)
         tB2 = tB * tB
 
-        if self.variant == "rade":
-            # mu weights ∝ tB[j]
+        if self.rade_variant == "rade-of":
+            # weighted centering with weights proportional to tB[j]
             mu = self.cache.complement_mean_weighted(m, tB)
 
             ones = torch.ones((self.N, 1), device=m.device, dtype=m.dtype)
@@ -179,7 +194,7 @@ class PQGradNormTuner:
             C_t = self.cache.complement_sum_weighted(ones, tB2)
             S2 = A_t - 2.0 * mu * B_t + (mu * mu) * C_t
         else:
-            # rade-ic: uncentered
+            # RADE-OFS: uncentered non-edge contributions
             S1 = self.cache.complement_sum_weighted(m_sq, uB)
             S2 = self.cache.complement_sum_weighted(m_sq, tB2)
 
@@ -203,16 +218,15 @@ class PQGradNormTuner:
         cfg = self.cfg
         eps = cfg.eps
 
-        # (Optional) subset for speed; set subset_nodes=0 for full train_idx
+        # Optional subset for speed; subset_nodes=0 => full train_idx
         idx = _pick_subset(train_idx, cfg.subset_nodes, seed=epoch_seed)
 
-        # We want training-mode gradients (dropout consistent), but we must NOT update BN running stats.
+        # We want training-mode gradients (dropout consistent), but must NOT update BN running stats.
         was_training = model.training
         model.train()
         bn_states = _freeze_batchnorm_buffers(model)
 
         # Isolate RNG usage so this tuning step does not consume global RNG state.
-        # Works for CPU and CUDA.
         devices = []
         if data.x.is_cuda and data.x.device.index is not None:
             devices = [data.x.device.index]
@@ -222,12 +236,10 @@ class PQGradNormTuner:
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(int(epoch_seed) + int(cfg.seed))
 
-            # Ensure clean grads for safety (autograd.grad does not write .grad, but keep this explicit)
             model.zero_grad(set_to_none=True)
 
-            # clean forward (no RADE masks, no inference correction)
             # -------------------------
-            # 1) Anchor data gradient norm (clean or aug)
+            # 1) Anchor data gradient norm (clean or one stochastic RADE draw)
             # -------------------------
             def _sample_masks_for_anchor(p0: float, q0: float):
                 mode0 = str(aug_mode).lower().strip()
@@ -268,8 +280,8 @@ class PQGradNormTuner:
             model.zero_grad(set_to_none=True)
 
             if self.data_anchor == "aug":
-                # Use the SAME kind of stochastic training forward that SGD sees (one draw of masks),
-                # anchored at the CURRENT (p,q), not the candidate (p_try,q_try).
+                # Use the same kind of stochastic training forward that SGD sees,
+                # anchored at the current (p, q), not the candidate (p_try, q_try).
                 ei_keep0, ei_add0 = _sample_masks_for_anchor(float(current_p), float(current_q))
 
                 if ei_keep0 is None and ei_add0 is None:
@@ -294,9 +306,9 @@ class PQGradNormTuner:
             logGd = math.log(G_data + eps)
 
             # -------------------------
-            # 2) Snapshot for regularizer proxy (keep existing convention)
+            # 2) Snapshot for regularizer proxy
             #    Always compute from a clean forward (theoretical reference),
-            #    while Var remains detached.
+            #    while the variance term stays detached.
             # -------------------------
             model.zero_grad(set_to_none=True)
             logits, emb = model(data.x, data.edge_index, p=0.0, q=0.0, return_embeddings=True)
@@ -304,11 +316,10 @@ class PQGradNormTuner:
             W = model.pred_local.weight
             m, m_sq = self._messages_detached(emb, W)
 
-            # z(1-z)-like weights (multiclass); differentiable; Var stays detached
+            # Multiclass analogue of z(1-z); differentiable; Var stays detached.
             w = _w_multiclass(logits)
 
-
-            # bounds / grids (respect aug_mode)
+            # Bounds / grids (respect aug_mode)
             aug_mode = str(aug_mode).lower().strip()
             p_max = cfg.p_max if aug_mode in ("both", "drop") else 0.0
             q_max = cfg.q_max if aug_mode in ("both", "add") else 0.0
@@ -317,17 +328,16 @@ class PQGradNormTuner:
                 0.0, float(p_max), steps=int(cfg.grid_size), device=data.x.device
             ).tolist()
 
-            # --- REPLACE q_grid linspace with a K_add-based grid (prevents "q floor" / fixed added edges) ---
+            # q-grid based on expected number of additions K_add; avoids a "q floor"
             if q_max <= 0.0:
                 q_grid = [0.0]
             else:
-                M_undir = max(1, self._num_non_edges_undirected())  # number of undirected non-edges
-                K_max = int(round(float(q_max) * float(M_undir)))   # max expected undirected additions under q_max
+                M_undir = max(1, self._num_non_edges_undirected())
+                K_max = int(round(float(q_max) * float(M_undir)))
 
                 if K_max <= 0:
                     q_grid = [0.0]
                 else:
-                    # Always include very small expected-add counts so q can go below q_max/(grid_size-1)
                     K_core = [0, 1, 2, 5, 10, 20, 50]
                     K_core = [k for k in K_core if k <= K_max]
 
@@ -342,13 +352,12 @@ class PQGradNormTuner:
                     K_list = sorted(set(K_core + K_lin))[:target]
                     q_grid = [float(k) / float(M_undir) for k in K_list]
 
-
             best_obj = float("inf")
             best_p, best_q = 0.0, 0.0
             best_Greg = 0.0
 
             if self.gnn == "gin":
-                V_drop, V_add = self._var_gin_bases(m, m_sq)  # detached bases
+                V_drop, V_add = self._var_gin_bases(m, m_sq)
 
                 R_drop = 0.5 * (w[idx] * V_drop[idx]).sum() / max(int(idx.numel()), 1)
                 R_add = 0.5 * (w[idx] * V_add[idx]).sum() / max(int(idx.numel()), 1)
@@ -361,7 +370,7 @@ class PQGradNormTuner:
                 c = _dot(g_drop, g_add)
 
                 for p_try in p_grid:
-                    s = p_try / max(1.0 - p_try, eps)   # p/(1-p)
+                    s = p_try / max(1.0 - p_try, eps)   # p / (1-p)
                     for q_try in q_grid:
                         t = q_try * (1.0 - q_try)       # q(1-q)
                         g2 = (s * s) * a + (t * t) * b + 2.0 * s * t * c
@@ -373,7 +382,7 @@ class PQGradNormTuner:
             elif self.gnn == "gcn":
                 for p_try in p_grid:
                     for q_try in q_grid:
-                        V = self._var_gcn(float(p_try), float(q_try), m, m_sq)  # detached
+                        V = self._var_gcn(float(p_try), float(q_try), m, m_sq)
                         R = 0.5 * (w[idx] * V[idx]).sum() / max(int(idx.numel()), 1)
 
                         g_reg = torch.autograd.grad(R, params, retain_graph=True, create_graph=False, allow_unused=True)
@@ -396,7 +405,7 @@ class PQGradNormTuner:
         p_new = cfg.ema * float(current_p) + (1.0 - cfg.ema) * float(best_p)
         q_new = cfg.ema * float(current_q) + (1.0 - cfg.ema) * float(best_q)
 
-        # enforce aug_mode
+        # Enforce aug_mode
         if aug_mode == "drop":
             q_new = 0.0
         elif aug_mode == "add":
@@ -404,7 +413,7 @@ class PQGradNormTuner:
         elif aug_mode == "none":
             p_new, q_new = 0.0, 0.0
 
-        # clamp
+        # Clamp
         p_new = float(max(0.0, min(p_new, cfg.p_max)))
         q_new = float(max(0.0, min(q_new, cfg.q_max)))
 
