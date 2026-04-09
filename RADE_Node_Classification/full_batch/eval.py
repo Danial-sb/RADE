@@ -1,4 +1,4 @@
-# eval.py (PATCH: make split_idx device-safe)
+# eval.py
 
 import torch
 import torch.nn.functional as F

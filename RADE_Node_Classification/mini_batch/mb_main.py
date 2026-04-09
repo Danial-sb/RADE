@@ -4,6 +4,7 @@ os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 import argparse
 import random
+import time
 from typing import Tuple, Dict, Any, List, Optional
 
 import numpy as np
@@ -129,6 +130,34 @@ mb_rade_mode = str(getattr(args, "mb_rade_mode", "local")).lower().strip()
 if mb_rade_mode not in {"local", "disabled"}:
     raise ValueError(f"--mb_rade_mode must be one of {{local, disabled}}. Got {mb_rade_mode}")
 
+# -----------------------
+# Linear-backbone routing
+# -----------------------
+gnn_raw = str(getattr(args, "gnn", "gcn")).lower().strip()
+args.gnn_raw = gnn_raw  # keep for tagging/logging
+
+if gnn_raw == "sgc":
+    # SGC = linearized version of GCN stack (no nonlinearity, no aug)
+    args.gnn = "gcn"
+    args.linear = True
+elif gnn_raw == "gin-linear":
+    # GIN-Linear = linearized version of GIN stack (no nonlinearity, no aug)
+    args.gnn = "gin"
+    args.linear = True
+
+# If we routed to a linear backbone, hard-disable augmentation + stochastic layers
+if getattr(args, "linear", False) and gnn_raw in {"sgc", "gin-linear"}:
+    args.aug_tech = "none"
+    args.aug_mode = "none"
+    args.unbiased = False
+    args.pq_gradnorm = False
+
+    args.dropout = 0.0
+    if hasattr(args, "bn"):
+        args.bn = False
+    if hasattr(args, "ln"):
+        args.ln = False
+
 fix_seed(int(args.seed))
 
 if args.cpu:
@@ -163,6 +192,15 @@ if wandb_run is not None:
         allow_val_change=True,
     )
 
+print(
+    f"[CONFIG] dataset={args.dataset} | backbone_raw={getattr(args,'gnn_raw',args.gnn)} -> backbone={args.gnn} | "
+    f"linear={bool(getattr(args,'linear',False))} | aug_tech={args.aug_tech} aug_mode={args.aug_mode} | "
+    f"unbiased={bool(getattr(args,'unbiased',False))}({getattr(args,'unbiased_mode','-')}) | "
+    f"pq_gradnorm={bool(getattr(args,'pq_gradnorm',False))} | "
+    f"p={float(getattr(args,'p',0.0)):.4f} q={float(getattr(args,'q',0.0)):.6f} | "
+    f"mask_sharing={getattr(args,'mask_sharing','-')} "
+)
+
 # -----------------------
 # Build split list for runs
 # -----------------------
@@ -194,12 +232,15 @@ logger = Logger(int(args.runs), args)
 
 print("MODEL:", model)
 
+
+def _sync_for_timing(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
 # -----------------------
 # NeighborLoader config
 # -----------------------
 # Map the CLI knobs into the NeighborLoaderConfig used by mb_loaders.py
-# -----------------------
-# NeighborLoader config
 # -----------------------
 num_workers = int(getattr(args, "mb_num_workers", 0))
 batch_size_train = int(getattr(args, "batch_size", 2048))
@@ -282,6 +323,8 @@ for run in range(int(args.runs)):
         save_model(args, model, optimizer, run)
 
     for epoch in range(int(args.epochs)):
+        _sync_for_timing(device)
+        epoch_time = time.perf_counter()
         model.train()
 
         # Epoch aggregates (for logging)
@@ -496,6 +539,9 @@ for run in range(int(args.runs)):
 
         result = (float(tr), float(va), float(te), float(va_loss), None)
         logger.add_result(run, result[:4])
+        _sync_for_timing(device)
+        epoch_time = time.perf_counter() - epoch_time
+        logger.add_runtime(run, epoch_time)
 
         improved = (result[1] > best_val)
         if improved:
@@ -605,6 +651,8 @@ for run in range(int(args.runs)):
             elif aug_tech == "dropnode":
                 aug_str = f" (dropnode={float(getattr(args, 'dropnode_rate', 0.0)):.3f})"
 
+            aug_str += f", Epoch Time: {epoch_time:.4f}s"
+
             print(
                 f"Run: {run + 1:02d}, "
                 f"Epoch: {epoch:03d}, "
@@ -648,12 +696,18 @@ for run in range(int(args.runs)):
     logger.print_statistics(run)
 
 results = logger.print_statistics()
-save_result(args, results)
+runtime_summary = logger.get_runtime_summary()
+save_result(args, results, runtime_summary=runtime_summary)
 
 if wandb_run is not None:
     try:
         wandb_run.summary["final_test_mean"] = float(results.mean().item())
         wandb_run.summary["final_test_std"] = float(results.std().item())
+        if runtime_summary is not None:
+            wandb_run.summary["runtime/profile"] = "all_mini_batch_runs"
+            wandb_run.summary["runtime/epoch_sec_run_mean"] = float(runtime_summary["run_mean"])
+            wandb_run.summary["runtime/epoch_sec_run_std"] = float(runtime_summary["run_std"])
+            wandb_run.summary["runtime/epoch_sec_pooled_mean"] = float(runtime_summary["pooled_mean"])
     except Exception:
         pass
     wandb.finish()

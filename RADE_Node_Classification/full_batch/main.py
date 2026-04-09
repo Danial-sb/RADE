@@ -3,6 +3,7 @@ import os
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 import argparse
 import random
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -15,6 +16,7 @@ from data_utils import eval_acc_nc, class_rand_splits, make_random_split_idx, ev
 from eval import evaluate
 from parse import parse_method, parser_add_main_args
 from augmentation import BernoulliEdgeAugmentor
+from viz_pq import save_pq_plots
 
 from pq_gradnorm import PQGradNormTuner, PQTunerConfig
 
@@ -79,6 +81,35 @@ if getattr(args, "wandb", False):
             args.ln = False
 
 # -----------------------
+# Linear-backbone routing
+# -----------------------
+gnn_raw = str(getattr(args, "gnn", "gcn")).lower().strip()
+args.gnn_raw = gnn_raw  # keep for tagging/logging
+
+if gnn_raw == "sgc":
+    # SGC = linearized version of GCN stack (no nonlinearity, no aug)
+    args.gnn = "gcn"
+    args.linear = True
+elif gnn_raw == "gin-linear":
+    # GIN-Linear = linearized version of GIN stack (no nonlinearity, no aug)
+    args.gnn = "gin"
+    args.linear = True
+
+# If we routed to a linear backbone, hard-disable augmentation + stochastic layers
+if getattr(args, "linear", False) and gnn_raw in {"sgc", "gin-linear"}:
+    args.aug_tech = "none"
+    args.aug_mode = "none"
+    args.unbiased = False
+    args.pq_gradnorm = False
+
+    args.dropout = 0.0
+    if hasattr(args, "bn"):
+        args.bn = False
+    if hasattr(args, "ln"):
+        args.ln = False
+
+
+# -----------------------
 # Augmentation technique routing
 # -----------------------
 aug_tech = str(getattr(args, "aug_tech", "rade")).lower().strip()
@@ -105,6 +136,15 @@ if aug_tech == "dropnode":
 
 if aug_tech == "none":
     args.aug_mode = "none"
+
+print(
+    f"[CONFIG] dataset={args.dataset} | backbone_raw={getattr(args,'gnn_raw',args.gnn)} -> backbone={args.gnn} | "
+    f"linear={bool(getattr(args,'linear',False))} | aug_tech={args.aug_tech} aug_mode={args.aug_mode} | "
+    f"unbiased={bool(getattr(args,'unbiased',False))}({getattr(args,'unbiased_mode','-')}) | "
+    f"pq_gradnorm={bool(getattr(args,'pq_gradnorm',False))} | "
+    f"p={float(getattr(args,'p',0.0)):.4f} q={float(getattr(args,'q',0.0)):.6f} | "
+    f"mask_sharing={getattr(args,'mask_sharing','-')} "
+)
 
 fix_seed(args.seed)
 
@@ -150,6 +190,8 @@ if aug_tech == "rade":
 # Build split list for runs
 # -----------------------
 split_idx_lst = []
+p_histories = []
+q_histories = []
 for run in range(args.runs):
     if args.rand_split:
         split_idx = make_random_split_idx(n, args.train_prop, args.valid_prop, seed=args.seed + run)
@@ -166,24 +208,6 @@ for run in range(args.runs):
 # Move data once
 data = data.to(device)
 
-# -----------------------
-# Model / loss / metric
-# -----------------------
-model = parse_method(args, n, c, d, device)
-
-# IMPORTANT for RADE-GCN/RADE-GIN:
-if getattr(args, "unbiased", False):
-    if not hasattr(model, "set_graph"):
-        raise RuntimeError("args.unbiased=True but model has no set_graph(). Add it to your model class.")
-    model.set_graph(data.edge_index, int(data.num_nodes))
-
-criterion = nn.CrossEntropyLoss()
-eval_func = eval_f1_nc if args.dataset.lower() == "flickr" else eval_acc_nc
-logger = Logger(args.runs, args)
-
-print("MODEL:", model)
-
-
 def _enforce_aug_mode(p_val: float, q_val: float, aug_mode: str) -> Tuple[float, float]:
     aug_mode = str(aug_mode).lower().strip()
     if aug_mode == "drop":
@@ -193,6 +217,30 @@ def _enforce_aug_mode(p_val: float, q_val: float, aug_mode: str) -> Tuple[float,
     if aug_mode == "none":
         return 0.0, 0.0
     return float(p_val), float(q_val)
+
+
+def _sync_for_timing(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+# -----------------------
+# Model / loss / metric
+# -----------------------
+model = parse_method(args, n, c, d, device)
+
+# IMPORTANT for RADE-GCN/RADE-GIN:
+if aug_tech == "rade":
+    if not hasattr(model, "set_graph"):
+        raise RuntimeError("aug_tech=rade but model has no set_graph(). Add it to your model class.")
+    model.set_graph(data.edge_index, int(data.num_nodes))
+
+criterion = nn.CrossEntropyLoss()
+eval_func = eval_f1_nc if args.dataset.lower() == "flickr" else eval_acc_nc
+logger = Logger(args.runs, args)
+
+print("MODEL:", model)
+print("[Timing] enabled for all full-batch runs")
 
 
 # -----------------------
@@ -207,6 +255,9 @@ for run in range(args.runs):
 
     # (p,q) used for THIS run
     p_eff, q_eff = _enforce_aug_mode(float(args.p), float(args.q), args.aug_mode)
+    # record p,q used at each epoch (values used in THAT epoch's training)
+    p_trace = []
+    q_trace = []
 
     # Create a fresh tuner per run
     pq_tuner = None
@@ -244,8 +295,13 @@ for run in range(args.runs):
         save_model(args, model, optimizer, run)
 
     for epoch in range(args.epochs):
+        _sync_for_timing(device)
+        epoch_time = time.perf_counter()
+
         model.train()
         optimizer.zero_grad(set_to_none=True)
+        p_trace.append(float(p_eff))
+        q_trace.append(float(q_eff))
 
         # -----------------------
         # Augment per epoch
@@ -265,50 +321,39 @@ for run in range(args.runs):
         )
 
         if do_aug:
-            if getattr(args, "unbiased", False):
-                base_seed = args.seed + 10_000 * run + epoch
+            base_seed = args.seed + 10_000 * run + epoch
 
-                if str(getattr(args, "mask_sharing", "shared")).lower().strip() == "shared":
-                    _, edge_index_keep, edge_index_add, aug_stats = augmentor.augment_edge_indices(
-                        p=p_eff,
-                        q=q_eff,
-                        mode=args.aug_mode,
-                        seed=base_seed,
-                        device=device,
-                    )
-                    edge_index_aug = data.edge_index
-                else:
-                    edge_index_keep = []
-                    edge_index_add = []
-                    stats_list = []
-
-                    for layer in range(int(args.local_layers)):
-                        _, ei_keep_l, ei_add_l, st = augmentor.augment_edge_indices(
-                            p=p_eff,
-                            q=q_eff,
-                            mode=args.aug_mode,
-                            seed=base_seed + 1_000_000 * layer,
-                            device=device,
-                        )
-                        edge_index_keep.append(ei_keep_l)
-                        edge_index_add.append(ei_add_l)
-                        stats_list.append(st)
-
-                    aug_stats = {
-                        "dropped_undir_avg": float(sum(s["dropped_undir"] for s in stats_list)) / float(len(stats_list)),
-                        "added_undir_avg": float(sum(s["added_undir"] for s in stats_list)) / float(len(stats_list)),
-                    }
-                    edge_index_aug = data.edge_index
-
-            else:
-                edge_index_aug, aug_stats = augmentor.augment_edge_index(
+            if str(getattr(args, "mask_sharing", "shared")).lower().strip() == "shared":
+                _, edge_index_keep, edge_index_add, aug_stats = augmentor.augment_edge_indices(
                     p=p_eff,
                     q=q_eff,
                     mode=args.aug_mode,
-                    seed=args.seed + 10_000 * run + epoch,
+                    seed=base_seed,
                     device=device,
-                    return_stats=True,
                 )
+                edge_index_aug = data.edge_index
+            else:
+                edge_index_keep = []
+                edge_index_add = []
+                stats_list = []
+
+                for layer in range(int(args.local_layers)):
+                    _, ei_keep_l, ei_add_l, st = augmentor.augment_edge_indices(
+                        p=p_eff,
+                        q=q_eff,
+                        mode=args.aug_mode,
+                        seed=base_seed + 1_000_000 * layer,
+                        device=device,
+                    )
+                    edge_index_keep.append(ei_keep_l)
+                    edge_index_add.append(ei_add_l)
+                    stats_list.append(st)
+
+                aug_stats = {
+                    "dropped_undir_avg": float(sum(s["dropped_undir"] for s in stats_list)) / float(len(stats_list)),
+                    "added_undir_avg": float(sum(s["added_undir"] for s in stats_list)) / float(len(stats_list)),
+                }
+                edge_index_aug = data.edge_index
 
         # -----------------------
         # Forward
@@ -317,7 +362,7 @@ for run in range(args.runs):
             logits = model(data.x, data.edge_index, dropmessage_rate=dropmessage_rate)
         elif aug_tech == "dropnode":
             logits = model(data.x, data.edge_index, dropnode_rate=dropnode_rate)
-        elif getattr(args, "unbiased", False) and do_aug:
+        elif aug_tech == "rade" and do_aug:
             logits = model(
                 data.x,
                 data.edge_index,
@@ -327,7 +372,7 @@ for run in range(args.runs):
                 q=q_eff,
             )
         else:
-            logits = model(data.x, edge_index_aug)
+            logits = model(data.x, data.edge_index)
 
         loss = criterion(logits[train_idx], data.y[train_idx])
         loss.backward()
@@ -358,6 +403,9 @@ for run in range(args.runs):
             device=device,
         )
         logger.add_result(run, result[:4])
+        _sync_for_timing(device)
+        epoch_time = time.perf_counter() - epoch_time
+        logger.add_runtime(run, epoch_time)
 
         improved = (result[1] > best_val)
         if improved:
@@ -388,6 +436,8 @@ for run in range(args.runs):
                 "best/valid_acc": float(best_val),
                 "best/test_acc_at_best_valid": float(best_test),
             }
+
+            log_dict["runtime/epoch_sec"] = float(epoch_time)
 
             if aug_tech == "rade":
                 log_dict["aug/p"] = float(p_eff)
@@ -434,6 +484,8 @@ for run in range(args.runs):
 
             elif aug_tech == "dropnode":
                 aug_str = f" (dropnode={dropnode_rate:.3f})"
+
+            aug_str += f", Epoch Time: {epoch_time:.4f}s"
 
             print(
                 f"Run: {run + 1:02d}, "
@@ -529,14 +581,41 @@ for run in range(args.runs):
                     )
 
     logger.print_statistics(run)
+    p_histories.append(p_trace)
+    q_histories.append(q_trace)
+
 
 results = logger.print_statistics()
-save_result(args, results)
+runtime_summary = logger.get_runtime_summary()
+# Save GradNorm p/q schedules (mean±std over runs) when pq_gradnorm is enabled
+if getattr(args, "pq_gradnorm", False) and str(getattr(args, "aug_tech", "rade")).lower().strip() == "rade":
+    dataset_tag = str(args.dataset).lower().strip()
+    gnn_tag = str(getattr(args, "gnn_raw", getattr(args, "gnn", "gcn"))).lower().strip()
+    mode_tag = str(getattr(args, "unbiased_mode", "rade")).lower().strip()  # "rade" or "rade-ic"
+    mode_tag = "radeic" if mode_tag == "rade-ic" else mode_tag              # filename-friendly
+
+    tag = f"{dataset_tag}_{gnn_tag}_{mode_tag}"  # e.g., "cora_gcn_rade" or "cora_gcn_radeic"
+
+    save_pq_plots(
+        p_histories,
+        q_histories,
+        tag=tag,
+        out_dir="visualization",
+        show_runs=True,
+    )
+
+
+save_result(args, results, runtime_summary=runtime_summary)
 
 if wandb_run is not None:
     try:
         wandb_run.summary["final_test_mean"] = float(results.mean().item())
         wandb_run.summary["final_test_std"] = float(results.std().item())
+        if runtime_summary is not None:
+            wandb_run.summary["runtime/profile"] = "all_full_batch_runs"
+            wandb_run.summary["runtime/epoch_sec_run_mean"] = float(runtime_summary["run_mean"])
+            wandb_run.summary["runtime/epoch_sec_run_std"] = float(runtime_summary["run_std"])
+            wandb_run.summary["runtime/epoch_sec_pooled_mean"] = float(runtime_summary["pooled_mean"])
     except Exception:
         pass
     wandb.finish()

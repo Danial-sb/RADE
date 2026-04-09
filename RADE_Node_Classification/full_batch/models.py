@@ -1,3 +1,4 @@
+#models.py
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
@@ -83,7 +84,7 @@ class MPNNs(torch.nn.Module):
         first_in = hidden_channels if self.pre_linear else in_channels
         L = int(local_layers)
 
-        use_ic = (self.unbiased_mode == "rade-ic")
+        use_ic = (self.unbiased and self.unbiased_mode == "rade-ic")
 
         # -------------------------
         # Build layers
@@ -94,21 +95,32 @@ class MPNNs(torch.nn.Module):
 
             if gnn == "gin":
                 mlp = make_gin_mlp(in_dim, out_dim)
-                if self.unbiased:
-                    conv = RADEGINConv(mlp, ic_mode=use_ic)
+
+                if self.aug_tech == "rade":
+                    conv = RADEGINConv(
+                        mlp,
+                        ic_mode=use_ic,
+                        apply_corrections=self.unbiased,
+                    )
+                elif self.aug_tech == "dropmessage":
+                    conv = DropMessageGINConv(mlp)
                 else:
-                    if self.aug_tech == "dropmessage":
-                        conv = DropMessageGINConv(mlp)
-                    else:
-                        conv = GINConv(mlp)
+                    conv = GINConv(mlp)
+
             else:
-                if self.unbiased:
-                    conv = RADEGCNConv(in_dim, out_dim, bias=True, correct_self_loop=True, ic_mode=use_ic)
+                if self.aug_tech == "rade":
+                    conv = RADEGCNConv(
+                        in_dim,
+                        out_dim,
+                        bias=True,
+                        correct_self_loop=True,
+                        ic_mode=use_ic,
+                        apply_corrections=self.unbiased,
+                    )
+                elif self.aug_tech == "dropmessage":
+                    conv = DropMessageGCNConv(in_dim, out_dim, bias=True)
                 else:
-                    if self.aug_tech == "dropmessage":
-                        conv = DropMessageGCNConv(in_dim, out_dim, bias=True)
-                    else:
-                        conv = GCNConv(in_dim, out_dim, cached=False, normalize=True)
+                    conv = GCNConv(in_dim, out_dim, cached=False, normalize=True)
 
             self.local_convs.append(conv)
 
@@ -189,7 +201,7 @@ class MPNNs(torch.nn.Module):
         L = len(self.local_convs)
 
         rade_active = (
-            self.unbiased
+            self.aug_tech == "rade"
             and self.training
             and (edge_index_keep is not None or edge_index_add is not None)
             and (p > 0.0 or q > 0.0)

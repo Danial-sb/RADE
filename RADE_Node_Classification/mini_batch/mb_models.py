@@ -94,7 +94,7 @@ class MPNNsMB(nn.Module):
 
         first_in = hidden_channels if self.pre_linear else in_channels
         L = int(local_layers)
-        use_ic = (self.unbiased_mode == "rade-ic")
+        use_ic = (self.unbiased and self.unbiased_mode == "rade-ic")
 
         for layer_idx in range(L):
             in_dim = first_in if layer_idx == 0 else hidden_channels
@@ -102,21 +102,30 @@ class MPNNsMB(nn.Module):
 
             if self.gnn == "gin":
                 mlp = make_gin_mlp(in_dim, out_dim)
-                if self.unbiased:
-                    conv = RADEGINConvMB(mlp, ic_mode=use_ic)
+                if self.aug_tech == "rade":
+                    conv = RADEGINConvMB(
+                        mlp,
+                        ic_mode=use_ic,
+                        apply_corrections=self.unbiased,
+                    )
+                elif self.aug_tech == "dropmessage":
+                    conv = DropMessageGINConv(mlp)
                 else:
-                    if self.aug_tech == "dropmessage":
-                        conv = DropMessageGINConv(mlp)
-                    else:
-                        conv = GINConv(mlp)
+                    conv = GINConv(mlp)
             else:
-                if self.unbiased:
-                    conv = RADEGCNConvMB(in_dim, out_dim, bias=True, correct_self_loop=True, ic_mode=use_ic)
+                if self.aug_tech == "rade":
+                    conv = RADEGCNConvMB(
+                        in_dim,
+                        out_dim,
+                        bias=True,
+                        correct_self_loop=True,
+                        ic_mode=use_ic,
+                        apply_corrections=self.unbiased,
+                    )
+                elif self.aug_tech == "dropmessage":
+                    conv = DropMessageGCNConv(in_dim, out_dim, bias=True)
                 else:
-                    if self.aug_tech == "dropmessage":
-                        conv = DropMessageGCNConv(in_dim, out_dim, bias=True)
-                    else:
-                        conv = GCNConv(in_dim, out_dim, cached=False, normalize=True)
+                    conv = GCNConv(in_dim, out_dim, cached=False, normalize=True)
 
             self.local_convs.append(conv)
 
@@ -180,7 +189,7 @@ class MPNNsMB(nn.Module):
         return_embeddings: bool = False,
     ):
         # If we have RADE convs in the stack, set batch cache every forward.
-        if self.unbiased:
+        if self.aug_tech == "rade":
             self._set_batch_graph(edge_index_clean=edge_index_clean, num_nodes=x.size(0))
 
         # Pre-linear (optional)
@@ -199,7 +208,7 @@ class MPNNsMB(nn.Module):
         L = len(self.local_convs)
 
         rade_active = (
-            self.unbiased
+            (self.aug_tech == "rade")
             and (self.mb_rade_mode == "local")
             and self.training
             and (edge_index_keep is not None or edge_index_add is not None)

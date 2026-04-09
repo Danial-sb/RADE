@@ -1,15 +1,51 @@
+
+#logger.py
+
+import os
+
 import torch
+
 
 class Logger(object):
     """ Adapted from https://github.com/snap-stanford/ogb/ """
+
     def __init__(self, runs, info=None):
         self.info = info
         self.results = [[] for _ in range(runs)]
+        self.runtime_results = [[] for _ in range(runs)]
 
     def add_result(self, run, result):
         assert len(result) == 4
         assert run >= 0 and run < len(self.results)
         self.results[run].append(result)
+
+    def add_runtime(self, run, epoch_time):
+        assert run >= 0 and run < len(self.runtime_results)
+        self.runtime_results[run].append(float(epoch_time))
+
+    def get_runtime_summary(self):
+        run_means = []
+        pooled = []
+
+        for run_times in self.runtime_results:
+            if len(run_times) == 0:
+                continue
+            t = torch.tensor(run_times, dtype=torch.float64)
+            run_means.append(t.mean().item())
+            pooled.extend(run_times)
+
+        if len(run_means) == 0:
+            return None
+
+        run_means_t = torch.tensor(run_means, dtype=torch.float64)
+        pooled_t = torch.tensor(pooled, dtype=torch.float64)
+        return {
+            "run_mean": run_means_t.mean().item(),
+            "run_std": run_means_t.std(unbiased=False).item(),
+            "pooled_mean": pooled_t.mean().item(),
+            "num_runs": len(run_means),
+            "num_epochs": int(pooled_t.numel()),
+        }
 
     def print_statistics(self, run=None, mode='max_acc'):
         if run is not None:
@@ -27,7 +63,12 @@ class Logger(object):
             print(f'Chosen epoch: {ind}')
             print(f'Final Train: {result[ind, 0]:.2f}')
             print(f'Final Test: {result[ind, 2]:.2f}')
-            self.test=result[ind, 2]
+            self.test = result[ind, 2]
+
+            if len(self.runtime_results[run]) > 0:
+                runtimes = torch.tensor(self.runtime_results[run], dtype=torch.float64)
+                print(f'Avg Epoch Time: {runtimes.mean():.4f}s')
+                print(f'Epochs Timed: {int(runtimes.numel())}')
 
         else:
             # NOTE: runs may have different lengths under early stopping.
@@ -58,30 +99,39 @@ class Logger(object):
 
             print(f'All runs:')
             r = best_result[:, 0]
-            print(f'Highest Train: {r.mean():.2f} ± {r.std():.2f}')
+            print(f'Highest Train: {r.mean():.2f} +- {r.std():.2f}')
             r = best_result[:, 1]
-            print(f'Highest Test: {r.mean():.2f} ± {r.std():.2f}')
+            print(f'Highest Test: {r.mean():.2f} +- {r.std():.2f}')
             r = best_result[:, 2]
-            print(f'Highest Valid: {r.mean():.2f} ± {r.std():.2f}')
+            print(f'Highest Valid: {r.mean():.2f} +- {r.std():.2f}')
             r = best_result[:, 3]
-            print(f'  Final Train: {r.mean():.2f} ± {r.std():.2f}')
+            print(f'  Final Train: {r.mean():.2f} +- {r.std():.2f}')
             r = best_result[:, 4]
-            print(f'   Final Test: {r.mean():.2f} ± {r.std():.2f}')
+            print(f'   Final Test: {r.mean():.2f} +- {r.std():.2f}')
 
             self.test = r.mean()
+            runtime_summary = self.get_runtime_summary()
+            if runtime_summary is not None:
+                print(
+                    f"Avg Epoch Time (run mean): {runtime_summary['run_mean']:.4f}s "
+                    f"+- {runtime_summary['run_std']:.4f}s"
+                )
+                print(
+                    f"Avg Epoch Time (pooled): {runtime_summary['pooled_mean']:.4f}s "
+                    f"over {runtime_summary['num_epochs']} epochs"
+                )
             return best_result[:, 4]
 
+    def output(self, out_path, info):
+        with open(out_path, 'a') as f:
+            f.write(info)
+            f.write(f'test acc:{self.test}\n')
 
-    def output(self,out_path,info):
-            with open(out_path,'a') as f:
-                f.write(info)
-                f.write(f'test acc:{self.test}\n')
 
-import os
 def save_model(args, model, optimizer, run):
     if not os.path.exists(f'models/{args.dataset}'):
         os.makedirs(f'models/{args.dataset}')
-    if(args.model=='MPNN'):
+    if(args.model == 'MPNN'):
         model_path = f'models/{args.dataset}/{args.model}_{args.gnn}_{run}.pt'
     else:
         model_path = f'models/{args.dataset}/{args.model}_{run}.pt'
@@ -89,8 +139,9 @@ def save_model(args, model, optimizer, run):
                 'optimizer_state_dict': optimizer.state_dict()
                 }, model_path)
 
+
 def load_model(args, model, optimizer, run):
-    if(args.model=='MPNN'):
+    if(args.model == 'MPNN'):
         model_path = f'models/{args.dataset}/{args.model}_{args.gnn}_{run}.pt'
     else:
         model_path = f'models/{args.dataset}/{args.model}_{run}.pt'
@@ -101,21 +152,28 @@ def load_model(args, model, optimizer, run):
 
     return model, optimizer
 
-def save_result(args, results):
+
+def save_result(args, results, runtime_summary=None):
     if not os.path.exists(f'results/{args.dataset}'):
         os.makedirs(f'results/{args.dataset}')
-    if(args.model=='MPNN'):
+    if(args.model == 'MPNN'):
         filename = f'results/{args.dataset}/{args.model}_{args.gnn}.csv'
     else:
         filename = f'results/{args.dataset}/{args.model}.csv'
     print(f"Saving results to {filename}")
     with open(f"{filename}", 'a+') as write_obj:
-        if(args.model=='MPNN'):
+        if(args.model == 'MPNN'):
+            runtime_suffix = ""
+            if runtime_summary is not None:
+                runtime_suffix = (
+                    f" epoch_time {runtime_summary['run_mean']:.4f}s "
+                    f"$\\pm$ {runtime_summary['run_std']:.4f}s"
+                )
             write_obj.write(
-                f"{args.model} " + f"{args.lr} " + f"{args.hidden_channels} " + f"{args.local_layers} " + f"{args.dropout} " + f"{args.ln} " + \
-                f"{args.bn} " + f"{args.res} " + \
-                f"{results.mean():.2f} $\pm$ {results.std():.2f} \n")
+                f"{args.model} " + f"{args.lr} " + f"{args.hidden_channels} " + f"{args.local_layers} " + f"{args.dropout} " + f"{args.ln} " +
+                f"{args.bn} " + f"{args.res} " +
+                f"{results.mean():.2f} $\\pm$ {results.std():.2f}" + runtime_suffix + " \n")
         else:
             write_obj.write(
-                f"{args.model} " + f"{args.lr} " + \
-                f"{results.mean():.2f} $\pm$ {results.std():.2f} \n")
+                f"{args.model} " + f"{args.lr} " +
+                f"{results.mean():.2f} $\\pm$ {results.std():.2f} \n")

@@ -1,3 +1,4 @@
+#rade_convs.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -177,14 +178,13 @@ class RADEGCNConv(nn.Module):
     """
     GCN symmetric normalization with RADE / RADE-IC expectation-preserving corrections.
 
-    - RADE (ic_mode=False):
-        * Train: centered additions
-        * Eval: standard clean GCN
+    - apply_corrections=True:
+        * RADE / RADE-IC behavior as before
 
-    - RADE-IC (ic_mode=True):
-        * Train: NO centering on additions
-        * Eval: clean GCN + deterministic inference correction on non-neighbors:
-              sum_{j∈C(i)} E[Gamma_ij] x_j  (decoupled approx => q * tB[i] * sum_{j∈C(i)} tB[j] x_j)
+    - apply_corrections=False:
+        * Use the SAME keep/add edge pipeline, but do NOT apply
+          correction factors / centering / self-loop correction.
+        * This gives a matched operator path for timing.
     """
     def __init__(
         self,
@@ -192,13 +192,15 @@ class RADEGCNConv(nn.Module):
         out_channels: int,
         bias: bool = True,
         correct_self_loop: bool = True,
-        ic_mode: bool = False,  # <-- NEW
+        ic_mode: bool = False,
+        apply_corrections: bool = True,
     ):
         super().__init__()
         self.lin = nn.Linear(in_channels, out_channels, bias=False)
         self.bias = nn.Parameter(torch.zeros(out_channels)) if bias else None
         self.correct_self_loop = correct_self_loop
         self.ic_mode = bool(ic_mode)
+        self.apply_corrections = bool(apply_corrections)
 
         self.graph_cache: Optional[GraphCache] = None  # set via set_graph()
 
@@ -259,7 +261,7 @@ class RADEGCNConv(nn.Module):
             return out
 
         # -------------------------
-        # RADE / RADE-IC TRAIN path
+        # TRAIN path on sampled keep/add edges
         # -------------------------
         row_k, col_k = edge_index_keep[0], edge_index_keep[1]
 
@@ -267,8 +269,7 @@ class RADEGCNConv(nn.Module):
             row_a, col_a = edge_index_add[0], edge_index_add[1]
         else:
             row_a = row_k.new_empty((0,))
-            col_a = col_k.new_empty((0,))
-
+            col_a = row_k.new_empty((0,))
 
         ar = torch.arange(N, device=x.device)
         row_all = torch.cat([row_k, row_a, ar])
@@ -282,6 +283,29 @@ class RADEGCNConv(nn.Module):
         Gamma_a = inv_sqrt_aug[row_a] * inv_sqrt_aug[col_a] if row_a.numel() else None
         Gamma_self = inv_sqrt_aug * inv_sqrt_aug
 
+        # -------------------------------------------------
+        # Matched NO-correction path:
+        # same sampled keep/add tensors, same RADE conv path,
+        # but no expectation-preserving corrections.
+        # -------------------------------------------------
+        if not self.apply_corrections:
+            out_k = _scatter_add_rows(Gamma_k.unsqueeze(1) * x[row_k], col_k, N)
+
+            if row_a.numel():
+                out_a = _scatter_add_rows(Gamma_a.unsqueeze(1) * x[row_a], col_a, N)
+            else:
+                out_a = torch.zeros_like(out_k)
+
+            out_self = Gamma_self.unsqueeze(1) * x
+
+            out = out_k + out_a + out_self
+            if self.bias is not None:
+                out = out + self.bias
+            return out
+
+        # -------------------------------------------------
+        # Original corrected RADE / RADE-IC path
+        # -------------------------------------------------
         deg_clean = self.graph_cache.deg_clean.to(x.device)
         deg_hat = (deg_clean + 1.0).clamp(min=1.0)
         inv_sqrt_hat = deg_hat.pow(-0.5)
@@ -307,18 +331,18 @@ class RADEGCNConv(nn.Module):
                 out_a = sum_a
             else:
                 # RADE: weighted centering (Case B weights)
-                tB = _delta_E_inv_sqrt_caseB(deg_clean, comp_size, p=p, q=q).to(x.device, dtype=x.dtype)  # [N]
+                tB = _delta_E_inv_sqrt_caseB(deg_clean, comp_size, p=p, q=q).to(x.device, dtype=x.dtype)
                 wj = tB
-                mu = self.graph_cache.complement_mean_weighted(x, w=wj)  # [N,F]
+                mu = self.graph_cache.complement_mean_weighted(x, w=wj)
 
                 sum_g = _scatter_add_scalar(Gamma_a, col_a, N).unsqueeze(1)
                 out_a = sum_a - mu * sum_g
         else:
             out_a = torch.zeros_like(out_k)
 
-        # self-loop correction (kept as before; recommended)
+        # self-loop correction
         if self.correct_self_loop:
-            E_inv = _delta_E_inv_self(deg_clean, comp_size, p=p, q=q).to(x.device, dtype=x.dtype)  # ≈ E[1/d'_i]
+            E_inv = _delta_E_inv_self(deg_clean, comp_size, p=p, q=q).to(x.device, dtype=x.dtype)
             E_Gamma_self = E_inv
             corr_self = (alpha_self / E_Gamma_self.clamp(min=1e-12))
             out_self = (Gamma_self * corr_self).unsqueeze(1) * x
@@ -336,20 +360,26 @@ class RADEGINConv(nn.Module):
     """
     Sum-aggregation GIN-style RADE / RADE-IC.
 
-    - RADE (ic_mode=False):
-        * Train: centered additions (mu over C(i))
-        * Eval: standard clean GIN
+    - apply_corrections=True:
+        * current RADE / RADE-IC behavior
 
-    - RADE-IC (ic_mode=True):
-        * Train: NO centering on additions
-        * Eval: clean neighbor sum + deterministic correction q * sum_{j∈C(i)} x_j
+    - apply_corrections=False:
+        * same sampled keep/add path, but no alpha rescaling and no centering
     """
 
-    def __init__(self, mlp: nn.Module, eps: float = 0.0, train_eps: bool = False, ic_mode: bool = False):
+    def __init__(
+        self,
+        mlp: nn.Module,
+        eps: float = 0.0,
+        train_eps: bool = False,
+        ic_mode: bool = False,
+        apply_corrections: bool = True,
+    ):
         super().__init__()
         self.mlp = mlp
         self.initial_eps = float(eps)
         self.ic_mode = bool(ic_mode)
+        self.apply_corrections = bool(apply_corrections)
 
         if train_eps:
             self.eps = nn.Parameter(torch.tensor([self.initial_eps], dtype=torch.float32))
@@ -403,20 +433,29 @@ class RADEGINConv(nn.Module):
             row_a = row_k.new_empty((0,))
             col_a = col_k.new_empty((0,))
 
-        # neighbor correction (same for RADE and RADE-IC): alpha = 1/(1-p)
+        if not self.apply_corrections:
+            keep_sum = _scatter_add_rows(x[row_k], col_k, N)
+
+            if row_a.numel() > 0:
+                add_sum = _scatter_add_rows(x[row_a], col_a, N)
+            else:
+                add_sum = torch.zeros_like(keep_sum)
+
+            h = keep_sum + add_sum
+            out = (1.0 + self.eps.to(x.device)) * x + h
+            return self.mlp(out)
+
+        # corrected RADE / RADE-IC path
         alpha = 1.0 / max(1e-12, (1.0 - float(p)))
         keep_sum = _scatter_add_rows(x[row_k], col_k, N) * alpha
 
-        # addition handling differs
         if row_a.numel() > 0:
             add_sum_raw = _scatter_add_rows(x[row_a], col_a, N)
 
             if self.ic_mode:
-                # RADE-IC: NO centering
                 add_sum = add_sum_raw
             else:
-                # RADE: center using mu over C(i)
-                mu = self.graph_cache.complement_mean_unweighted(x)  # [N,F]
+                mu = self.graph_cache.complement_mean_unweighted(x)
                 add_deg = _scatter_add_scalar(
                     torch.ones(row_a.numel(), device=x.device, dtype=x.dtype),
                     col_a,

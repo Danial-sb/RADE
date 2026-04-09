@@ -32,7 +32,7 @@ def parse_method(args, num_nodes, num_classes, in_dim, device):
         unbiased_mode=args.unbiased_mode,
         linear=bool(getattr(args, "linear", False)),
         aug_tech=str(getattr(args, "aug_tech", "none")),
-        # mb_rade_mode=str(getattr(args, "mb_rade_mode", "local")),  # local|disabled
+        mb_rade_mode=str(getattr(args, "mb_rade_mode", "local")),
     ).to(device)
     return model
 
@@ -65,7 +65,7 @@ def parser_add_main_args(parser):
     # -----------------
     # training schedule
     # -----------------
-    parser.add_argument("--epochs", type=int, default=1000, help="number of training epochs")
+    parser.add_argument("--epochs", type=int, default=500, help="number of training epochs")
     parser.add_argument("--runs", type=int, default=5, help="number of distinct runs")
 
     # split control (used only for datasets that are random-split in the loader)
@@ -139,7 +139,13 @@ def parser_add_main_args(parser):
     # model
     # -----------------
     parser.add_argument("--model", type=str, default="MPNN", choices=["MPNN"])
-    parser.add_argument("--gnn", type=str, default="gin", choices=["gcn", "gin"])
+    parser.add_argument(
+        "--gnn",
+        type=str,
+        default="gcn",
+        choices=["gcn", "gin", "sgc", "gin-linear"],
+        help="Backbone: gcn/gin are standard. sgc routes to linear-GCN. gin-linear routes to linear-GIN."
+    )
     parser.add_argument("--hidden_channels", type=int, default=256)
     parser.add_argument("--local_layers", type=int, default=2)
     parser.add_argument("--pre_linear", type=bool, default=True)
@@ -174,7 +180,7 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--aug_tech",
         type=str,
-        default="none",
+        default="rade",
         choices=["rade", "dropmessage", "dropnode", "none"],
         help="Which augmentation family to use. "
              "'rade' uses edge drop/add pipeline (mini_batch semantics controlled by --mb_rade_mode). "
@@ -205,16 +211,16 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--aug_mode",
         type=str,
-        default="none",
+        default="both",
         choices=["none", "drop", "add", "both"],
         help="Graph augmentation mode per epoch.",
     )
-    parser.add_argument("--p", type=float, default=0.01, help="Edge drop probability for edges (i,j) in E.")
-    parser.add_argument("--q", type=float, default=0.00000143, help="Non-edge add probability (per-non-edge rate).")
+    parser.add_argument("--p", type=float, default=0.2, help="Edge drop probability for edges (i,j) in E.")
+    parser.add_argument("--q", type=float, default=0.000013446, help="Non-edge add probability (per-non-edge rate).")
     parser.add_argument(
         "--unbiased",
         type=bool,
-        default=False,
+        default=True,
         help="Use expectation-preserving (unbiased) aggregation for drop/add (RADE-style). "
              "Note: exact global unbiasedness is not available under node-induced mini-batches.",
     )

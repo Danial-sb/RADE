@@ -1,4 +1,4 @@
-# data_utils.py (revised for nc_datasets_simple.py compatibility)
+# data_utils.py
 
 from __future__ import annotations
 

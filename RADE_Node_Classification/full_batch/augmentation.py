@@ -1,4 +1,6 @@
 # augmentation.py
+# Efficiency for the candidate set
+# p and q for citeseer.
 from __future__ import annotations
 
 from dataclasses import dataclass

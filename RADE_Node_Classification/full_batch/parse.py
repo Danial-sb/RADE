@@ -1,10 +1,11 @@
-# parse.py (revised for nc_datasets_simple.py compatibility)
+# parse.py
 
 from models import MPNNs
 
-
 def parse_method(args, num_nodes, num_classes, in_dim, device):
-    # num_nodes is unused by MPNNs, kept for API consistency
+    gnn = str(args.gnn).lower().strip()
+
+    # --- standard MPNN path ---
     model = MPNNs(
         in_channels=in_dim,
         hidden_channels=args.hidden_channels,
@@ -16,7 +17,7 @@ def parse_method(args, num_nodes, num_classes, in_dim, device):
         ln=args.ln,
         bn=args.bn,
         jk=args.jk,
-        gnn=args.gnn,
+        gnn=args.gnn,  # 'gcn' or 'gin'
         unbiased=args.unbiased,
         unbiased_mode=args.unbiased_mode,
         linear=bool(getattr(args, "linear", False)),
@@ -25,12 +26,13 @@ def parse_method(args, num_nodes, num_classes, in_dim, device):
     return model
 
 
+
 def parser_add_main_args(parser):
     # dataset
     parser.add_argument(
         "--dataset",
         type=str,
-        default="citeseer",
+        default="computer",
         choices=["cora", "citeseer", "pubmed", "cs", "computer", "physics", "flickr", "ogbn-arxiv"],
         help="Dataset name (must match nc_datasets_simple.py)",
     )
@@ -42,12 +44,12 @@ def parser_add_main_args(parser):
     )
 
     # system
-    parser.add_argument("--device", type=int, default=0, help="GPU id (default: 0)")
+    parser.add_argument("--device", type=int, default=2, help="GPU id (default: 0)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cpu", action="store_true")
 
     # training schedule
-    parser.add_argument("--epochs", type=int, default=500, help="number of training epochs")
+    parser.add_argument("--epochs", type=int, default=1000, help="number of training epochs")
     parser.add_argument("--runs", type=int, default=5, help="number of distinct runs")
 
     # split control (used only for datasets that are random-split in the loader)
@@ -68,15 +70,21 @@ def parser_add_main_args(parser):
 
     # model
     parser.add_argument("--model", type=str, default="MPNN", choices=["MPNN"])
-    parser.add_argument("--gnn", type=str, default="gin", choices=["gcn", "gin"])
-    parser.add_argument("--hidden_channels", type=int, default=256)
+    parser.add_argument(
+        "--gnn",
+        type=str,
+        default="gcn",
+        choices=["gcn", "gin", "sgc", "gin-linear"],
+        help="Backbone: gcn/gin are standard. sgc routes to linear-GCN. gin-linear routes to linear-GIN."
+    )
+    parser.add_argument("--hidden_channels", type=int, default=128)
     parser.add_argument("--local_layers", type=int, default=2)
     parser.add_argument("--pre_linear", type=bool, default=True)
     parser.add_argument("--res", action="store_true")
     parser.add_argument("--ln", action="store_true")
     parser.add_argument("--bn", action="store_true")
     parser.add_argument("--jk", action="store_true")
-    parser.add_argument("--linear", type=bool, default=True, help="Use strictly linear model: disables ReLU/Dropout/BN/LN,"
+    parser.add_argument("--linear", type=bool, default=False, help="Use strictly linear model: disables ReLU/Dropout/BN/LN,"
                                                               "and makes GIN MLP linear.")
 
     # optimization
@@ -84,7 +92,7 @@ def parser_add_main_args(parser):
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--dropout", type=float, default=0.0)
     # early stopping
-    parser.add_argument("--patience", type=int, default=100, help="Early stopping patience in epochs based on "
+    parser.add_argument("--patience", type=int, default=200, help="Early stopping patience in epochs based on "
                                                                   "validation accuracy. Set <=0 to disable "
                                                                   "early stopping.",)
 
@@ -123,9 +131,9 @@ def parser_add_main_args(parser):
     parser.add_argument("--aug_mode", type=str, default="both",
                         choices=["none", "drop", "add", "both"],
                         help="Graph augmentation mode per epoch.")
-    parser.add_argument("--p", type=float, default=0.2,
+    parser.add_argument("--p", type=float, default=0.5,
                         help="Edge drop probability for edges (i,j) in E.")
-    parser.add_argument("--q", type=float, default=0.000164,
+    parser.add_argument("--q", type=float, default=0.001303,
                         help="Non-edge add probability for pairs (i,j) not in E (per-non-edge rate).")
 
     parser.add_argument("--unbiased", type=bool, default=True,
@@ -151,15 +159,15 @@ def parser_add_main_args(parser):
     )
 
     # ---- GradNorm p/q tuning (epoch-wise) ----
-    parser.add_argument("--pq_gradnorm", type=bool, default=True,
+    parser.add_argument("--pq_gradnorm", type=bool, default=False,
                         help="Enable epoch-wise GradNorm matching to adapt (p,q).")
 
     parser.add_argument("--p_max", type=float, default=0.8,
                         help="Upper bound for p during GradNorm tuning.")
-    parser.add_argument("--q_max", type=float, default=0.000328,
+    parser.add_argument("--q_max", type=float, default=0.001442,
                         help="Upper bound for q during GradNorm tuning.")
 
-    parser.add_argument("--pq_grid_size", type=int, default=11,
+    parser.add_argument("--pq_grid_size", type=int, default=5,
                         help="Grid size for (p,q) search. Use 11 for GIN; use 3-5 for GCN (costlier).")
 
     parser.add_argument("--pq_subset_nodes", type=int, default=1024,
@@ -169,7 +177,7 @@ def parser_add_main_args(parser):
 
     parser.add_argument("--pq_update_every", type=int, default=1,
                         help="Update (p,q) every k epochs.")
-    parser.add_argument("--pq_warmup_epochs", type=int, default=20,
+    parser.add_argument("--pq_warmup_epochs", type=int, default=0,
                         help="Number of initial epochs to skip pq updates.")
     parser.add_argument("--pq_eps", type=float, default=1e-12,
                         help="Small epsilon for log/denominator stabilizers.")

@@ -158,6 +158,7 @@ class RADEGCNConvMB(nn.Module):
     Key difference vs full_batch:
       - Graph cache is built from the clean *batch* subgraph.
       - Complements C(i) are complements within the batch node set.
+      - The no-correction path still uses the same RADE keep/add operator.
     """
 
     def __init__(
@@ -167,12 +168,14 @@ class RADEGCNConvMB(nn.Module):
         bias: bool = True,
         correct_self_loop: bool = True,
         ic_mode: bool = False,
+        apply_corrections: bool = True,
     ):
         super().__init__()
         self.lin = nn.Linear(in_channels, out_channels, bias=False)
         self.bias = nn.Parameter(torch.zeros(out_channels)) if bias else None
         self.correct_self_loop = bool(correct_self_loop)
         self.ic_mode = bool(ic_mode)
+        self.apply_corrections = bool(apply_corrections)
         self.graph_cache: Optional[BatchGraphCache] = None
 
     def set_graph(self, graph_cache: BatchGraphCache) -> None:
@@ -253,6 +256,21 @@ class RADEGCNConvMB(nn.Module):
         Gamma_a = inv_sqrt_aug[row_a] * inv_sqrt_aug[col_a] if row_a.numel() else None
         Gamma_self = inv_sqrt_aug * inv_sqrt_aug                          # [N]
 
+        if not self.apply_corrections:
+            out_k = _scatter_add_rows(Gamma_k.unsqueeze(1) * x[row_k], col_k, N)
+
+            if row_a.numel():
+                out_a = _scatter_add_rows(Gamma_a.unsqueeze(1) * x[row_a], col_a, N)
+            else:
+                out_a = torch.zeros_like(out_k)
+
+            out_self = Gamma_self.unsqueeze(1) * x
+
+            out = out_k + out_a + out_self
+            if self.bias is not None:
+                out = out + self.bias
+            return out
+
         # clean degrees (batch-local) for target alpha normalization
         deg_clean = self.graph_cache.deg_clean.to(x.device)
         deg_hat = (deg_clean + 1.0).clamp(min=1.0)
@@ -308,11 +326,19 @@ class RADEGINConvMB(nn.Module):
         * Eval: adds deterministic correction q * sum_{j∈C_batch(i)} x_j
     """
 
-    def __init__(self, mlp: nn.Module, eps: float = 0.0, train_eps: bool = False, ic_mode: bool = False):
+    def __init__(
+        self,
+        mlp: nn.Module,
+        eps: float = 0.0,
+        train_eps: bool = False,
+        ic_mode: bool = False,
+        apply_corrections: bool = True,
+    ):
         super().__init__()
         self.mlp = mlp
         self.initial_eps = float(eps)
         self.ic_mode = bool(ic_mode)
+        self.apply_corrections = bool(apply_corrections)
 
         if train_eps:
             self.eps = nn.Parameter(torch.tensor([self.initial_eps], dtype=torch.float32))
@@ -367,6 +393,18 @@ class RADEGINConvMB(nn.Module):
         else:
             row_a = row_k.new_empty((0,))
             col_a = col_k.new_empty((0,))
+
+        if not self.apply_corrections:
+            keep_sum = _scatter_add_rows(x[row_k], col_k, N)
+
+            if row_a.numel() > 0:
+                add_sum = _scatter_add_rows(x[row_a], col_a, N)
+            else:
+                add_sum = torch.zeros_like(keep_sum)
+
+            h = keep_sum + add_sum
+            out = (1.0 + self.eps.to(x.device)) * x + h
+            return self.mlp(out)
 
         # neighbor correction alpha = 1/(1-p)
         alpha = 1.0 / max(1e-12, (1.0 - float(p)))
