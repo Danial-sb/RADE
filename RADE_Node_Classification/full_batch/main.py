@@ -164,13 +164,14 @@ else:
 # Load data (contract)
 # -----------------------
 data, base_split_idx = load_nc_dataset(
-    args.data_dir,
-    args.dataset,
-    True,
-    True,
-    args.seed,
-    args.train_prop,
-    args.valid_prop,
+    root=args.data_dir,
+    name=args.dataset,
+    normalize_features=True,
+    make_undirected_edges=True,
+    remove_citeseer_isolated_nodes=bool(getattr(args, "remove_citeseer_isolated_nodes", False)),
+    seed=args.seed,
+    train_prop=args.train_prop,
+    valid_prop=args.valid_prop,
 )
 
 # Basic dataset stats
@@ -281,14 +282,18 @@ for run in range(args.runs):
             raise ValueError("--pq_gradnorm currently requires --ep_correction True.")
 
         cfg = PQTunerConfig(
-            p_max=float(getattr(args, "p_max", 0.5)),
-            q_max=float(getattr(args, "q_max", 1e-3)),
-            grid_size=int(getattr(args, "pq_grid_size", 5)),
-            ema=float(getattr(args, "pq_ema", 0.9)),
-            eps=float(getattr(args, "pq_eps", 1e-12)),
-            subset_nodes=int(getattr(args, "pq_subset_nodes", 1024)),
-            seed=int(getattr(args, "pq_seed", 0)),
-            data_anchor=str(getattr(args, "pq_data_anchor", "clean")).lower().strip(),
+            p_max=args.p_max,
+            q_max=args.q_max,
+            grid_size=args.pq_grid_size,
+            ema=args.pq_ema,
+            eps=args.pq_eps,
+            subset_nodes=args.pq_subset_nodes,
+            seed=args.seed,
+            data_anchor=args.pq_data_anchor,
+            search_method=args.pq_search_method,
+            powell_maxiter=args.pq_powell_maxiter,
+            powell_xtol=args.pq_powell_xtol,
+            powell_ftol=args.pq_powell_ftol,
         )
         pq_tuner = PQGradNormTuner(
             edge_index_clean=data.edge_index,
@@ -416,10 +421,6 @@ for run in range(args.runs):
 
         logger.add_result(run, result[:4])
 
-        _sync_for_timing(device)
-        epoch_time = time.perf_counter() - epoch_time
-        logger.add_runtime(run, epoch_time)
-
         improved = (result[1] > best_val)
         if improved:
             best_val = float(result[1])
@@ -430,6 +431,64 @@ for run in range(args.runs):
                 save_model(args, model, optimizer, run)
         else:
             epochs_no_improve += 1
+
+        stop_now = patience > 0 and epochs_no_improve >= patience
+
+        # -----------------------
+        # PQ-GradNorm update (RADE only)
+        # -----------------------
+        if (not stop_now) and pq_tuner is not None:
+            warmup = int(getattr(args, "pq_warmup_epochs", 0))
+            every = int(getattr(args, "pq_update_every", 1))
+            if (epoch + 1) >= warmup and ((epoch + 1) % every == 0):
+                epoch_seed = int(args.seed) + 100000 * int(run) + int(epoch) + int(getattr(args, "pq_seed", 0))
+
+                prev_mode_training = model.training
+                model.train()
+
+                p_new, q_new, info = pq_tuner.suggest_pq(
+                    model=model,
+                    data=data,
+                    train_idx=train_idx,
+                    criterion=criterion,
+                    current_p=p_eff,
+                    current_q=q_eff,
+                    aug_mode=str(args.aug_mode).lower().strip(),
+                    epoch_seed=epoch_seed,
+                    mask_sharing=str(getattr(args, "mask_sharing", "shared")).lower().strip(),
+                    num_layers=int(getattr(args, "local_layers", 1)),
+                )
+
+                if not prev_mode_training:
+                    model.eval()
+
+                p_new, q_new = _enforce_aug_mode(p_new, q_new, args.aug_mode)
+                p_eff, q_eff = p_new, q_new
+
+                print(
+                    f"[PQ-GradNorm] run={run + 1:02d} epoch={epoch + 1:03d} "
+                    f"G_data={info['G_data']:.3e} G_reg_best={info['G_reg_best']:.3e} "
+                    f"p(best->new)={info['p_best']:.4f}->{info['p_new']:.4f} "
+                    f"q(best->new)={info['q_best']:.6f}->{info['q_new']:.6f} obj={info['obj']:.2e}"
+                )
+
+                if wandb_run is not None:
+                    wandb.log(
+                        {
+                            "pq/G_data": float(info["G_data"]),
+                            "pq/G_reg_best": float(info["G_reg_best"]),
+                            "pq/obj": float(info["obj"]),
+                            "pq/p_best": float(info["p_best"]),
+                            "pq/q_best": float(info["q_best"]),
+                            "pq/p_new": float(info["p_new"]),
+                            "pq/q_new": float(info["q_new"]),
+                        },
+                        step=(epoch + run * int(args.epochs)),
+                    )
+
+        _sync_for_timing(device)
+        epoch_time = time.perf_counter() - epoch_time
+        logger.add_runtime(run, epoch_time)
 
         # -----------------------
         # wandb logging
@@ -521,7 +580,7 @@ for run in range(args.runs):
         # -----------------------
         # Early stopping trigger
         # -----------------------
-        if patience > 0 and epochs_no_improve >= patience:
+        if stop_now:
             stop_epoch = epoch + 1
             best_epoch_disp = best_epoch + 1 if best_epoch >= 0 else -1
             msg = (
@@ -545,58 +604,6 @@ for run in range(args.runs):
                     step=step,
                 )
             break
-
-        # -----------------------
-        # PQ-GradNorm update (RADE only)
-        # -----------------------
-        if pq_tuner is not None:
-            warmup = int(getattr(args, "pq_warmup_epochs", 0))
-            every = int(getattr(args, "pq_update_every", 1))
-            if (epoch + 1) >= warmup and ((epoch + 1) % every == 0):
-                epoch_seed = int(args.seed) + 100000 * int(run) + int(epoch) + int(getattr(args, "pq_seed", 0))
-
-                prev_mode_training = model.training
-                model.train()
-
-                p_new, q_new, info = pq_tuner.suggest_pq(
-                    model=model,
-                    data=data,
-                    train_idx=train_idx,
-                    criterion=criterion,
-                    current_p=p_eff,
-                    current_q=q_eff,
-                    aug_mode=str(args.aug_mode).lower().strip(),
-                    epoch_seed=epoch_seed,
-                    mask_sharing=str(getattr(args, "mask_sharing", "shared")).lower().strip(),
-                    num_layers=int(getattr(args, "local_layers", 1)),
-                )
-
-                if not prev_mode_training:
-                    model.eval()
-
-                p_new, q_new = _enforce_aug_mode(p_new, q_new, args.aug_mode)
-                p_eff, q_eff = p_new, q_new
-
-                print(
-                    f"[PQ-GradNorm] run={run + 1:02d} epoch={epoch + 1:03d} "
-                    f"G_data={info['G_data']:.3e} G_reg_best={info['G_reg_best']:.3e} "
-                    f"p(best->new)={info['p_best']:.4f}->{info['p_new']:.4f} "
-                    f"q(best->new)={info['q_best']:.6f}->{info['q_new']:.6f} obj={info['obj']:.2e}"
-                )
-
-                if wandb_run is not None:
-                    wandb.log(
-                        {
-                            "pq/G_data": float(info["G_data"]),
-                            "pq/G_reg_best": float(info["G_reg_best"]),
-                            "pq/obj": float(info["obj"]),
-                            "pq/p_best": float(info["p_best"]),
-                            "pq/q_best": float(info["q_best"]),
-                            "pq/p_new": float(info["p_new"]),
-                            "pq/q_new": float(info["q_new"]),
-                        },
-                        step=(epoch + run * int(args.epochs)),
-                    )
 
     logger.print_statistics(run)
     p_histories.append(p_trace)
