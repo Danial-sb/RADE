@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Callable
 
+import numpy as np
 import torch
 import torch.nn as nn
+
+try:
+    from scipy.optimize import minimize
+except Exception:  # pragma: no cover
+    minimize = None
 
 from augmentation import BernoulliEdgeAugmentor
 from rade_convs import (
@@ -25,6 +31,15 @@ def _validate_rade_variant(rade_variant: str) -> str:
             f"rade_variant must be one of {{'rade-of', 'rade-ofs'}}. Got {rade_variant}"
         )
     return rade_variant
+
+
+def _validate_search_method(search_method: str) -> str:
+    search_method = str(search_method).lower().strip()
+    if search_method not in {"grid", "powell"}:
+        raise ValueError(
+            f"search_method must be one of {{'grid', 'powell'}}. Got {search_method}"
+        )
+    return search_method
 
 
 def _grad_norm(grads) -> float:
@@ -89,14 +104,23 @@ class PQTunerConfig:
     subset_nodes: int = 0   # 0 => full train_idx
     seed: int = 0
     data_anchor: str = "clean"
+    search_method: str = "grid"   # {"grid", "powell"}
+    powell_maxiter: int = 25
+    powell_xtol: float = 1e-3
+    powell_ftol: float = 1e-3
 
 
 class PQGradNormTuner:
     """
     Epoch-wise GradNorm matcher for RADE-OF / RADE-OFS.
 
+    Search options:
+    - grid   : bounded finite search over candidate (p, q)
+    - powell : bounded derivative-free continuous search
+
+    Evaluation paths:
     - GIN: fast path via two base gradients
-    - GCN: grid search, each candidate does one autograd.grad on the detached-variance proxy
+    - GCN: each candidate/objective evaluation does one autograd.grad on the detached proxy
     """
 
     def __init__(
@@ -108,13 +132,16 @@ class PQGradNormTuner:
         cfg: PQTunerConfig,
     ):
         self.cfg = cfg
-        self.gnn = str(gnn).lower().strip()                # 'gin' or 'gcn'
+        self.gnn = str(gnn).lower().strip()                # "gin" or "gcn"
         self.rade_variant = _validate_rade_variant(rade_variant)
+        self.search_method = _validate_search_method(getattr(cfg, "search_method", "grid"))
         self.cache = GraphCache.from_edge_index(edge_index_clean, int(num_nodes))
         self.N = int(num_nodes)
 
         self.edge_index_clean = edge_index_clean
-        self.augmentor = BernoulliEdgeAugmentor.from_edge_index(edge_index_clean, num_nodes=self.N)
+        self.augmentor = BernoulliEdgeAugmentor.from_edge_index(
+            edge_index_clean, num_nodes=self.N
+        )
 
         da = str(getattr(cfg, "data_anchor", "clean")).lower().strip()
         if da not in {"clean", "aug"}:
@@ -129,13 +156,17 @@ class PQGradNormTuner:
         return n * (n - 1) // 2 - m_undir
 
     @torch.no_grad()
-    def _messages_detached(self, emb: torch.Tensor, W: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _messages_detached(
+        self, emb: torch.Tensor, W: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         h = emb.detach()
         W = W.detach()
         m = h @ W.t()      # [N, C]
         return m, m * m
 
-    def _var_gin_bases(self, m: torch.Tensor, m_sq: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _var_gin_bases(
+        self, m: torch.Tensor, m_sq: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         row, col = self.cache.edge_index_clean_dir
         neigh_sum_sq = _scatter_add_rows(m_sq[row], col, self.N)  # [N, C]
         comp_sum_sq = self.cache.complement_sum_unweighted(m_sq)  # [N, C]
@@ -201,6 +232,249 @@ class PQGradNormTuner:
         add_var = (q * uB.unsqueeze(1) * S1) - ((q * q) * tB2.unsqueeze(1) * S2)
 
         return neigh_var + add_var
+
+    def _build_q_grid(self, q_max: float) -> List[float]:
+        cfg = self.cfg
+        if q_max <= 0.0:
+            return [0.0]
+
+        M_undir = max(1, self._num_non_edges_undirected())
+        K_max = int(round(float(q_max) * float(M_undir)))
+        if K_max <= 0:
+            return [0.0]
+
+        K_core = [0, 1, 2, 5, 10, 20, 50]
+        K_core = [k for k in K_core if k <= K_max]
+
+        target = int(cfg.grid_size)
+        remaining = max(0, target - len(K_core))
+
+        K_lin = []
+        if remaining > 0:
+            lin = torch.linspace(0.0, float(K_max), steps=remaining + 2, device="cpu")
+            K_lin = [int(round(x)) for x in lin.tolist()[1:-1]]
+
+        K_list = sorted(set(K_core + K_lin))[:target]
+        return [float(k) / float(M_undir) for k in K_list]
+
+    def _make_objective(
+        self,
+        *,
+        params,
+        idx: torch.Tensor,
+        w: torch.Tensor,
+        m: torch.Tensor,
+        m_sq: torch.Tensor,
+        logGd: float,
+        eps: float,
+    ) -> Callable[[float, float], Tuple[float, float]]:
+        if self.gnn == "gin":
+            V_drop, V_add = self._var_gin_bases(m, m_sq)
+
+            R_drop = 0.5 * (w[idx] * V_drop[idx]).sum() / max(int(idx.numel()), 1)
+            R_add = 0.5 * (w[idx] * V_add[idx]).sum() / max(int(idx.numel()), 1)
+
+            g_drop = torch.autograd.grad(
+                R_drop, params, retain_graph=True, create_graph=False, allow_unused=True
+            )
+            g_add = torch.autograd.grad(
+                R_add, params, retain_graph=True, create_graph=False, allow_unused=True
+            )
+
+            a = _dot(g_drop, g_drop)
+            b = _dot(g_add, g_add)
+            c = _dot(g_drop, g_add)
+
+            def objective(p_try: float, q_try: float) -> Tuple[float, float]:
+                s = p_try / max(1.0 - p_try, eps)   # p / (1-p)
+                t = q_try * (1.0 - q_try)           # q(1-q)
+                g2 = (s * s) * a + (t * t) * b + 2.0 * s * t * c
+                Greg = math.sqrt(max(g2, 0.0))
+                obj = (math.log(Greg + eps) - logGd) ** 2
+                return float(obj), float(Greg)
+
+            return objective
+
+        if self.gnn == "gcn":
+            def objective(p_try: float, q_try: float) -> Tuple[float, float]:
+                V = self._var_gcn(float(p_try), float(q_try), m, m_sq)
+                R = 0.5 * (w[idx] * V[idx]).sum() / max(int(idx.numel()), 1)
+
+                g_reg = torch.autograd.grad(
+                    R, params, retain_graph=True, create_graph=False, allow_unused=True
+                )
+                Greg = _grad_norm(g_reg)
+                obj = (math.log(Greg + eps) - logGd) ** 2
+                return float(obj), float(Greg)
+
+            return objective
+
+        raise ValueError(f"Unsupported gnn={self.gnn}. Expected 'gin' or 'gcn'.")
+
+    def _search_grid(
+        self,
+        objective: Callable[[float, float], Tuple[float, float]],
+        *,
+        p_max: float,
+        q_max: float,
+        device: torch.device,
+    ) -> Tuple[float, float, float, float, Dict[str, float]]:
+        cfg = self.cfg
+
+        p_grid = [0.0] if p_max <= 0.0 else torch.linspace(
+            0.0, float(p_max), steps=int(cfg.grid_size), device=device
+        ).tolist()
+        q_grid = self._build_q_grid(q_max)
+
+        best_obj = float("inf")
+        best_p, best_q = 0.0, 0.0
+        best_Greg = 0.0
+        n_eval = 0
+
+        for p_try in p_grid:
+            for q_try in q_grid:
+                obj, Greg = objective(float(p_try), float(q_try))
+                n_eval += 1
+                if obj < best_obj:
+                    best_obj, best_p, best_q, best_Greg = obj, float(p_try), float(q_try), float(Greg)
+
+        meta = {
+            "n_eval": float(n_eval),
+            "solver_success": 1.0,
+        }
+        return best_p, best_q, best_Greg, best_obj, meta
+
+    def _search_powell(
+            self,
+            objective: Callable[[float, float], Tuple[float, float]],
+            *,
+            current_p: float,
+            current_q: float,
+            p_max: float,
+            q_max: float,
+    ) -> Tuple[float, float, float, float, Dict[str, float]]:
+        if minimize is None:
+            raise ImportError(
+                "search_method='powell' requires scipy. Install scipy or switch search_method='grid'."
+            )
+
+        active = []
+        if p_max > 0.0:
+            active.append("p")
+        if q_max > 0.0:
+            active.append("q")
+
+        if not active:
+            obj0, Greg0 = objective(0.0, 0.0)
+            meta = {
+                "n_eval": 1.0,
+                "solver_success": 1.0,
+            }
+            return 0.0, 0.0, Greg0, obj0, meta
+
+        def unpack(x: np.ndarray) -> Tuple[float, float]:
+            # x lives in normalized coordinates in [0, 1]^d; map back to raw (p, q).
+            i = 0
+            p_try, q_try = 0.0, 0.0
+            if "p" in active:
+                p_try = float(x[i]) * float(p_max)
+                i += 1
+            if "q" in active:
+                q_try = float(x[i]) * float(q_max)
+                i += 1
+            return p_try, q_try
+
+        # Normalize active search variables to [0, 1] so Powell sees coordinates on comparable scales.
+        # This is important because p may live on [0, 0.8] while q may live on [0, 1e-3], and
+        # direct optimization in raw coordinates can make the q-dimension numerically under-resolved.
+        x0 = []
+        bounds = []
+        if "p" in active:
+            p0 = float(max(0.0, min(current_p, p_max)))
+            x0.append(0.0 if p_max <= 0.0 else p0 / float(p_max))
+            bounds.append((0.0, 1.0))
+        if "q" in active:
+            q0 = float(max(0.0, min(current_q, q_max)))
+            x0.append(0.0 if q_max <= 0.0 else q0 / float(q_max))
+            bounds.append((0.0, 1.0))
+
+        best_seen = {
+            "obj": float("inf"),
+            "p": 0.0,
+            "q": 0.0,
+            "Greg": 0.0,
+            "n_eval": 0,
+        }
+
+        def fun_np(x: np.ndarray) -> float:
+            p_try, q_try = unpack(np.asarray(x, dtype=float))
+            obj, Greg = objective(p_try, q_try)
+            best_seen["n_eval"] += 1
+            if obj < best_seen["obj"]:
+                best_seen["obj"] = float(obj)
+                best_seen["p"] = float(p_try)
+                best_seen["q"] = float(q_try)
+                best_seen["Greg"] = float(Greg)
+            return float(obj)
+
+        res = minimize(
+            fun_np,
+            x0=np.asarray(x0, dtype=float),
+            method="Powell",
+            bounds=bounds,
+            options={
+                "maxiter": int(self.cfg.powell_maxiter),
+                "xtol": float(self.cfg.powell_xtol),
+                "ftol": float(self.cfg.powell_ftol),
+                "disp": False,
+            },
+        )
+
+        p_best = float(best_seen["p"])
+        q_best = float(best_seen["q"])
+        Greg_best = float(best_seen["Greg"])
+        obj_best = float(best_seen["obj"])
+
+        meta = {
+            "n_eval": float(best_seen["n_eval"]),
+            "solver_success": 1.0 if bool(res.success) else 0.0,
+        }
+        return p_best, q_best, Greg_best, obj_best, meta
+
+        def fun_np(x: np.ndarray) -> float:
+            p_try, q_try = unpack(np.asarray(x, dtype=float))
+            obj, Greg = objective(p_try, q_try)
+            best_seen["n_eval"] += 1
+            if obj < best_seen["obj"]:
+                best_seen["obj"] = float(obj)
+                best_seen["p"] = float(p_try)
+                best_seen["q"] = float(q_try)
+                best_seen["Greg"] = float(Greg)
+            return float(obj)
+
+        res = minimize(
+            fun_np,
+            x0=np.asarray(x0, dtype=float),
+            method="Powell",
+            bounds=bounds,
+            options={
+                "maxiter": int(self.cfg.powell_maxiter),
+                "xtol": float(self.cfg.powell_xtol),
+                "ftol": float(self.cfg.powell_ftol),
+                "disp": False,
+            },
+        )
+
+        p_best = float(best_seen["p"])
+        q_best = float(best_seen["q"])
+        Greg_best = float(best_seen["Greg"])
+        obj_best = float(best_seen["obj"])
+
+        meta = {
+            "n_eval": float(best_seen["n_eval"]),
+            "solver_success": 1.0 if bool(res.success) else 0.0,
+        }
+        return p_best, q_best, Greg_best, obj_best, meta
 
     def suggest_pq(
         self,
@@ -301,7 +575,9 @@ class PQGradNormTuner:
 
             loss_data = criterion(logits_anchor[idx], data.y[idx])
             params = [p for p in model.parameters() if p.requires_grad]
-            g_data = torch.autograd.grad(loss_data, params, retain_graph=False, create_graph=False, allow_unused=True)
+            g_data = torch.autograd.grad(
+                loss_data, params, retain_graph=False, create_graph=False, allow_unused=True
+            )
             G_data = _grad_norm(g_data)
             logGd = math.log(G_data + eps)
 
@@ -319,80 +595,36 @@ class PQGradNormTuner:
             # Multiclass analogue of z(1-z); differentiable; Var stays detached.
             w = _w_multiclass(logits)
 
-            # Bounds / grids (respect aug_mode)
+            # Bounds (respect aug_mode)
             aug_mode = str(aug_mode).lower().strip()
             p_max = cfg.p_max if aug_mode in ("both", "drop") else 0.0
             q_max = cfg.q_max if aug_mode in ("both", "add") else 0.0
 
-            p_grid = [0.0] if p_max <= 0 else torch.linspace(
-                0.0, float(p_max), steps=int(cfg.grid_size), device=data.x.device
-            ).tolist()
+            objective = self._make_objective(
+                params=params,
+                idx=idx,
+                w=w,
+                m=m,
+                m_sq=m_sq,
+                logGd=logGd,
+                eps=eps,
+            )
 
-            # q-grid based on expected number of additions K_add; avoids a "q floor"
-            if q_max <= 0.0:
-                q_grid = [0.0]
+            if self.search_method == "grid":
+                best_p, best_q, best_Greg, best_obj, search_meta = self._search_grid(
+                    objective,
+                    p_max=p_max,
+                    q_max=q_max,
+                    device=data.x.device,
+                )
             else:
-                M_undir = max(1, self._num_non_edges_undirected())
-                K_max = int(round(float(q_max) * float(M_undir)))
-
-                if K_max <= 0:
-                    q_grid = [0.0]
-                else:
-                    K_core = [0, 1, 2, 5, 10, 20, 50]
-                    K_core = [k for k in K_core if k <= K_max]
-
-                    target = int(cfg.grid_size)
-                    remaining = max(0, target - len(K_core))
-
-                    K_lin = []
-                    if remaining > 0:
-                        lin = torch.linspace(0.0, float(K_max), steps=remaining + 2, device="cpu")
-                        K_lin = [int(round(x)) for x in lin.tolist()[1:-1]]
-
-                    K_list = sorted(set(K_core + K_lin))[:target]
-                    q_grid = [float(k) / float(M_undir) for k in K_list]
-
-            best_obj = float("inf")
-            best_p, best_q = 0.0, 0.0
-            best_Greg = 0.0
-
-            if self.gnn == "gin":
-                V_drop, V_add = self._var_gin_bases(m, m_sq)
-
-                R_drop = 0.5 * (w[idx] * V_drop[idx]).sum() / max(int(idx.numel()), 1)
-                R_add = 0.5 * (w[idx] * V_add[idx]).sum() / max(int(idx.numel()), 1)
-
-                g_drop = torch.autograd.grad(R_drop, params, retain_graph=True, create_graph=False, allow_unused=True)
-                g_add = torch.autograd.grad(R_add, params, retain_graph=True, create_graph=False, allow_unused=True)
-
-                a = _dot(g_drop, g_drop)
-                b = _dot(g_add, g_add)
-                c = _dot(g_drop, g_add)
-
-                for p_try in p_grid:
-                    s = p_try / max(1.0 - p_try, eps)   # p / (1-p)
-                    for q_try in q_grid:
-                        t = q_try * (1.0 - q_try)       # q(1-q)
-                        g2 = (s * s) * a + (t * t) * b + 2.0 * s * t * c
-                        Greg = math.sqrt(max(g2, 0.0))
-                        obj = (math.log(Greg + eps) - logGd) ** 2
-                        if obj < best_obj:
-                            best_obj, best_p, best_q, best_Greg = obj, float(p_try), float(q_try), float(Greg)
-
-            elif self.gnn == "gcn":
-                for p_try in p_grid:
-                    for q_try in q_grid:
-                        V = self._var_gcn(float(p_try), float(q_try), m, m_sq)
-                        R = 0.5 * (w[idx] * V[idx]).sum() / max(int(idx.numel()), 1)
-
-                        g_reg = torch.autograd.grad(R, params, retain_graph=True, create_graph=False, allow_unused=True)
-                        Greg = _grad_norm(g_reg)
-
-                        obj = (math.log(Greg + eps) - logGd) ** 2
-                        if obj < best_obj:
-                            best_obj, best_p, best_q, best_Greg = obj, float(p_try), float(q_try), float(Greg)
-            else:
-                raise ValueError(f"Unsupported gnn={self.gnn}. Expected 'gin' or 'gcn'.")
+                best_p, best_q, best_Greg, best_obj, search_meta = self._search_powell(
+                    objective,
+                    current_p=float(current_p),
+                    current_q=float(current_q),
+                    p_max=p_max,
+                    q_max=q_max,
+                )
 
         # Restore BN module states
         _restore_batchnorm_buffers(bn_states)
@@ -425,5 +657,7 @@ class PQGradNormTuner:
             "p_new": float(p_new),
             "q_new": float(q_new),
             "obj": float(best_obj),
+            "search_method": self.search_method,
+            **search_meta,
         }
         return p_new, q_new, info

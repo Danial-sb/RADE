@@ -27,7 +27,7 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--dataset",
         type=str,
-        default="cora",
+        default="pubmed",
         choices=["cora", "citeseer", "pubmed", "cs", "computer", "physics", "flickr", "ogbn-arxiv"],
         help="Dataset name (must match nc_datasets_simple.py)",
     )
@@ -37,9 +37,15 @@ def parser_add_main_args(parser):
         default="./data/",
         help="Root directory passed to load_nc_dataset(root=...)",
     )
+    parser.add_argument(
+        "--remove_citeseer_isolated_nodes",
+        type=bool,
+        default=False,
+        help="Remove isolated nodes when loading CiteSeer. Ignored for other datasets.",
+    )
 
     # system
-    parser.add_argument("--device", type=int, default=2, help="GPU id (default: 0)")
+    parser.add_argument("--device", type=int, default=0, help="GPU id (default: 0)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cpu", action="store_true")
 
@@ -77,7 +83,7 @@ def parser_add_main_args(parser):
         choices=["gcn", "gin", "sgc", "gin-linear"],
         help="Backbone: gcn/gin are standard. sgc routes to linear-GCN. gin-linear routes to linear-GIN."
     )
-    parser.add_argument("--hidden_channels", type=int, default=128)
+    parser.add_argument("--hidden_channels", type=int, default=256)
     parser.add_argument("--local_layers", type=int, default=2)
     parser.add_argument("--pre_linear", type=bool, default=True)
     parser.add_argument("--res", action="store_true")
@@ -87,7 +93,7 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--linear",
         type=bool,
-        default=False,
+        default=True,
         help="Use strictly linear model: disables ReLU/Dropout/BN/LN and makes GIN MLP linear.",
     )
 
@@ -99,7 +105,7 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--patience",
         type=int,
-        default=200,
+        default=100,
         help="Early stopping patience in epochs based on validation accuracy. Set <=0 to disable early stopping.",
     )
 
@@ -149,14 +155,14 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--q",
         type=float,
-        default=0.001303,
+        default=0.0000456,
         help="Non-edge-add probability for clean non-edges (i,j) not in E.",
     )
 
     parser.add_argument(
         "--ep_correction",
         type=bool,
-        default=False,
+        default=True,
         help="Use expectation-preserving aggregation correction for RADE.",
     )
 
@@ -188,14 +194,18 @@ def parser_add_main_args(parser):
         default=False,
         help="Enable epoch-wise GradNorm matching to adapt (p,q).",
     )
+
+    parser.add_argument("--pq_search_method", type=str, default="grid",
+                        choices=["grid", "powell"])
+    parser.add_argument("--pq_powell_maxiter", type=int, default=25)
+    parser.add_argument("--pq_powell_xtol", type=float, default=1e-3)
+    parser.add_argument("--pq_powell_ftol", type=float, default=1e-3)
+    parser.add_argument("--pq_grid_size", type=int, default=5,
+                        help="Grid size for (p,q) search. Use 11 for GIN; use 3-5 for GCN (costlier).")
+
     parser.add_argument("--p_max", type=float, default=0.8, help="Upper bound for p during GradNorm tuning.")
-    parser.add_argument("--q_max", type=float, default=0.001442, help="Upper bound for q during GradNorm tuning.")
-    parser.add_argument(
-        "--pq_grid_size",
-        type=int,
-        default=5,
-        help="Grid size for (p,q) search. Use 11 for GIN; use 3-5 for GCN (costlier).",
-    )
+    parser.add_argument("--q_max", type=float, default=0.0000912, help="Upper bound for q during GradNorm tuning.")
+
     parser.add_argument(
         "--pq_subset_nodes",
         type=int,
