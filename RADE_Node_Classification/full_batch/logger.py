@@ -56,7 +56,7 @@ class Logger(object):
             print(f'Highest Train: {result[:, 0].max():.2f}')
             print(f'Highest Valid: {result[:, 1].max():.2f}')
             print(f'Highest Test: {result[:, 2].max():.2f}')
-            print(f'Chosen epoch: {ind}')
+            print(f'Chosen epoch: {ind + 1}')
             print(f'Final Train: {result[ind, 0]:.2f}')
             print(f'Final Test: {result[ind, 2]:.2f}')
             self.test = result[ind, 2]

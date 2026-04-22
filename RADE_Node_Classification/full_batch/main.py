@@ -3,6 +3,7 @@ os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 import argparse
 import random
+import sys
 import time
 from typing import Tuple
 
@@ -15,10 +16,15 @@ from logger import Logger, save_model, save_result
 from dataset import load_nc_dataset
 from data_utils import eval_acc_nc, class_rand_splits, make_random_split_idx, eval_f1_nc
 from eval import evaluate
-from parse import parse_method, parser_add_main_args
+from parse import (
+    apply_full_batch_auto_defaults,
+    get_explicit_arg_names,
+    parse_method,
+    parser_add_main_args,
+)
 from augmentation import BernoulliEdgeAugmentor
-from viz_pq import save_pq_plots
-from pq_gradnorm import PQGradNormTuner, PQTunerConfig
+from viz_pq import save_pq_plots, save_pq_search_comparison_plots, save_pq_objective_surface_plots
+from pq_gradnorm import PQGradNormTuner, PQTunerConfig, SEARCH_METHODS
 
 
 def fix_seed(seed: int = 42) -> None:
@@ -39,7 +45,7 @@ def fix_seed(seed: int = 42) -> None:
 parser = argparse.ArgumentParser(description="Training Pipeline for Node Classification")
 parser_add_main_args(parser)
 args = parser.parse_args()
-print(args)
+explicit_arg_names = get_explicit_arg_names(sys.argv[1:])
 
 # Enforce strict linearity at CLI level (before wandb overrides)
 if getattr(args, "linear", False):
@@ -72,7 +78,7 @@ if getattr(args, "wandb", False):
     for k, v in dict(wandb.config).items():
         if hasattr(args, k):
             setattr(args, k, v)
-    wandb.config.update(vars(args), allow_val_change=True)
+    explicit_arg_names.update({k for k in dict(wandb.config).keys() if hasattr(args, k)})
 
     if getattr(args, "linear", False):
         args.dropout = 0.0
@@ -80,6 +86,20 @@ if getattr(args, "wandb", False):
             args.bn = False
         if hasattr(args, "ln"):
             args.ln = False
+
+
+preset_key, auto_applied, auto_skipped = apply_full_batch_auto_defaults(args, explicit_arg_names)
+if preset_key is not None:
+    auto_parts = [f"{name}={value}" for name, value in auto_applied.items()]
+    skipped_parts = [f"{name}={value}" for name, value in auto_skipped.items()]
+
+    if auto_parts:
+        print(f"[AUTO-CONFIG] full-batch preset {preset_key[0]}/{preset_key[1]} applied: {', '.join(auto_parts)}")
+    if skipped_parts:
+        print(
+            f"[AUTO-CONFIG] kept explicit overrides for {preset_key[0]}/{preset_key[1]}: "
+            f"{', '.join(skipped_parts)}"
+        )
 
 
 # -----------------------
@@ -109,6 +129,10 @@ if getattr(args, "linear", False) and gnn_raw in {"sgc", "gin-linear"}:
         args.bn = False
     if hasattr(args, "ln"):
         args.ln = False
+
+print(args)
+if wandb_run is not None:
+    wandb.config.update(vars(args), allow_val_change=True)
 
 
 # -----------------------
@@ -141,13 +165,17 @@ if aug_tech == "dropnode":
 if aug_tech == "none":
     args.aug_mode = "none"
 
+ep_emp_average_mode = "ema" if bool(getattr(args, "pq_gradnorm", False)) else "running_mean"
+
 print(
     f"[CONFIG] dataset={args.dataset} | backbone_raw={getattr(args, 'gnn_raw', args.gnn)} -> backbone={args.gnn} | "
     f"linear={bool(getattr(args, 'linear', False))} | "
     f"aug_tech={args.aug_tech} aug_mode={args.aug_mode} | "
     f"ep_correction={bool(getattr(args, 'ep_correction', False))} "
-    f"(variant={getattr(args, 'rade_variant', '-')}) | "
-    f"pq_gradnorm={bool(getattr(args, 'pq_gradnorm', False))} | "
+    f"(mode={getattr(args, 'ep_expectation_mode', 'analytic')}, avg={ep_emp_average_mode}, variant={getattr(args, 'rade_variant', '-')}) | "
+    f"pq_gradnorm={bool(getattr(args, 'pq_gradnorm', False))} "
+    f"(search={getattr(args, 'pq_search_method', '-')}, "
+    f"compare={bool(getattr(args, 'pq_compare_search_methods', False))}) | "
     f"p={float(getattr(args, 'p', 0.0)):.4f} q={float(getattr(args, 'q', 0.0)):.6f} | "
     f"mask_sharing={getattr(args, 'mask_sharing', '-')}"
 )
@@ -200,6 +228,8 @@ if aug_tech == "rade":
 split_idx_lst = []
 p_histories = []
 q_histories = []
+method_obj_histories = {method: [] for method in SEARCH_METHODS}
+surface_snapshots_by_run = {}
 for run in range(args.runs):
     if args.rand_split:
         split_idx = make_random_split_idx(n, args.train_prop, args.valid_prop, seed=args.seed + run)
@@ -269,9 +299,23 @@ for run in range(args.runs):
     # (p, q) used for this run
     p_eff, q_eff = _enforce_aug_mode(float(args.p), float(args.q), args.aug_mode)
 
+    # Initialize lagged empirical EP state once per run.
+    if (
+        aug_tech == "rade"
+        and bool(getattr(args, "ep_correction", False))
+        and str(getattr(args, "ep_expectation_mode", "analytic")).lower().strip() == "empirical_ema"
+    ):
+        if not hasattr(model, "reset_ep_stats"):
+            raise RuntimeError(
+                "ep_expectation_mode='empirical_ema' requires model.reset_ep_stats(...)."
+            )
+        model.reset_ep_stats(p_eff, q_eff)
+
     # Record p, q used at each epoch
     p_trace = []
     q_trace = []
+    method_obj_trace = {method: [] for method in SEARCH_METHODS}
+    surface_snapshots = []
 
     # Fresh tuner per run
     pq_tuner = None
@@ -280,6 +324,9 @@ for run in range(args.runs):
             raise ValueError("--pq_gradnorm requires --aug_mode != none.")
         if not getattr(args, "ep_correction", False):
             raise ValueError("--pq_gradnorm currently requires --ep_correction True.")
+        if str(getattr(args, "pq_search_method", "grid")).lower().strip() == "adam":
+            if bool(getattr(args, "pq_compare_search_methods", False)):
+                raise ValueError("--pq_compare_search_methods is not supported when --pq_search_method=adam.")
 
         cfg = PQTunerConfig(
             p_max=args.p_max,
@@ -291,9 +338,17 @@ for run in range(args.runs):
             seed=args.seed,
             data_anchor=args.pq_data_anchor,
             search_method=args.pq_search_method,
+            compare_search_methods=bool(getattr(args, "pq_compare_search_methods", False)),
             powell_maxiter=args.pq_powell_maxiter,
             powell_xtol=args.pq_powell_xtol,
             powell_ftol=args.pq_powell_ftol,
+            newton_maxiter=args.pq_newton_maxiter,
+            newton_tol=args.pq_newton_tol,
+            newton_damping=args.pq_newton_damping,
+            adam_lr=args.pq_adam_lr,
+            adam_beta1=args.pq_adam_beta1,
+            adam_beta2=args.pq_adam_beta2,
+            adam_eps=args.pq_adam_eps,
         )
         pq_tuner = PQGradNormTuner(
             edge_index_clean=data.edge_index,
@@ -315,12 +370,18 @@ for run in range(args.runs):
     for epoch in range(args.epochs):
         _sync_for_timing(device)
         epoch_time = time.perf_counter()
+        epoch_display = int(epoch + 1)
 
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
-        p_trace.append(float(p_eff))
-        q_trace.append(float(q_eff))
+        p_epoch = float(p_eff)
+        q_epoch = float(q_eff)
+
+        p_trace.append(p_epoch)
+        q_trace.append(q_epoch)
+        for method in SEARCH_METHODS:
+            method_obj_trace[method].append(float("nan"))
 
         # -----------------------
         # Augment per epoch
@@ -335,7 +396,7 @@ for run in range(args.runs):
         do_aug = (
             aug_tech == "rade"
             and (str(args.aug_mode).lower().strip() != "none")
-            and (p_eff > 0.0 or q_eff > 0.0)
+            and (p_epoch > 0.0 or q_epoch > 0.0)
         )
 
         if do_aug:
@@ -343,8 +404,8 @@ for run in range(args.runs):
 
             if str(getattr(args, "mask_sharing", "shared")).lower().strip() == "shared":
                 _, edge_index_keep, edge_index_add, aug_stats = augmentor.augment_edge_indices(
-                    p=p_eff,
-                    q=q_eff,
+                    p=p_epoch,
+                    q=q_epoch,
                     mode=args.aug_mode,
                     seed=base_seed,
                     device=device,
@@ -356,8 +417,8 @@ for run in range(args.runs):
 
                 for layer in range(int(args.local_layers)):
                     _, ei_keep_l, ei_add_l, st = augmentor.augment_edge_indices(
-                        p=p_eff,
-                        q=q_eff,
+                        p=p_epoch,
+                        q=q_epoch,
                         mode=args.aug_mode,
                         seed=base_seed + 1_000_000 * layer,
                         device=device,
@@ -384,8 +445,8 @@ for run in range(args.runs):
                 data.edge_index,
                 edge_index_keep=edge_index_keep,
                 edge_index_add=edge_index_add,
-                p=p_eff,
-                q=q_eff,
+                p=p_epoch,
+                q=q_epoch,
             )
         else:
             logits = model(data.x, data.edge_index)
@@ -393,6 +454,26 @@ for run in range(args.runs):
         loss = criterion(logits[train_idx], data.y[train_idx])
         loss.backward()
         optimizer.step()
+
+        # -----------------------
+        # Lagged empirical-EP update (after optimizer step)
+        # -----------------------
+        if (
+            aug_tech == "rade"
+            and do_aug
+            and bool(getattr(args, "ep_correction", False))
+            and str(getattr(args, "ep_expectation_mode", "analytic")).lower().strip() == "empirical_ema"
+        ):
+            if not hasattr(model, "update_ep_stats"):
+                raise RuntimeError(
+                    "ep_expectation_mode='empirical_ema' requires model.update_ep_stats(...)."
+                )
+            model.update_ep_stats(
+                edge_index_keep=edge_index_keep,
+                edge_index_add=edge_index_add,
+                p=p_epoch,
+                q=q_epoch,
+            )
 
         # -----------------------
         # Evaluation
@@ -404,7 +485,7 @@ for run in range(args.runs):
             elif aug_tech == "dropnode":
                 logits_eval = model(data.x, data.edge_index, dropnode_rate=0.0)
             elif getattr(args, "ep_correction", False) and str(getattr(args, "rade_variant", "rade-of")) == "rade-ofs":
-                logits_eval = model(data.x, data.edge_index, p=p_eff, q=q_eff)
+                logits_eval = model(data.x, data.edge_index, p=p_epoch, q=q_epoch)
             else:
                 logits_eval = model(data.x, data.edge_index)
 
@@ -446,17 +527,25 @@ for run in range(args.runs):
                 prev_mode_training = model.training
                 model.train()
 
+                capture_surface = (
+                    bool(getattr(args, "pq_surface_plot", False))
+                    and (run + 1) == max(1, int(getattr(args, "pq_surface_run", 1)))
+                    and ((epoch + 1) % max(1, int(getattr(args, "pq_surface_every", 1))) == 0)
+                )
+
                 p_new, q_new, info = pq_tuner.suggest_pq(
                     model=model,
                     data=data,
                     train_idx=train_idx,
                     criterion=criterion,
-                    current_p=p_eff,
-                    current_q=q_eff,
+                    current_p=p_epoch,
+                    current_q=q_epoch,
                     aug_mode=str(args.aug_mode).lower().strip(),
                     epoch_seed=epoch_seed,
                     mask_sharing=str(getattr(args, "mask_sharing", "shared")).lower().strip(),
                     num_layers=int(getattr(args, "local_layers", 1)),
+                    capture_surface=capture_surface,
+                    surface_grid_size=int(getattr(args, "pq_surface_grid_size", 31)),
                 )
 
                 if not prev_mode_training:
@@ -465,24 +554,96 @@ for run in range(args.runs):
                 p_new, q_new = _enforce_aug_mode(p_new, q_new, args.aug_mode)
                 p_eff, q_eff = p_new, q_new
 
-                print(
-                    f"[PQ-GradNorm] run={run + 1:02d} epoch={epoch + 1:03d} "
-                    f"G_data={info['G_data']:.3e} G_reg_best={info['G_reg_best']:.3e} "
-                    f"p(best->new)={info['p_best']:.4f}->{info['p_new']:.4f} "
-                    f"q(best->new)={info['q_best']:.6f}->{info['q_new']:.6f} obj={info['obj']:.2e}"
-                )
+                if bool(info.get("comparison_enabled", 0.0)):
+                    methods = [
+                        method for method in str(info.get("comparison_methods", "")).split(",") if method
+                    ]
+                    for method in methods:
+                        method_obj_trace[method][-1] = float(info[f"comparison_{method}_obj"])
+
+                if capture_surface and ("surface_data" in info):
+                    surface_snapshot = dict(info["surface_data"])
+                    surface_snapshot["epoch"] = int(epoch + 1)
+                    surface_snapshot["run"] = int(run + 1)
+                    surface_snapshots.append(surface_snapshot)
+
+                pq_method = str(info.get("search_method", getattr(args, "pq_search_method", "grid")))
+                if pq_method == "adam":
+                    print(
+                        f"[PQ-GradNorm-Adam] run={run + 1:02d} epoch={epoch + 1:03d} "
+                        f"G_data={info['G_data']:.3e} G_reg={info['G_reg_best']:.3e} "
+                        f"p={info['p_best']:.4f} q={info['q_best']:.6f} obj={info['obj']:.2e} "
+                        f"lr={info.get('adam_lr', float('nan')):.2e}"
+                    )
+                else:
+                    print(
+                        f"[PQ-GradNorm] run={run + 1:02d} epoch={epoch + 1:03d} "
+                        f"G_data={info['G_data']:.3e} G_reg_best={info['G_reg_best']:.3e} "
+                        f"p(best->new)={info['p_best']:.4f}->{info['p_new']:.4f} "
+                        f"q(best->new)={info['q_best']:.6f}->{info['q_new']:.6f} obj={info['obj']:.2e}"
+                    )
+                if bool(info.get("comparison_enabled", 0.0)):
+                    methods = [
+                        method for method in str(info.get("comparison_methods", "")).split(",") if method
+                    ]
+                    compare_parts = [
+                        (
+                            f"{method}:obj={info[f'comparison_{method}_obj']:.2e} "
+                            f"(p={info[f'comparison_{method}_p_best']:.4f}, "
+                            f"q={info[f'comparison_{method}_q_best']:.6f}, "
+                            f"evals={int(info[f'comparison_{method}_n_eval'])})"
+                        )
+                        for method in methods
+                    ]
+                    print(
+                        f"[PQ-Compare] run={run + 1:02d} epoch={epoch + 1:03d} "
+                        + " | ".join(compare_parts)
+                        + " | "
+                        f"better={info['comparison_better_method']}"
+                    )
 
                 if wandb_run is not None:
+                    pq_log = {
+                        "pq/epoch": epoch_display,
+                        "pq/G_data": float(info["G_data"]),
+                        "pq/G_reg_best": float(info["G_reg_best"]),
+                        "pq/obj": float(info["obj"]),
+                        "pq/p_used": p_epoch,
+                        "pq/q_used": q_epoch,
+                        "pq/p_eval": float(info["p_best"]),
+                        "pq/q_eval": float(info["q_best"]),
+                        "pq/p_next": float(info["p_new"]),
+                        "pq/q_next": float(info["q_new"]),
+                        "pq/p_best": float(info["p_best"]),
+                        "pq/q_best": float(info["q_best"]),
+                        "pq/p_new": float(info["p_new"]),
+                        "pq/q_new": float(info["q_new"]),
+                    }
+                    if pq_method == "adam":
+                        pq_log["pq/G_reg_curr"] = float(info["G_reg_best"])
+                        pq_log["pq/G_reg_next"] = float(info.get("G_reg_new", float("nan")))
+                        pq_log["pq/obj_curr"] = float(info["obj"])
+                        pq_log["pq/obj_next"] = float(info.get("obj_new", float("nan")))
+                    if bool(info.get("comparison_enabled", 0.0)):
+                        methods = [
+                            method for method in str(info.get("comparison_methods", "")).split(",") if method
+                        ]
+                        pq_log["pq_compare/enabled"] = float(info["comparison_enabled"])
+                        pq_log["pq_compare/best_obj"] = float(info["comparison_best_obj"])
+                        pq_log["pq_compare/obj_spread"] = float(info["comparison_obj_spread"])
+                        for method in methods:
+                            pq_log[f"pq_compare/{method}_obj"] = float(info[f"comparison_{method}_obj"])
+                            pq_log[f"pq_compare/{method}_p_best"] = float(info[f"comparison_{method}_p_best"])
+                            pq_log[f"pq_compare/{method}_q_best"] = float(info[f"comparison_{method}_q_best"])
+                            pq_log[f"pq_compare/{method}_G_reg_best"] = float(
+                                info[f"comparison_{method}_G_reg_best"]
+                            )
+                            pq_log[f"pq_compare/{method}_n_eval"] = float(info[f"comparison_{method}_n_eval"])
+                            pq_log[f"pq_compare/{method}_solver_success"] = float(
+                                info[f"comparison_{method}_solver_success"]
+                            )
                     wandb.log(
-                        {
-                            "pq/G_data": float(info["G_data"]),
-                            "pq/G_reg_best": float(info["G_reg_best"]),
-                            "pq/obj": float(info["obj"]),
-                            "pq/p_best": float(info["p_best"]),
-                            "pq/q_best": float(info["q_best"]),
-                            "pq/p_new": float(info["p_new"]),
-                            "pq/q_new": float(info["q_new"]),
-                        },
+                        pq_log,
                         step=(epoch + run * int(args.epochs)),
                     )
 
@@ -499,7 +660,7 @@ for run in range(args.runs):
             log_dict = {
                 "aug/tech": str(aug_tech),
                 "run": int(run + 1),
-                "epoch": int(epoch),
+                "epoch": epoch_display,
                 "train/loss": float(loss.item()),
                 "train/acc": float(result[0]),
                 "valid/acc": float(result[1]),
@@ -511,9 +672,15 @@ for run in range(args.runs):
             }
 
             if aug_tech == "rade":
-                log_dict["aug/p"] = float(p_eff)
-                log_dict["aug/q"] = float(q_eff)
+                log_dict["aug/p"] = p_epoch
+                log_dict["aug/q"] = q_epoch
+                log_dict["aug/p_used"] = p_epoch
+                log_dict["aug/q_used"] = q_epoch
+                log_dict["aug/p_next"] = float(p_eff)
+                log_dict["aug/q_next"] = float(q_eff)
                 log_dict["rade/ep_correction"] = bool(getattr(args, "ep_correction", False))
+                log_dict["rade/ep_expectation_mode"] = str(getattr(args, "ep_expectation_mode", "analytic"))
+                log_dict["rade/ep_emp_average_mode"] = ep_emp_average_mode
                 log_dict["rade/variant"] = str(getattr(args, "rade_variant", "rade-of"))
 
                 if aug_stats is not None:
@@ -552,8 +719,10 @@ for run in range(args.runs):
                         aug_str = f", Drop/Add(avg per layer): -{dU:.1f} +{aU:.1f} edges"
 
                 aug_str += (
-                    f" (p={p_eff:.4f}, q={q_eff:.6f}, "
+                    f" (p={p_epoch:.4f}, q={q_epoch:.6f}, "
                     f"ep_correction={bool(getattr(args, 'ep_correction', False))}, "
+                    f"ep_mode={getattr(args, 'ep_expectation_mode', 'analytic')}, "
+                    f"ep_avg={ep_emp_average_mode}, "
                     f"variant={getattr(args, 'rade_variant', 'rade-of')})"
                 )
 
@@ -567,7 +736,7 @@ for run in range(args.runs):
 
             print(
                 f"Run: {run + 1:02d}, "
-                f"Epoch: {epoch:03d}, "
+                f"Epoch: {epoch_display:03d}, "
                 f"Loss: {loss:.4f}, "
                 f"Train: {100 * result[0]:.2f}%, "
                 f"Valid: {100 * result[1]:.2f}%, "
@@ -608,6 +777,10 @@ for run in range(args.runs):
     logger.print_statistics(run)
     p_histories.append(p_trace)
     q_histories.append(q_trace)
+    for method in SEARCH_METHODS:
+        method_obj_histories[method].append(method_obj_trace[method])
+    if len(surface_snapshots) > 0:
+        surface_snapshots_by_run[run + 1] = surface_snapshots
 
 
 results = logger.print_statistics()
@@ -618,8 +791,11 @@ if getattr(args, "pq_gradnorm", False) and str(getattr(args, "aug_tech", "rade")
     dataset_tag = str(args.dataset).lower().strip()
     gnn_tag = str(getattr(args, "gnn_raw", getattr(args, "gnn", "gcn"))).lower().strip()
     variant_tag = str(getattr(args, "rade_variant", "rade-of")).lower().strip().replace("-", "")
+    search_tag = str(getattr(args, "pq_search_method", "grid")).lower().strip()
 
-    tag = f"{dataset_tag}_{gnn_tag}_{variant_tag}"  # e.g. "cora_gcn_radeof" or "cora_gcn_radeofs"
+    tag = (
+        f"{dataset_tag}_{gnn_tag}_{variant_tag}_{search_tag}"
+    )  # e.g. "cora_gcn_radeof_grid" or "cora_gcn_radeofs_powell"
 
     save_pq_plots(
         p_histories,
@@ -628,6 +804,22 @@ if getattr(args, "pq_gradnorm", False) and str(getattr(args, "aug_tech", "rade")
         out_dir="visualization",
         show_runs=True,
     )
+    if bool(getattr(args, "pq_compare_search_methods", False)):
+        save_pq_search_comparison_plots(
+            method_obj_histories,
+            tag=tag,
+            out_dir="visualization",
+            show_runs=True,
+        )
+    surface_run = max(1, int(getattr(args, "pq_surface_run", 1)))
+    if bool(getattr(args, "pq_surface_plot", False)) and surface_run in surface_snapshots_by_run:
+        save_pq_objective_surface_plots(
+            surface_snapshots_by_run[surface_run],
+            tag=tag,
+            run_idx=surface_run,
+            out_dir="visualization",
+            create_animation=bool(getattr(args, "pq_surface_animation", False)),
+        )
 
 save_result(args, results, runtime_summary=runtime_summary)
 

@@ -1,7 +1,6 @@
-# nc_minibatch/mb_models.py
 from __future__ import annotations
 
-from typing import Optional, Union, List
+from typing import List, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -15,19 +14,12 @@ EdgeIndexObj = Union[torch.Tensor, List[torch.Tensor]]
 
 
 class MPNNsMB(nn.Module):
-    """
-    Mini-batch MPNNs for node classification.
-
-    Differences vs full_batch:
-      - RADE caches are batch-local and are rebuilt per forward(batch).
-      - Complement C(i) is the complement within the batch node set.
-    """
-
     def __init__(
         self,
         in_channels: int,
         hidden_channels: int,
         out_channels: int,
+        num_nodes: int,
         local_layers: int = 3,
         dropout: float = 0.5,
         pre_linear: bool = False,
@@ -36,8 +28,12 @@ class MPNNsMB(nn.Module):
         bn: bool = False,
         jk: bool = False,
         gnn: str = "gcn",
-        unbiased: bool = False,
-        unbiased_mode: str = "rade",
+        ep_correction: bool = False,
+        ep_expectation_mode: str = "analytic",
+        ep_emp_average_mode: str = "ema",
+        ep_emp_beta: float = 0.1,
+        ep_emp_eps: float = 1e-12,
+        rade_variant: str = "rade-of",
         linear: bool = False,
         aug_tech: str = "rade",
         mb_rade_mode: str = "local",
@@ -46,9 +42,8 @@ class MPNNsMB(nn.Module):
 
         assert gnn in ("gcn", "gin"), "gnn must be 'gcn' or 'gin'"
         assert local_layers >= 1, "local_layers must be >= 1"
-        if unbiased_mode not in ("rade", "rade-ic"):
-            raise ValueError(f"unbiased_mode must be 'rade' or 'rade-ic'. Got {unbiased_mode}")
 
+        self.global_num_nodes = int(num_nodes)
         self.linear = bool(linear)
         if self.linear:
             dropout = 0.0
@@ -65,12 +60,16 @@ class MPNNsMB(nn.Module):
         self.bn = bool(bn)
         self.jk = bool(jk)
         self.gnn = str(gnn).lower().strip()
-        self.unbiased = bool(unbiased)
-        self.unbiased_mode = str(unbiased_mode).lower().strip()
+        self.ep_correction = bool(ep_correction)
+        self.ep_expectation_mode = str(ep_expectation_mode).lower().strip()
+        self.ep_emp_average_mode = str(ep_emp_average_mode).lower().strip()
+        self.ep_emp_beta = float(ep_emp_beta)
+        self.ep_emp_eps = float(ep_emp_eps)
+        self.rade_variant = str(rade_variant).lower().strip()
 
         self.mb_rade_mode = str(mb_rade_mode).lower().strip()
         if self.mb_rade_mode not in {"local", "disabled"}:
-            raise ValueError(f"mb_rade_mode must be 'local' or 'disabled'. Got {self.mb_rade_mode}")
+            raise ValueError(f"mb_rade_mode must be 'local' or 'disabled'. Got {mb_rade_mode}")
 
         self.aug_tech = str(aug_tech).lower().strip()
         if self.aug_tech not in {"rade", "dropmessage", "dropnode", "none"}:
@@ -82,7 +81,6 @@ class MPNNsMB(nn.Module):
         self.lns = nn.ModuleList() if self.ln else None
         self.bns = nn.ModuleList() if self.bn else None
 
-
         def make_gin_mlp(in_dim: int, out_dim: int) -> nn.Module:
             if self.linear:
                 return nn.Linear(in_dim, out_dim)
@@ -93,10 +91,7 @@ class MPNNsMB(nn.Module):
             )
 
         first_in = hidden_channels if self.pre_linear else in_channels
-        L = int(local_layers)
-        use_ic = (self.unbiased and self.unbiased_mode == "rade-ic")
-
-        for layer_idx in range(L):
+        for layer_idx in range(int(local_layers)):
             in_dim = first_in if layer_idx == 0 else hidden_channels
             out_dim = hidden_channels
 
@@ -105,8 +100,12 @@ class MPNNsMB(nn.Module):
                 if self.aug_tech == "rade":
                     conv = RADEGINConvMB(
                         mlp,
-                        ic_mode=use_ic,
-                        apply_corrections=self.unbiased,
+                        rade_variant=self.rade_variant,
+                        ep_correction=self.ep_correction,
+                        ep_expectation_mode=self.ep_expectation_mode,
+                        ep_emp_average_mode=self.ep_emp_average_mode,
+                        ep_emp_beta=self.ep_emp_beta,
+                        ep_emp_eps=self.ep_emp_eps,
                     )
                 elif self.aug_tech == "dropmessage":
                     conv = DropMessageGINConv(mlp)
@@ -119,8 +118,12 @@ class MPNNsMB(nn.Module):
                         out_dim,
                         bias=True,
                         correct_self_loop=True,
-                        ic_mode=use_ic,
-                        apply_corrections=self.unbiased,
+                        rade_variant=self.rade_variant,
+                        ep_correction=self.ep_correction,
+                        ep_expectation_mode=self.ep_expectation_mode,
+                        ep_emp_average_mode=self.ep_emp_average_mode,
+                        ep_emp_beta=self.ep_emp_beta,
+                        ep_emp_eps=self.ep_emp_eps,
                     )
                 elif self.aug_tech == "dropmessage":
                     conv = DropMessageGCNConv(in_dim, out_dim, bias=True)
@@ -157,23 +160,65 @@ class MPNNsMB(nn.Module):
 
     @staticmethod
     def _apply_dropnode(x: torch.Tensor, dropnode_rate: float, training: bool) -> torch.Tensor:
-        r = float(dropnode_rate)
-        if (not training) or r <= 0.0:
+        rate = float(dropnode_rate)
+        if (not training) or rate <= 0.0:
             return x
-        if r >= 1.0:
-            raise ValueError(f"dropnode_rate must be in [0,1). Got {r}")
-        keep = 1.0 - r
+        if rate >= 1.0:
+            raise ValueError(f"dropnode_rate must be in [0,1). Got {rate}")
+        keep = 1.0 - rate
         mask = torch.empty((x.size(0), 1), device=x.device, dtype=x.dtype).bernoulli_(keep)
         return x * (mask / keep)
 
-    def _set_batch_graph(self, edge_index_clean: torch.Tensor, num_nodes: int) -> None:
-        """
-        Mini-batch critical: graph cache must be rebuilt for each batch because degrees and complements are batch-local.
-        """
-        cache = BatchGraphCache.from_edge_index(edge_index_clean, int(num_nodes))
+    def _set_batch_graph(self, edge_index_clean: torch.Tensor, num_nodes: int, node_ids: Optional[torch.Tensor]) -> None:
+        cache = BatchGraphCache.from_edge_index(
+            edge_index_clean,
+            int(num_nodes),
+            node_ids=node_ids,
+            global_num_nodes_total=self.global_num_nodes,
+        )
         for conv in self.local_convs:
             if hasattr(conv, "set_graph"):
                 conv.set_graph(cache)
+
+    def set_graph(self, edge_index_clean: torch.Tensor, num_nodes: int, node_ids: Optional[torch.Tensor] = None) -> None:
+        self._set_batch_graph(edge_index_clean=edge_index_clean, num_nodes=num_nodes, node_ids=node_ids)
+
+    def reset_ep_stats(self, p: float, q: float) -> None:
+        for conv in self.local_convs:
+            if hasattr(conv, "reset_ep_stats"):
+                conv.reset_ep_stats(p=float(p), q=float(q))
+
+    def update_ep_stats(
+        self,
+        *,
+        edge_index_keep: Optional[EdgeIndexObj],
+        edge_index_add: Optional[EdgeIndexObj],
+        p: float,
+        q: float,
+    ) -> None:
+        def _is_list(obj):
+            return isinstance(obj, (list, tuple))
+
+        num_layers = len(self.local_convs)
+
+        def _pick_layer_edges(obj: Optional[EdgeIndexObj], idx: int) -> Optional[torch.Tensor]:
+            if obj is None:
+                return None
+            if _is_list(obj):
+                if len(obj) != num_layers:
+                    raise ValueError(f"Expected list length={num_layers}, got {len(obj)}")
+                tensor = obj[idx]
+                return None if (tensor is None or tensor.numel() == 0) else tensor
+            return None if obj.numel() == 0 else obj
+
+        for layer_idx, conv in enumerate(self.local_convs):
+            if hasattr(conv, "update_ep_stats"):
+                conv.update_ep_stats(
+                    edge_index_keep=_pick_layer_edges(edge_index_keep, layer_idx),
+                    edge_index_add=_pick_layer_edges(edge_index_add, layer_idx),
+                    p=float(p),
+                    q=float(q),
+                )
 
     def forward(
         self,
@@ -186,65 +231,58 @@ class MPNNsMB(nn.Module):
         q: float = 0.0,
         dropmessage_rate: float = 0.0,
         dropnode_rate: float = 0.0,
+        node_ids: Optional[torch.Tensor] = None,
         return_embeddings: bool = False,
     ):
-        # If we have RADE convs in the stack, set batch cache every forward.
         if self.aug_tech == "rade":
-            self._set_batch_graph(edge_index_clean=edge_index_clean, num_nodes=x.size(0))
+            self._set_batch_graph(edge_index_clean=edge_index_clean, num_nodes=x.size(0), node_ids=node_ids)
 
-        # Pre-linear (optional)
         if self.lin_in is not None:
             x = self.lin_in(x)
             if (not self.linear) and (self.dropout > 0.0):
                 x = F.dropout(x, p=self.dropout, training=self.training)
 
-        # DropNode (baseline): only when selected
         if self.aug_tech == "dropnode":
             x = self._apply_dropnode(x, dropnode_rate=float(dropnode_rate), training=self.training)
 
-        def _is_list(t):
-            return isinstance(t, (list, tuple))
+        def _is_list(obj):
+            return isinstance(obj, (list, tuple))
 
-        L = len(self.local_convs)
+        num_layers = len(self.local_convs)
 
         rade_active = (
-            (self.aug_tech == "rade")
-            and (self.mb_rade_mode == "local")
+            self.aug_tech == "rade"
+            and self.mb_rade_mode == "local"
             and self.training
             and (edge_index_keep is not None or edge_index_add is not None)
             and (float(p) > 0.0 or float(q) > 0.0)
         )
 
-        def _pick_layer_edges(obj: Optional[EdgeIndexObj], i: int) -> Optional[torch.Tensor]:
+        def _pick_layer_edges(obj: Optional[EdgeIndexObj], idx: int) -> Optional[torch.Tensor]:
             if obj is None:
                 return None
             if _is_list(obj):
-                if len(obj) != L:
-                    raise ValueError(f"Expected list length={L}, got {len(obj)}")
-                t = obj[i]
-                return None if (t is None or t.numel() == 0) else t
+                if len(obj) != num_layers:
+                    raise ValueError(f"Expected list length={num_layers}, got {len(obj)}")
+                tensor = obj[idx]
+                return None if (tensor is None or tensor.numel() == 0) else tensor
             return None if obj.numel() == 0 else obj
 
         x_final = None
-
-        for i, conv in enumerate(self.local_convs):
+        for layer_idx, conv in enumerate(self.local_convs):
             x_in = x
-
             apply_rade_here = rade_active and hasattr(conv, "set_graph")
 
             if apply_rade_here:
-                layer_keep = _pick_layer_edges(edge_index_keep, i)
-                layer_add = _pick_layer_edges(edge_index_add, i)
                 x = conv(
                     x,
                     edge_index_clean,
-                    edge_index_keep=layer_keep,
-                    edge_index_add=layer_add,
+                    edge_index_keep=_pick_layer_edges(edge_index_keep, layer_idx),
+                    edge_index_add=_pick_layer_edges(edge_index_add, layer_idx),
                     p=float(p),
                     q=float(q),
                 )
             else:
-                # RADE convs may use p,q in eval for RADE-IC inference correction
                 if hasattr(conv, "set_graph"):
                     x = conv(x, edge_index_clean, p=float(p), q=float(q))
                 elif getattr(conv, "supports_dropmessage", False):
@@ -253,22 +291,19 @@ class MPNNsMB(nn.Module):
                     x = conv(x, edge_index_clean)
 
             if self.res:
-                x = x + self.lins[i](x_in)
+                x = x + self.lins[layer_idx](x_in)
 
             if not self.linear:
                 if self.ln:
-                    x = self.lns[i](x)
+                    x = self.lns[layer_idx](x)
                 elif self.bn:
-                    x = self.bns[i](x)
+                    x = self.bns[layer_idx](x)
 
                 x = F.relu(x)
                 if self.dropout > 0.0:
                     x = F.dropout(x, p=self.dropout, training=self.training)
 
-            if self.jk:
-                x_final = x if x_final is None else (x_final + x)
-            else:
-                x_final = x
+            x_final = x if (x_final is None or not self.jk) else (x_final + x)
 
         logits = self.pred_local(x_final)
         if return_embeddings:
@@ -276,5 +311,4 @@ class MPNNsMB(nn.Module):
         return logits
 
 
-# Convenience alias if you want to import the same name in parse code:
 MPNNs = MPNNsMB

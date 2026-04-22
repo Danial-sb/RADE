@@ -51,6 +51,30 @@ def _validate_rade_variant(rade_variant: str) -> str:
     return rade_variant
 
 
+def _validate_ep_expectation_mode(ep_expectation_mode: str) -> str:
+    ep_expectation_mode = str(ep_expectation_mode).lower().strip()
+    if ep_expectation_mode not in {"analytic", "empirical_ema"}:
+        raise ValueError(
+            f"ep_expectation_mode must be one of {{'analytic', 'empirical_ema'}}. "
+            f"Got {ep_expectation_mode}"
+        )
+    return ep_expectation_mode
+
+
+def _validate_ep_emp_average_mode(ep_emp_average_mode: str) -> str:
+    ep_emp_average_mode = str(ep_emp_average_mode).lower().strip()
+    if ep_emp_average_mode not in {"ema", "running_mean"}:
+        raise ValueError(
+            f"ep_emp_average_mode must be one of {{'ema', 'running_mean'}}. "
+            f"Got {ep_emp_average_mode}"
+        )
+    return ep_emp_average_mode
+
+
+def _directed_edge_keys(row: torch.Tensor, col: torch.Tensor, num_nodes: int) -> torch.Tensor:
+    return row.to(torch.long) * int(num_nodes) + col.to(torch.long)
+
+
 @dataclass
 class GraphCache:
     """
@@ -282,6 +306,8 @@ class RADEGCNConv(nn.Module):
       - ep_correction=True       -> use expectation-preserving aggregation correction
       - ep_correction=False      -> same sampled keep/add operator path, but without
                                     expectation-preserving correction (matched ablation)
+      - ep_expectation_mode='analytic'      -> original paper expectation
+      - ep_expectation_mode='empirical_ema' -> lagged online EMA ablation
     """
 
     def __init__(
@@ -292,6 +318,10 @@ class RADEGCNConv(nn.Module):
         correct_self_loop: bool = True,
         rade_variant: str = "rade-of",
         ep_correction: bool = True,
+        ep_expectation_mode: str = "analytic",
+        ep_emp_average_mode: str = "ema",
+        ep_emp_beta: float = 0.1,
+        ep_emp_eps: float = 1e-12,
     ):
         super().__init__()
         self.lin = nn.Linear(in_channels, out_channels, bias=False)
@@ -299,16 +329,281 @@ class RADEGCNConv(nn.Module):
         self.correct_self_loop = bool(correct_self_loop)
         self.rade_variant = _validate_rade_variant(rade_variant)
         self.ep_correction = bool(ep_correction)
+        self.ep_expectation_mode = _validate_ep_expectation_mode(ep_expectation_mode)
+        self.ep_emp_average_mode = _validate_ep_emp_average_mode(ep_emp_average_mode)
+        self.ep_emp_beta = float(ep_emp_beta)
+        self.ep_emp_eps = float(ep_emp_eps)
 
         self.graph_cache: Optional[GraphCache] = None
 
+        self.register_buffer("emp_clean_edge_raw", torch.empty(0, dtype=torch.float32))
+        self.register_buffer("emp_clean_edge_scale", torch.tensor(1.0, dtype=torch.float32))
+        self.register_buffer("emp_self_raw", torch.empty(0, dtype=torch.float32))
+        self.register_buffer("emp_self_scale", torch.tensor(1.0, dtype=torch.float32))
+        self.register_buffer("emp_nonedge_row", torch.empty(0, dtype=torch.long))
+        self.register_buffer("emp_nonedge_col", torch.empty(0, dtype=torch.long))
+        self.register_buffer("emp_nonedge_raw", torch.empty(0, dtype=torch.float32))
+        self.register_buffer("emp_nonedge_scale", torch.tensor(1.0, dtype=torch.float32))
+        self.register_buffer("emp_num_updates", torch.tensor(0, dtype=torch.long))
+
+        self._clean_edge_lookup: dict[int, int] = {}
+        self._emp_nonedge_lookup: dict[int, int] = {}
+
     def set_graph(self, graph_cache: GraphCache) -> None:
         self.graph_cache = graph_cache
+        row, col = graph_cache.edge_index_clean_dir[0], graph_cache.edge_index_clean_dir[1]
+        keys = _directed_edge_keys(row, col, graph_cache.num_nodes).detach().cpu().tolist()
+        self._clean_edge_lookup = {int(key): idx for idx, key in enumerate(keys)}
+        self._rebuild_emp_nonedge_lookup()
 
     def reset_parameters(self) -> None:
         self.lin.reset_parameters()
         if self.bias is not None:
             torch.nn.init.zeros_(self.bias)
+
+    def _reset_emp_nonedge_sparse(self) -> None:
+        device = self.emp_nonedge_scale.device
+        self.emp_nonedge_row = torch.empty(0, dtype=torch.long, device=device)
+        self.emp_nonedge_col = torch.empty(0, dtype=torch.long, device=device)
+        self.emp_nonedge_raw = torch.empty(0, dtype=torch.float32, device=device)
+        self.emp_nonedge_scale.fill_(1.0)
+        self._emp_nonedge_lookup = {}
+
+    def _rebuild_emp_nonedge_lookup(self) -> None:
+        if self.graph_cache is None:
+            self._emp_nonedge_lookup = {}
+            return
+        if self.emp_nonedge_row.numel() == 0:
+            self._emp_nonedge_lookup = {}
+            return
+        keys = _directed_edge_keys(
+            self.emp_nonedge_row.detach().cpu(),
+            self.emp_nonedge_col.detach().cpu(),
+            self.graph_cache.num_nodes,
+        ).tolist()
+        self._emp_nonedge_lookup = {int(key): idx for idx, key in enumerate(keys)}
+
+    def _gcn_sample_coeffs(
+        self,
+        edge_index_keep: Optional[torch.Tensor],
+        edge_index_add: Optional[torch.Tensor],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        assert self.graph_cache is not None, "Call model.set_graph(...) before using empirical EP stats."
+
+        N = int(self.graph_cache.num_nodes)
+
+        if edge_index_keep is not None and edge_index_keep.numel() > 0:
+            row_k = edge_index_keep[0].to(device)
+            col_k = edge_index_keep[1].to(device)
+        else:
+            row_k = torch.empty(0, dtype=torch.long, device=device)
+            col_k = torch.empty(0, dtype=torch.long, device=device)
+
+        if edge_index_add is not None and edge_index_add.numel() > 0:
+            row_a = edge_index_add[0].to(device)
+            col_a = edge_index_add[1].to(device)
+        else:
+            row_a = torch.empty(0, dtype=torch.long, device=device)
+            col_a = torch.empty(0, dtype=torch.long, device=device)
+
+        ar = torch.arange(N, device=device)
+        row_all = torch.cat([row_k, row_a, ar], dim=0)
+        col_all = torch.cat([col_k, col_a, ar], dim=0)
+
+        w_all = torch.ones(row_all.numel(), device=device, dtype=dtype)
+        deg_aug = _scatter_add_scalar(w_all, col_all, N).clamp(min=1.0)
+        inv_sqrt_aug = deg_aug.pow(-0.5)
+
+        gamma_k = inv_sqrt_aug[row_k] * inv_sqrt_aug[col_k]
+        gamma_a = inv_sqrt_aug[row_a] * inv_sqrt_aug[col_a] if row_a.numel() else torch.empty(0, device=device, dtype=dtype)
+        gamma_self = inv_sqrt_aug * inv_sqrt_aug
+        return row_k, col_k, gamma_k, row_a, col_a, gamma_a, gamma_self
+
+    def _append_nonedge_raw(
+        self,
+        row_a: torch.Tensor,
+        col_a: torch.Tensor,
+        gamma_a: torch.Tensor,
+        *,
+        new_mult: float,
+    ) -> None:
+        if row_a.numel() == 0:
+            return
+        assert self.graph_cache is not None, "Call model.set_graph(...) before using empirical EP stats."
+
+        scale = float(self.emp_nonedge_scale.item())
+        if scale <= 0.0:
+            raise RuntimeError("emp_nonedge_scale must be positive when beta < 1.")
+
+        num_nodes = int(self.graph_cache.num_nodes)
+        raw_updates = (float(new_mult) * gamma_a.detach().to(dtype=torch.float32) / scale).cpu().tolist()
+        row_list = row_a.detach().cpu().tolist()
+        col_list = col_a.detach().cpu().tolist()
+
+        new_rows = []
+        new_cols = []
+        new_vals = []
+        existing_indices = []
+        existing_updates = []
+
+        for row_i, col_i, raw_i in zip(row_list, col_list, raw_updates):
+            key = int(row_i) * num_nodes + int(col_i)
+            idx = self._emp_nonedge_lookup.get(key)
+            if idx is None:
+                idx = int(self.emp_nonedge_raw.numel()) + len(new_rows)
+                self._emp_nonedge_lookup[key] = idx
+                new_rows.append(int(row_i))
+                new_cols.append(int(col_i))
+                new_vals.append(float(raw_i))
+            else:
+                existing_indices.append(int(idx))
+                existing_updates.append(float(raw_i))
+
+        if existing_indices:
+            idx_t = torch.tensor(existing_indices, dtype=torch.long, device=self.emp_nonedge_raw.device)
+            upd_t = torch.tensor(existing_updates, dtype=torch.float32, device=self.emp_nonedge_raw.device)
+            self.emp_nonedge_raw.index_add_(0, idx_t, upd_t)
+
+        if new_rows:
+            dev = self.emp_nonedge_raw.device
+            row_t = torch.tensor(new_rows, dtype=torch.long, device=dev)
+            col_t = torch.tensor(new_cols, dtype=torch.long, device=dev)
+            val_t = torch.tensor(new_vals, dtype=torch.float32, device=dev)
+            self.emp_nonedge_row = torch.cat([self.emp_nonedge_row, row_t], dim=0)
+            self.emp_nonedge_col = torch.cat([self.emp_nonedge_col, col_t], dim=0)
+            self.emp_nonedge_raw = torch.cat([self.emp_nonedge_raw, val_t], dim=0)
+
+    def _get_clean_edge_emp(
+        self,
+        row: torch.Tensor,
+        col: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if row.numel() == 0:
+            return torch.empty(0, dtype=dtype, device=device)
+        assert self.graph_cache is not None, "Call model.set_graph(...) before using empirical EP stats."
+
+        keys = _directed_edge_keys(row.detach().cpu(), col.detach().cpu(), self.graph_cache.num_nodes).tolist()
+        idx = [self._clean_edge_lookup[int(key)] for key in keys]
+        idx_t = torch.tensor(idx, dtype=torch.long, device=self.emp_clean_edge_raw.device)
+        vals = self.emp_clean_edge_scale * self.emp_clean_edge_raw.index_select(0, idx_t)
+        return vals.to(device=device, dtype=dtype)
+
+    def _apply_emp_nonedge_expectation(self, x: torch.Tensor) -> torch.Tensor:
+        if self.emp_nonedge_raw.numel() == 0:
+            return torch.zeros((x.size(0), x.size(1)), device=x.device, dtype=x.dtype)
+
+        rows = self.emp_nonedge_row.to(x.device)
+        cols = self.emp_nonedge_col.to(x.device)
+        vals = (self.emp_nonedge_scale * self.emp_nonedge_raw).to(x.device, dtype=x.dtype)
+        return _scatter_add_rows(vals.unsqueeze(1) * x[rows], cols, x.size(0))
+
+    def _emp_update_weights(self) -> tuple[float, float]:
+        if self.ep_emp_average_mode == "ema":
+            beta = float(self.ep_emp_beta)
+            if beta <= 0.0:
+                return 1.0, 0.0
+            if beta >= 1.0:
+                return 0.0, 1.0
+            return 1.0 - beta, beta
+
+        t_prev = int(self.emp_num_updates.item())
+        t_new = t_prev + 1
+        return float(t_prev) / float(t_new), 1.0 / float(t_new)
+
+    def reset_ep_stats(self, p: float, q: float) -> None:
+        assert self.graph_cache is not None, "Call model.set_graph(...) before reset_ep_stats(...)."
+        deg_clean = self.graph_cache.deg_clean
+        comp_size = self.graph_cache.comp_size
+        row, col = self.graph_cache.edge_index_clean_dir[0], self.graph_cache.edge_index_clean_dir[1]
+
+        tA = _delta_E_inv_sqrt_caseA(deg_clean, comp_size, p=float(p), q=float(q))
+        self.emp_clean_edge_raw = ((1.0 - float(p)) * tA[row] * tA[col]).detach().to(dtype=torch.float32)
+        self.emp_clean_edge_scale.fill_(1.0)
+
+        self.emp_self_raw = _delta_E_inv_self(deg_clean, comp_size, p=float(p), q=float(q)).detach().to(dtype=torch.float32)
+        self.emp_self_scale.fill_(1.0)
+
+        self._reset_emp_nonedge_sparse()
+        self.emp_num_updates.zero_()
+
+    def update_ep_stats(
+        self,
+        *,
+        edge_index_keep: Optional[torch.Tensor],
+        edge_index_add: Optional[torch.Tensor],
+        p: float,
+        q: float,
+    ) -> None:
+        if self.ep_expectation_mode != "empirical_ema":
+            return
+        assert self.graph_cache is not None, "Call model.set_graph(...) before update_ep_stats(...)."
+
+        old_mult, new_mult = self._emp_update_weights()
+        if new_mult <= 0.0:
+            return
+
+        device = self.graph_cache.deg_clean.device
+        row_k, col_k, gamma_k, row_a, col_a, gamma_a, gamma_self = self._gcn_sample_coeffs(
+            edge_index_keep=edge_index_keep,
+            edge_index_add=edge_index_add,
+            device=device,
+            dtype=torch.float32,
+        )
+
+        if old_mult <= 1e-12:
+            self.emp_clean_edge_scale.fill_(1.0)
+            if self.emp_clean_edge_raw.numel():
+                self.emp_clean_edge_raw.zero_()
+            if row_k.numel():
+                keys = _directed_edge_keys(row_k.detach().cpu(), col_k.detach().cpu(), self.graph_cache.num_nodes).tolist()
+                idx = [self._clean_edge_lookup[int(key)] for key in keys]
+                idx_t = torch.tensor(idx, dtype=torch.long, device=self.emp_clean_edge_raw.device)
+                self.emp_clean_edge_raw.index_copy_(0, idx_t, gamma_k.detach().to(self.emp_clean_edge_raw.device, dtype=torch.float32))
+
+            self.emp_self_scale.fill_(1.0)
+            self.emp_self_raw = gamma_self.detach().to(self.emp_self_raw.device, dtype=torch.float32)
+
+            self._reset_emp_nonedge_sparse()
+            if row_a.numel():
+                self.emp_nonedge_row = row_a.detach().to(self.emp_nonedge_row.device, dtype=torch.long)
+                self.emp_nonedge_col = col_a.detach().to(self.emp_nonedge_col.device, dtype=torch.long)
+                self.emp_nonedge_raw = gamma_a.detach().to(self.emp_nonedge_raw.device, dtype=torch.float32)
+                self.emp_nonedge_scale.fill_(1.0)
+                self._rebuild_emp_nonedge_lookup()
+            self.emp_num_updates.add_(1)
+            return
+
+        self.emp_clean_edge_scale.mul_(old_mult)
+        if row_k.numel():
+            keys = _directed_edge_keys(row_k.detach().cpu(), col_k.detach().cpu(), self.graph_cache.num_nodes).tolist()
+            idx = [self._clean_edge_lookup[int(key)] for key in keys]
+            idx_t = torch.tensor(idx, dtype=torch.long, device=self.emp_clean_edge_raw.device)
+            upd_t = (new_mult * gamma_k.detach().to(self.emp_clean_edge_raw.device, dtype=torch.float32)) / self.emp_clean_edge_scale
+            self.emp_clean_edge_raw.index_add_(0, idx_t, upd_t)
+
+        self.emp_self_scale.mul_(old_mult)
+        upd_self = (new_mult * gamma_self.detach().to(self.emp_self_raw.device, dtype=torch.float32)) / self.emp_self_scale
+        if self.emp_self_raw.numel() != upd_self.numel():
+            self.emp_self_raw = torch.zeros_like(upd_self)
+        self.emp_self_raw.add_(upd_self)
+
+        self.emp_nonedge_scale.mul_(old_mult)
+        self._append_nonedge_raw(row_a=row_a, col_a=col_a, gamma_a=gamma_a, new_mult=new_mult)
+        self.emp_num_updates.add_(1)
 
     def forward(
         self,
@@ -347,16 +642,18 @@ class RADEGCNConv(nn.Module):
             gamma = inv_sqrt[row] * inv_sqrt[col]
             out = _scatter_add_rows(gamma.unsqueeze(1) * x[row], col, N)
 
-            # RADE-OFS inference correction:
-            #   out += q * tB(i) * sum_{j in C(i)} tB(j) x_j
-            # under the decoupled Case-B approximation.
+            # RADE-OFS inference correction.
             if use_ofs and (not self.training) and (q > 0.0):
-                deg_clean = self.graph_cache.deg_clean.to(x.device)
-                comp_size = self.graph_cache.comp_size.to(x.device)
-
-                tB = _delta_E_inv_sqrt_caseB(deg_clean, comp_size, p=p, q=q).to(x.device, dtype=x.dtype)
-                comp_wx = self.graph_cache.complement_sum_weighted(x, w=tB)
-                out = out + (q * tB).unsqueeze(1) * comp_wx
+                if self.ep_expectation_mode == "empirical_ema":
+                    # Exact sparse empirical expectation over observed clean non-edges.
+                    out = out + self._apply_emp_nonedge_expectation(x)
+                else:
+                    # Analytic decoupled Case-B approximation.
+                    deg_clean = self.graph_cache.deg_clean.to(x.device)
+                    comp_size = self.graph_cache.comp_size.to(x.device)
+                    tB = _delta_E_inv_sqrt_caseB(deg_clean, comp_size, p=p, q=q).to(x.device, dtype=x.dtype)
+                    comp_wx = self.graph_cache.complement_sum_weighted(x, w=tB)
+                    out = out + (q * tB).unsqueeze(1) * comp_wx
 
             if self.bias is not None:
                 out = out + self.bias
@@ -425,10 +722,13 @@ class RADEGCNConv(nn.Module):
         alpha_self = inv_sqrt_hat * inv_sqrt_hat
 
         # Case A: expected realized coefficient on retained clean edges.
-        tA = _delta_E_inv_sqrt_caseA(deg_clean, comp_size, p=p, q=q)
-        E_Gamma_k = (1.0 - p) * tA[row_k] * tA[col_k]
+        if self.ep_expectation_mode == "empirical_ema":
+            E_Gamma_k = self._get_clean_edge_emp(row_k, col_k, dtype=x.dtype, device=x.device)
+        else:
+            tA = _delta_E_inv_sqrt_caseA(deg_clean, comp_size, p=p, q=q).to(x.device, dtype=x.dtype)
+            E_Gamma_k = (1.0 - p) * tA[row_k] * tA[col_k]
 
-        corr_k = alpha_k / E_Gamma_k.clamp(min=1e-12)
+        corr_k = alpha_k / E_Gamma_k.clamp(min=self.ep_emp_eps)
         out_k = _scatter_add_rows((Gamma_k * corr_k).unsqueeze(1) * x[row_k], col_k, N)
 
         # Sampled non-edge contributions.
@@ -440,21 +740,28 @@ class RADEGCNConv(nn.Module):
                 # keep non-edge contributions uncentered so their effect is carried to inference.
                 out_a = sum_a
             else:
-                # RADE-OF training:
-                # weighted centering under the Case-B decoupled approximation.
-                tB = _delta_E_inv_sqrt_caseB(deg_clean, comp_size, p=p, q=q).to(x.device, dtype=x.dtype)
-                mu = self.graph_cache.complement_mean_weighted(x, w=tB)
+                if self.ep_expectation_mode == "empirical_ema":
+                    # Subtract the exact sparse empirical expectation of non-edge messages.
+                    out_a = sum_a - self._apply_emp_nonedge_expectation(x)
+                else:
+                    # RADE-OF training:
+                    # weighted centering under the Case-B decoupled approximation.
+                    tB = _delta_E_inv_sqrt_caseB(deg_clean, comp_size, p=p, q=q).to(x.device, dtype=x.dtype)
+                    mu = self.graph_cache.complement_mean_weighted(x, w=tB)
 
-                # sum_g[i] = sum over sampled added non-edges into i of realized Gamma_a
-                sum_g = _scatter_add_scalar(Gamma_a, col_a, N).unsqueeze(1)
-                out_a = sum_a - mu * sum_g
+                    # sum_g[i] = sum over sampled added non-edges into i of realized Gamma_a
+                    sum_g = _scatter_add_scalar(Gamma_a, col_a, N).unsqueeze(1)
+                    out_a = sum_a - mu * sum_g
         else:
             out_a = torch.zeros_like(out_k)
 
         # Self-loop correction.
         if self.correct_self_loop:
-            E_Gamma_self = _delta_E_inv_self(deg_clean, comp_size, p=p, q=q).to(x.device, dtype=x.dtype)
-            corr_self = alpha_self / E_Gamma_self.clamp(min=1e-12)
+            if self.ep_expectation_mode == "empirical_ema":
+                E_Gamma_self = (self.emp_self_scale * self.emp_self_raw).to(x.device, dtype=x.dtype)
+            else:
+                E_Gamma_self = _delta_E_inv_self(deg_clean, comp_size, p=p, q=q).to(x.device, dtype=x.dtype)
+            corr_self = alpha_self / E_Gamma_self.clamp(min=self.ep_emp_eps)
             out_self = (Gamma_self * corr_self).unsqueeze(1) * x
         else:
             out_self = Gamma_self.unsqueeze(1) * x
@@ -475,6 +782,8 @@ class RADEGINConv(nn.Module):
       - ep_correction=True       -> use expectation-preserving aggregation correction
       - ep_correction=False      -> same sampled keep/add operator path, but without
                                     expectation-preserving correction
+      - ep_expectation_mode='analytic'      -> original paper expectation
+      - ep_expectation_mode='empirical_ema' -> lagged online EMA ablation
     """
 
     def __init__(
@@ -484,12 +793,20 @@ class RADEGINConv(nn.Module):
         train_eps: bool = False,
         rade_variant: str = "rade-of",
         ep_correction: bool = True,
+        ep_expectation_mode: str = "analytic",
+        ep_emp_average_mode: str = "ema",
+        ep_emp_beta: float = 0.1,
+        ep_emp_eps: float = 1e-12,
     ):
         super().__init__()
         self.mlp = mlp
         self.initial_eps = float(eps)
         self.rade_variant = _validate_rade_variant(rade_variant)
         self.ep_correction = bool(ep_correction)
+        self.ep_expectation_mode = _validate_ep_expectation_mode(ep_expectation_mode)
+        self.ep_emp_average_mode = _validate_ep_emp_average_mode(ep_emp_average_mode)
+        self.ep_emp_beta = float(ep_emp_beta)
+        self.ep_emp_eps = float(ep_emp_eps)
 
         if train_eps:
             self.eps = nn.Parameter(torch.tensor([self.initial_eps], dtype=torch.float32))
@@ -498,12 +815,79 @@ class RADEGINConv(nn.Module):
 
         self.graph_cache: Optional[GraphCache] = None
 
+        self.register_buffer("emp_keep_prob", torch.tensor(1.0, dtype=torch.float32))
+        self.register_buffer("emp_add_prob", torch.tensor(0.0, dtype=torch.float32))
+        self.register_buffer("emp_num_updates", torch.tensor(0, dtype=torch.long))
+
     def set_graph(self, graph_cache: GraphCache) -> None:
         self.graph_cache = graph_cache
 
     def reset_parameters(self) -> None:
         reset(self.mlp)
         self.eps.data.fill_(self.initial_eps)
+
+    def reset_ep_stats(self, p: float, q: float) -> None:
+        self.emp_keep_prob.fill_(max(self.ep_emp_eps, 1.0 - float(p)))
+        self.emp_add_prob.fill_(max(0.0, float(q)))
+        self.emp_num_updates.zero_()
+
+    def _emp_update_weights(self) -> tuple[float, float]:
+        if self.ep_emp_average_mode == "ema":
+            beta = float(self.ep_emp_beta)
+            if beta <= 0.0:
+                return 1.0, 0.0
+            if beta >= 1.0:
+                return 0.0, 1.0
+            return 1.0 - beta, beta
+
+        t_prev = int(self.emp_num_updates.item())
+        t_new = t_prev + 1
+        return float(t_prev) / float(t_new), 1.0 / float(t_new)
+
+    def update_ep_stats(
+        self,
+        *,
+        edge_index_keep: Optional[torch.Tensor],
+        edge_index_add: Optional[torch.Tensor],
+        p: float,
+        q: float,
+    ) -> None:
+        if self.ep_expectation_mode != "empirical_ema":
+            return
+        assert self.graph_cache is not None, "Call model.set_graph(...) before update_ep_stats(...)."
+
+        device = self.emp_keep_prob.device
+        old_mult, new_mult = self._emp_update_weights()
+        if new_mult <= 0.0:
+            return
+
+        num_clean_dir = int(self.graph_cache.edge_index_clean_dir.size(1))
+        num_nonedge_dir = int(round(float(self.graph_cache.comp_size.sum().item())))
+
+        keep_obs = 0.0
+        if edge_index_keep is not None and edge_index_keep.numel() > 0 and num_clean_dir > 0:
+            keep_obs = float(edge_index_keep.size(1)) / float(num_clean_dir)
+
+        add_obs = 0.0
+        if edge_index_add is not None and edge_index_add.numel() > 0 and num_nonedge_dir > 0:
+            add_obs = float(edge_index_add.size(1)) / float(num_nonedge_dir)
+
+        keep_obs_t = torch.tensor(max(self.ep_emp_eps, keep_obs), dtype=torch.float32, device=device)
+        add_obs_t = torch.tensor(max(0.0, add_obs), dtype=torch.float32, device=device)
+
+        self.emp_keep_prob.mul_(old_mult).add_(new_mult * keep_obs_t)
+        self.emp_add_prob.mul_(old_mult).add_(new_mult * add_obs_t)
+        self.emp_num_updates.add_(1)
+
+    def _get_keep_prob(self, p: float) -> float:
+        if self.ep_expectation_mode == "empirical_ema":
+            return float(self.emp_keep_prob.clamp(min=self.ep_emp_eps).item())
+        return max(self.ep_emp_eps, 1.0 - float(p))
+
+    def _get_add_prob(self, q: float) -> float:
+        if self.ep_expectation_mode == "empirical_ema":
+            return max(0.0, float(self.emp_add_prob.item()))
+        return max(0.0, float(q))
 
     def forward(
         self,
@@ -532,8 +916,9 @@ class RADEGINConv(nn.Module):
             # RADE-OFS inference correction:
             #   neigh_sum += q * sum_{j in C(i)} x_j
             if use_ofs and (not self.training) and (q > 0.0):
+                coeff_add = self._get_add_prob(q)
                 comp_sum = self.graph_cache.complement_sum_unweighted(x)
-                neigh_sum = neigh_sum + q * comp_sum
+                neigh_sum = neigh_sum + coeff_add * comp_sum
 
             out = (1.0 + self.eps.to(x.device)) * x + neigh_sum
             return self.mlp(out)
@@ -572,8 +957,9 @@ class RADEGINConv(nn.Module):
         #   - rade_variant='rade-ofs'
         # ------------------------------------------------------------------
 
-        # Retained clean edges: expectation-preserving rescaling by 1 / (1-p).
-        alpha = 1.0 / max(1e-12, (1.0 - float(p)))
+        # Retained clean edges: expectation-preserving rescaling by 1 / E[A'_ij].
+        keep_prob = self._get_keep_prob(p)
+        alpha = 1.0 / max(self.ep_emp_eps, keep_prob)
         keep_sum = _scatter_add_rows(x[row_k], col_k, N) * alpha
 
         if row_a.numel() > 0:

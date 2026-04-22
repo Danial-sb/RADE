@@ -26,6 +26,10 @@ class MPNNs(torch.nn.Module):
         jk=False,
         gnn="gcn",
         ep_correction: bool = False,
+        ep_expectation_mode: str = "analytic",
+        ep_emp_average_mode: str = "ema",
+        ep_emp_beta: float = 0.1,
+        ep_emp_eps: float = 1e-12,
         rade_variant: str = "rade-of",
         linear: bool = False,
         aug_tech: str = "rade",
@@ -37,6 +41,11 @@ class MPNNs(torch.nn.Module):
         if rade_variant not in ("rade-of", "rade-ofs"):
             raise ValueError(
                 f"rade_variant must be one of {{'rade-of', 'rade-ofs'}}. Got {rade_variant}"
+            )
+        if ep_expectation_mode not in ("analytic", "empirical_ema"):
+            raise ValueError(
+                f"ep_expectation_mode must be one of {{'analytic', 'empirical_ema'}}. "
+                f"Got {ep_expectation_mode}"
             )
 
         self.linear = bool(linear)
@@ -59,6 +68,10 @@ class MPNNs(torch.nn.Module):
         self.gnn = gnn
 
         self.ep_correction = bool(ep_correction)
+        self.ep_expectation_mode = str(ep_expectation_mode).lower().strip()
+        self.ep_emp_average_mode = str(ep_emp_average_mode).lower().strip()
+        self.ep_emp_beta = float(ep_emp_beta)
+        self.ep_emp_eps = float(ep_emp_eps)
         self.rade_variant = str(rade_variant)
 
         self.aug_tech = str(aug_tech).lower().strip()
@@ -101,6 +114,10 @@ class MPNNs(torch.nn.Module):
                         mlp,
                         rade_variant=self.rade_variant,
                         ep_correction=self.ep_correction,
+                        ep_expectation_mode=self.ep_expectation_mode,
+                        ep_emp_average_mode=self.ep_emp_average_mode,
+                        ep_emp_beta=self.ep_emp_beta,
+                        ep_emp_eps=self.ep_emp_eps,
                     )
                 elif self.aug_tech == "dropmessage":
                     conv = DropMessageGINConv(mlp)
@@ -116,6 +133,10 @@ class MPNNs(torch.nn.Module):
                         correct_self_loop=True,
                         rade_variant=self.rade_variant,
                         ep_correction=self.ep_correction,
+                        ep_expectation_mode=self.ep_expectation_mode,
+                        ep_emp_average_mode=self.ep_emp_average_mode,
+                        ep_emp_beta=self.ep_emp_beta,
+                        ep_emp_eps=self.ep_emp_eps,
                     )
                 elif self.aug_tech == "dropmessage":
                     conv = DropMessageGCNConv(in_dim, out_dim, bias=True)
@@ -155,6 +176,45 @@ class MPNNs(torch.nn.Module):
         for conv in self.local_convs:
             if hasattr(conv, "set_graph"):
                 conv.set_graph(cache)
+
+    def reset_ep_stats(self, p: float, q: float) -> None:
+        for conv in self.local_convs:
+            if hasattr(conv, "reset_ep_stats"):
+                conv.reset_ep_stats(p=float(p), q=float(q))
+
+    def update_ep_stats(
+        self,
+        *,
+        edge_index_keep: Optional[EdgeIndexObj],
+        edge_index_add: Optional[EdgeIndexObj],
+        p: float,
+        q: float,
+    ) -> None:
+        def _is_list(t):
+            return isinstance(t, (list, tuple))
+
+        L = len(self.local_convs)
+
+        def _pick_layer_edges(obj: Optional[EdgeIndexObj], i: int) -> Optional[torch.Tensor]:
+            if obj is None:
+                return None
+            if _is_list(obj):
+                if len(obj) != L:
+                    raise ValueError(f"Expected list length={L}, got {len(obj)}")
+                t = obj[i]
+                return None if (t is None or t.numel() == 0) else t
+            return None if obj.numel() == 0 else obj
+
+        for i, conv in enumerate(self.local_convs):
+            if hasattr(conv, "update_ep_stats"):
+                layer_keep = _pick_layer_edges(edge_index_keep, i)
+                layer_add = _pick_layer_edges(edge_index_add, i)
+                conv.update_ep_stats(
+                    edge_index_keep=layer_keep,
+                    edge_index_add=layer_add,
+                    p=float(p),
+                    q=float(q),
+                )
 
     @staticmethod
     def _apply_dropnode(x: torch.Tensor, dropnode_rate: float, training: bool) -> torch.Tensor:

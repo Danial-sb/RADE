@@ -1,7 +1,164 @@
+import argparse
+
 from models import MPNNs
 
 
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+
+    value_norm = str(value).strip().lower()
+    if value_norm in {"1", "true", "t", "yes", "y"}:
+        return True
+    if value_norm in {"0", "false", "f", "no", "n"}:
+        return False
+
+    raise argparse.ArgumentTypeError(f"Expected a boolean value, got {value!r}.")
+
+
+FULL_BATCH_AUTO_DEFAULTS = {
+    ("cora", "gcn"): {
+        "hidden_channels": 512,
+        "epochs": 500,
+        "p": 0.5,
+        "q": 0.000721,
+        "pq_grid_size": 5,
+        "q_max": 0.001442,
+    },
+    ("cora", "gin"): {
+        "hidden_channels": 256,
+        "epochs": 500,
+        "p": 0.5,
+        "q": 0.000721,
+        "pq_grid_size": 11,
+        "q_max": 0.001442,
+    },
+    ("citeseer", "gcn"): {
+        "hidden_channels": 512,
+        "epochs": 500,
+        "p": 0.2,
+        "q": 0.000164,
+        "pq_grid_size": 5,
+        "q_max": 0.000328,
+    },
+    ("citeseer", "gin"): {
+        "hidden_channels": 512,
+        "epochs": 500,
+        "p": 0.2,
+        "q": 0.000164,
+        "pq_grid_size": 11,
+        "q_max": 0.000328,
+    },
+    ("pubmed", "gcn"): {
+        "hidden_channels": 256,
+        "epochs": 500,
+        "p": 0.2,
+        "q": 0.0000456,
+        "pq_grid_size": 5,
+        "q_max": 0.0000912,
+    },
+    ("pubmed", "gin"): {
+        "hidden_channels": 512,
+        "epochs": 500,
+        "p": 0.2,
+        "q": 0.0000456,
+        "pq_grid_size": 11,
+        "q_max": 0.0000912,
+    },
+    ("cs", "gcn"): {
+        "hidden_channels": 64,
+        "epochs": 1500,
+        "p": 0.2,
+        "q": 0.0000957,
+        "pq_grid_size": 5,
+        "q_max": 0.0001914,
+    },
+    ("cs", "gin"): {
+        "hidden_channels": 256,
+        "epochs": 1500,
+        "p": 0.2,
+        "q": 0.0000957,
+        "pq_grid_size": 11,
+        "q_max": 0.0001914,
+    },
+    ("computer", "gcn"): {
+        "hidden_channels": 128,
+        "epochs": 1000,
+        "p": 0.5,
+        "q": 0.001303,
+        "pq_grid_size": 5,
+        "q_max": 0.002606,
+        "patience": 200,
+    },
+    ("computer", "gin"): {
+        "hidden_channels": 128,
+        "epochs": 1000,
+        "p": 0.5,
+        "q": 0.001303,
+        "pq_grid_size": 11,
+        "q_max": 0.002606,
+        "patience": 200,
+    },
+    ("physics", "gcn"): {
+        "hidden_channels": 64,
+        "epochs": 1500,
+        "p": 0.2,
+        "q": 0.0000834,
+        "pq_grid_size": 5,
+        "q_max": 0.0001668,
+    },
+    ("physics", "gin"): {
+        "hidden_channels": 64,
+        "epochs": 1500,
+        "p": 0.2,
+        "q": 0.0000834,
+        "pq_grid_size": 11,
+        "q_max": 0.0001668,
+    },
+}
+
+
+def get_explicit_arg_names(argv):
+    explicit = set()
+
+    for token in argv:
+        if token == "--":
+            break
+        if not token.startswith("--"):
+            continue
+
+        option = token[2:].split("=", 1)[0].strip()
+        if option:
+            explicit.add(option.replace("-", "_"))
+
+    return explicit
+
+
+def apply_full_batch_auto_defaults(args, explicit_arg_names=None):
+    explicit_arg_names = explicit_arg_names or set()
+
+    dataset = str(getattr(args, "dataset", "")).lower().strip()
+    gnn = str(getattr(args, "gnn", "")).lower().strip()
+    preset_key = (dataset, gnn)
+    preset = FULL_BATCH_AUTO_DEFAULTS.get(preset_key)
+
+    if preset is None:
+        return None, {}, {}
+
+    applied = {}
+    skipped = {}
+    for field_name, field_value in preset.items():
+        if field_name in explicit_arg_names:
+            skipped[field_name] = getattr(args, field_name)
+            continue
+        setattr(args, field_name, field_value)
+        applied[field_name] = field_value
+
+    return preset_key, applied, skipped
+
+
 def parse_method(args, num_nodes, num_classes, in_dim, device):
+    ep_emp_average_mode = "ema" if bool(getattr(args, "pq_gradnorm", False)) else "running_mean"
     model = MPNNs(
         in_channels=in_dim,
         hidden_channels=args.hidden_channels,
@@ -15,6 +172,10 @@ def parse_method(args, num_nodes, num_classes, in_dim, device):
         jk=args.jk,
         gnn=args.gnn,  # 'gcn' or 'gin'
         ep_correction=args.ep_correction,
+        ep_expectation_mode=args.ep_expectation_mode,
+        ep_emp_average_mode=ep_emp_average_mode,
+        ep_emp_beta=args.ep_emp_beta,
+        ep_emp_eps=args.ep_emp_eps,
         rade_variant=args.rade_variant,
         linear=bool(getattr(args, "linear", False)),
         aug_tech=str(getattr(args, "aug_tech", "rade")),
@@ -27,7 +188,7 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--dataset",
         type=str,
-        default="pubmed",
+        default="cora",
         choices=["cora", "citeseer", "pubmed", "cs", "computer", "physics", "flickr", "ogbn-arxiv"],
         help="Dataset name (must match nc_datasets_simple.py)",
     )
@@ -39,13 +200,15 @@ def parser_add_main_args(parser):
     )
     parser.add_argument(
         "--remove_citeseer_isolated_nodes",
-        type=bool,
+        type=str2bool,
+        nargs="?",
+        const=True,
         default=False,
         help="Remove isolated nodes when loading CiteSeer. Ignored for other datasets.",
     )
 
     # system
-    parser.add_argument("--device", type=int, default=0, help="GPU id (default: 0)")
+    parser.add_argument("--device", type=int, default=3, help="GPU id (default: 0)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cpu", action="store_true")
 
@@ -85,15 +248,17 @@ def parser_add_main_args(parser):
     )
     parser.add_argument("--hidden_channels", type=int, default=256)
     parser.add_argument("--local_layers", type=int, default=2)
-    parser.add_argument("--pre_linear", type=bool, default=True)
+    parser.add_argument("--pre_linear", type=str2bool, nargs="?", const=True, default=True)
     parser.add_argument("--res", action="store_true")
     parser.add_argument("--ln", action="store_true")
     parser.add_argument("--bn", action="store_true")
     parser.add_argument("--jk", action="store_true")
     parser.add_argument(
         "--linear",
-        type=bool,
-        default=True,
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
         help="Use strictly linear model: disables ReLU/Dropout/BN/LN and makes GIN MLP linear.",
     )
 
@@ -161,9 +326,32 @@ def parser_add_main_args(parser):
 
     parser.add_argument(
         "--ep_correction",
-        type=bool,
+        type=str2bool,
+        nargs="?",
+        const=True,
         default=True,
         help="Use expectation-preserving aggregation correction for RADE.",
+    )
+    parser.add_argument(
+        "--ep_expectation_mode",
+        type=str,
+        default="analytic",
+        choices=["analytic", "empirical_ema"],
+        help="How to obtain the expectation term used in EP correction. "
+             "'analytic' uses the original closed-form / approximation. "
+             "'empirical_ema' uses a lagged online EMA estimate as an ablation.",
+    )
+    parser.add_argument(
+        "--ep_emp_beta",
+        type=float,
+        default=0.1,
+        help="EMA update weight for the empirical expectation ablation.",
+    )
+    parser.add_argument(
+        "--ep_emp_eps",
+        type=float,
+        default=1e-12,
+        help="Small epsilon used to clamp empirical expectation denominators.",
     )
 
     parser.add_argument(
@@ -190,32 +378,107 @@ def parser_add_main_args(parser):
     # ---- GradNorm p/q tuning (epoch-wise) ----
     parser.add_argument(
         "--pq_gradnorm",
-        type=bool,
-        default=False,
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=True,
         help="Enable epoch-wise GradNorm matching to adapt (p,q).",
     )
 
-    parser.add_argument("--pq_search_method", type=str, default="grid",
-                        choices=["grid", "powell"])
+    parser.add_argument(
+        "--pq_search_method",
+        type=str,
+        default="adam",
+        choices=["grid", "powell", "newton", "adam"],
+        help="How to update (p,q). "
+             "'grid'/'powell'/'newton' use the existing epoch-wise search rule. "
+             "'adam' uses a stateful online controller with p=p_max*sigmoid(u), q=q_max*sigmoid(v) "
+             "and one Adam step per PQ update.",
+    )
+    parser.add_argument(
+        "--pq_compare_search_methods",
+        action="store_true",
+        help="Evaluate grid, Powell, and Newton on the same PQ-GradNorm tuning snapshot and log side-by-side results. "
+             "The configured --pq_search_method still controls which result updates (p,q).",
+    )
     parser.add_argument("--pq_powell_maxiter", type=int, default=25)
     parser.add_argument("--pq_powell_xtol", type=float, default=1e-3)
     parser.add_argument("--pq_powell_ftol", type=float, default=1e-3)
+    parser.add_argument("--pq_newton_maxiter", type=int, default=10)
+    parser.add_argument("--pq_newton_tol", type=float, default=1e-4)
+    parser.add_argument("--pq_newton_damping", type=float, default=1e-4)
+
+    parser.add_argument(
+        "--pq_adam_lr",
+        type=float,
+        default=0.2,
+        help="Learning rate for the Adam-based p/q controller when --pq_search_method=adam.",
+    )
+    parser.add_argument(
+        "--pq_adam_beta1",
+        type=float,
+        default=0.9,
+        help="Adam beta1 for the p/q controller.",
+    )
+    parser.add_argument(
+        "--pq_adam_beta2",
+        type=float,
+        default=0.999,
+        help="Adam beta2 for the p/q controller.",
+    )
+    parser.add_argument(
+        "--pq_adam_eps",
+        type=float,
+        default=1e-8,
+        help="Adam epsilon for the p/q controller.",
+    )
+
     parser.add_argument("--pq_grid_size", type=int, default=5,
                         help="Grid size for (p,q) search. Use 11 for GIN; use 3-5 for GCN (costlier).")
+    parser.add_argument(
+        "--pq_surface_plot",
+        action="store_true",
+        help="Save objective heatmaps/contours over a frozen (p,q) snapshot with solver best points overlaid.",
+    )
+    parser.add_argument(
+        "--pq_surface_animation",
+        action="store_true",
+        help="When --pq_surface_plot is enabled, also build a GIF over epochs if Pillow is available.",
+    )
+    parser.add_argument(
+        "--pq_surface_grid_size",
+        type=int,
+        default=31,
+        help="Grid resolution used for the optional objective surface export.",
+    )
+    parser.add_argument(
+        "--pq_surface_every",
+        type=int,
+        default=1,
+        help="Save an objective surface every k PQ update steps when --pq_surface_plot is enabled.",
+    )
+    parser.add_argument(
+        "--pq_surface_run",
+        type=int,
+        default=1,
+        help="1-based run index used for the optional objective surface export.",
+    )
 
-    parser.add_argument("--p_max", type=float, default=0.8, help="Upper bound for p during GradNorm tuning.")
-    parser.add_argument("--q_max", type=float, default=0.0000912, help="Upper bound for q during GradNorm tuning.")
+    parser.add_argument("--p_max", type=float, default=0.99, help="Upper bound for p during GradNorm tuning.")
+    parser.add_argument("--q_max", type=float, default=0.99, help="Upper bound for q during GradNorm tuning.")
 
     parser.add_argument(
         "--pq_subset_nodes",
         type=int,
-        default=1024,
-        help="Number of train nodes used to estimate GradNorm norms.",
+        default=0,
+        help="Number of train nodes used to estimate GradNorm norms. "
+             "Use 0 to use the full train_idx in the full-batch setting.",
     )
-    parser.add_argument("--pq_ema", type=float, default=0.9, help="EMA smoothing for p,q updates (stability).")
+    parser.add_argument("--pq_ema", type=float, default=0.9,
+                        help="EMA smoothing for p,q updates in search-based PQ tuning (grid/powell/newton only).")
     parser.add_argument("--pq_update_every", type=int, default=1, help="Update (p,q) every k epochs.")
     parser.add_argument("--pq_warmup_epochs", type=int, default=0, help="Number of initial epochs to skip pq updates.")
-    parser.add_argument("--pq_eps", type=float, default=1e-12, help="Small epsilon for log/denominator stabilizers.")
+    parser.add_argument("--pq_eps", type=float, default=1e-3, help="Small epsilon for log/denominator stabilizers.")
     parser.add_argument("--pq_seed", type=int, default=0, help="Seed for selecting the subset of nodes for pq selection.")
 
     parser.add_argument(

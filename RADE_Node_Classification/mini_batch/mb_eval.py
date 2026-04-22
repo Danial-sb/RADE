@@ -43,7 +43,12 @@ def _infer_on_loader(
     for batch in loader:
         batch = batch.to(device)
 
-        out = model(batch.x, batch.edge_index, **fw)  # logits for all nodes in the sampled subgraph
+        out = model(
+            batch.x,
+            batch.edge_index,
+            node_ids=getattr(batch, "n_id", None),
+            **fw,
+        )
         seed_n = int(batch.batch_size)
 
         # Seed node ids in global indexing
@@ -173,7 +178,7 @@ def evaluate_minibatch(
     Notes:
       - out_return is returned as None here (to avoid allocating full-graph logits),
         because evaluation is performed via loaders.
-      - This is the evaluation you should call for computer/cs/physics/flickr/ogbn-arxiv
+      - This is the evaluation for flickr/ogbn-arxiv
         to avoid CUDA OOM.
     """
     tr, _ = _score_split_from_loader(
