@@ -2,6 +2,7 @@ import os
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 import argparse
+import csv
 import random
 import sys
 import time
@@ -33,12 +34,13 @@ from .mb_parse import (
 from .mb_pq_gradnorm import PQGradNormTunerMB, PQTunerMBConfig, SEARCH_METHODS
 
 
-def fix_seed(seed: int = 42) -> None:
+def fix_seed(seed: int = 42, device: Optional[torch.device] = None) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if device is not None and device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.set_device(device)
+        torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     torch.use_deterministic_algorithms(True)
@@ -74,6 +76,104 @@ def _batch_seed(base_seed: int, batch_id: int, layer_id: int = 0) -> int:
 def _sync_for_timing(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+def _format_tag_float(value: float) -> str:
+    return str(f"{float(value):g}").replace(".", "p").replace("-", "m")
+
+
+def _safe_std(values: torch.Tensor) -> float:
+    if values.numel() <= 1:
+        return 0.0
+    return float(values.std().item())
+
+
+def _write_single_dataset_csv(record: Dict[str, object], out_path: str = "single_dataset/results_mb.csv") -> str:
+    abs_path = os.path.abspath(out_path)
+    parent = os.path.dirname(abs_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    fieldnames = [
+        "timestamp",
+        "dataset",
+        "final_test_acc_mean_pct",
+        "final_test_acc_std_pct",
+        "runtime_run_mean_sec",
+        "runtime_run_std_sec",
+        "runtime_pooled_mean_sec",
+        "runtime_num_runs",
+        "runtime_num_epochs",
+        "model",
+        "gnn_raw",
+        "gnn",
+        "hidden_channels",
+        "local_layers",
+        "lr",
+        "weight_decay",
+        "dropout",
+        "patience",
+        "runs",
+        "epochs",
+        "seed",
+        "device",
+        "batch_size",
+        "mb_num_workers",
+        "mb_pin_memory",
+        "full_eval_cpu",
+        "mb_rade_mode",
+        "graph_density",
+        "pq_expected_add_ratio_scale",
+        "aug_tech",
+        "aug_mode",
+        "p",
+        "q",
+        "ep_correction",
+        "ep_expectation_mode",
+        "ep_emp_beta",
+        "ep_emp_eps",
+        "mask_sharing",
+        "rade_variant",
+        "pq_gradnorm",
+        "pq_search_method",
+        "pq_compare_search_methods",
+        "pq_optimize_rho",
+        "pq_densification_penalty_lambda",
+        "pq_densification_penalty_type",
+        "pq_densification_penalty_rho0",
+        "pq_adam_lr",
+        "pq_epoch_objective_mode",
+        "pq_batch_weighting",
+        "pq_grid_size",
+        "p_max",
+        "q_max",
+        "pq_subset_nodes",
+        "pq_ema",
+        "pq_update_every",
+        "pq_warmup_epochs",
+        "pq_eps",
+        "pq_seed",
+        "pq_data_anchor",
+        "pq_store_batches",
+        "pq_max_batches_for_tuning",
+        "train_prop",
+        "valid_prop",
+        "rand_split",
+        "rand_split_class",
+        "label_num_per_class",
+        "valid_num",
+        "test_num",
+        "remove_citeseer_isolated_nodes",
+    ]
+
+    write_header = not os.path.exists(abs_path) or os.path.getsize(abs_path) == 0
+    with open(abs_path, "a", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow({field: record.get(field, "") for field in fieldnames})
+
+    return abs_path
 
 
 parser = argparse.ArgumentParser(description="Mini-batch Training Pipeline for Node Classification")
@@ -173,7 +273,10 @@ print(
     f"pq_gradnorm={bool(getattr(args, 'pq_gradnorm', False))} "
     f"(search={getattr(args, 'pq_search_method', '-')}, epoch_mode={getattr(args, 'pq_epoch_objective_mode', '-')}, "
     f"batch_weighting={getattr(args, 'pq_batch_weighting', '-')}, "
-    f"compare={bool(getattr(args, 'pq_compare_search_methods', False))}) | "
+    f"compare={bool(getattr(args, 'pq_compare_search_methods', False))}, "
+    f"rho_opt={bool(getattr(args, 'pq_optimize_rho', False))}, "
+    f"dens_penalty={getattr(args, 'pq_densification_penalty_type', '-')}:"
+    f"{float(getattr(args, 'pq_densification_penalty_lambda', 0.0)):g}) | "
     f"p={float(getattr(args, 'p', 0.0)):.4f} q={float(getattr(args, 'q', 0.0)):.6f} | "
     f"mask_sharing={getattr(args, 'mask_sharing', '-')} | mb_mode={mb_rade_mode}"
 )
@@ -181,10 +284,10 @@ print(
 if wandb_run is not None:
     wandb.config.update(vars(args), allow_val_change=True)
 
-fix_seed(int(args.seed))
 device = torch.device("cpu") if args.cpu else (
     torch.device(f"cuda:{int(args.device)}") if torch.cuda.is_available() else torch.device("cpu")
 )
+fix_seed(int(args.seed), device=device)
 
 data, base_split_idx = load_nc_dataset(
     root=args.data_dir,
@@ -202,11 +305,22 @@ n = int(data.num_nodes)
 d = int(data.x.size(1))
 c = int(data.y.max().item()) + 1
 e_undir = int(data.edge_index.size(1)) // 2 if data.edge_index is not None else 0
+total_undir_pairs = max(float(n) * float(max(n - 1, 0)) / 2.0, 1.0)
+graph_density = float(e_undir) / total_undir_pairs
+rho_scale = 0.0 if graph_density <= 0.0 else 1.0 / graph_density
 
 print(f"dataset {args.dataset} | num nodes {n} | num edges {e_undir} | num feats {d} | num classes {c}")
+print(f"[PQ] graph_density={graph_density:.6e} | rho_scale=1/d={rho_scale:.6e}")
 if wandb_run is not None:
     wandb.config.update(
-        {"num_nodes": n, "num_edges": e_undir, "num_feats": d, "num_classes": c},
+        {
+            "num_nodes": n,
+            "num_edges": e_undir,
+            "num_feats": d,
+            "num_classes": c,
+            "graph_density": graph_density,
+            "pq_expected_add_ratio_scale": rho_scale,
+        },
         allow_val_change=True,
     )
 
@@ -254,6 +368,8 @@ nl_cfg = NeighborLoaderConfig(
 
 p_histories: List[List[float]] = []
 q_histories: List[List[float]] = []
+obj_histories: List[List[float]] = []
+rho_histories: List[List[float]] = []
 method_obj_histories = {method: [] for method in SEARCH_METHODS}
 surface_snapshots_by_run: Dict[int, List[Dict[str, Any]]] = {}
 
@@ -287,6 +403,8 @@ for run in range(int(args.runs)):
             raise ValueError("--pq_gradnorm requires --mb_rade_mode=local.")
         if pq_search_method == "adam" and bool(getattr(args, "pq_compare_search_methods", False)):
             raise ValueError("--pq_compare_search_methods is not supported when --pq_search_method=adam.")
+        if bool(getattr(args, "pq_optimize_rho", False)) and pq_search_method != "adam":
+            raise ValueError("--pq_optimize_rho is supported only when --pq_search_method=adam in mini-batch.")
 
         pq_tuner = PQGradNormTunerMB(
             gnn=str(getattr(args, "gnn", "gin")),
@@ -294,6 +412,11 @@ for run in range(int(args.runs)):
             cfg=PQTunerMBConfig(
                 p_max=float(getattr(args, "p_max", 0.6)),
                 q_max=float(getattr(args, "q_max", 1e-3)),
+                expected_add_ratio_scale=float(rho_scale),
+                densification_penalty_lambda=float(getattr(args, "pq_densification_penalty_lambda", 0.0)),
+                densification_penalty_type=str(getattr(args, "pq_densification_penalty_type", "quadratic")),
+                densification_penalty_rho0=float(getattr(args, "pq_densification_penalty_rho0", 1.0)),
+                optimize_rho=bool(getattr(args, "pq_optimize_rho", False)),
                 grid_size=int(getattr(args, "pq_grid_size", 11)),
                 ema=float(getattr(args, "pq_ema", 0.9)),
                 eps=float(getattr(args, "pq_eps", 1e-12)),
@@ -326,6 +449,8 @@ for run in range(int(args.runs)):
 
     p_trace: List[float] = []
     q_trace: List[float] = []
+    obj_trace: List[float] = []
+    rho_trace: List[float] = []
     method_obj_trace = {method: [] for method in SEARCH_METHODS}
     surface_snapshots: List[Dict[str, Any]] = []
 
@@ -341,6 +466,8 @@ for run in range(int(args.runs)):
         q_epoch_start = float(q_eff)
         p_trace.append(p_epoch_start)
         q_trace.append(q_epoch_start)
+        obj_trace.append(float("nan"))
+        rho_trace.append(float(q_epoch_start) * float(rho_scale))
         for method in SEARCH_METHODS:
             method_obj_trace[method].append(float("nan"))
 
@@ -606,11 +733,14 @@ for run in range(int(args.runs)):
 
             p_trace[-1] = float(p_eff)
             q_trace[-1] = float(q_eff)
+            rho_trace[-1] = float(q_eff) * float(rho_scale)
+            obj_trace[-1] = _mean_info("obj_new")
 
             print(
                 f"[PQ-GradNorm-MB-Adam] run={run + 1:02d} epoch={epoch + 1:03d} "
                 f"updates={len(adam_batch_infos):03d} "
                 f"p(last)={float(p_eff):.4f} q(last)={float(q_eff):.6f} "
+                f"rho(last)={float(q_eff) * float(rho_scale):.3e} "
                 f"G_data_mean={_mean_info('G_data'):.3e} "
                 f"G_reg_mean={_mean_info('G_reg_best'):.3e} "
                 f"obj_mean={_mean_info('obj'):.2e}"
@@ -628,10 +758,15 @@ for run in range(int(args.runs)):
                         "pq/q_epoch_best": _mean_info("q_best"),
                         "pq/p_new": float(p_eff),
                         "pq/q_new": float(q_eff),
+                        "pq/rho_new": float(q_eff) * float(rho_scale),
+                        "pq/obj_selected": _mean_info("obj_new"),
                         "pq/used_batches": float(len(adam_batch_infos)),
                         "pq/skipped_batches": 0.0,
                         "pq/search_method": "adam",
                         "pq/adam_lr": float(getattr(args, "pq_adam_lr", 0.2)),
+                        "pq/optimize_rho": float(bool(getattr(args, "pq_optimize_rho", False))),
+                        "pq/densification_penalty_best_mean": _mean_info("densification_penalty_best"),
+                        "pq/densification_penalty_new_mean": _mean_info("densification_penalty_new"),
                     },
                     step=(epoch + run * int(args.epochs)),
                 )
@@ -655,6 +790,10 @@ for run in range(int(args.runs)):
             )
 
             p_eff, q_eff = _enforce_aug_mode(p_new, q_new, args.aug_mode)
+            p_trace[-1] = float(p_eff)
+            q_trace[-1] = float(q_eff)
+            rho_trace[-1] = float(info.get("rho_new", float(q_eff) * float(rho_scale)))
+            obj_trace[-1] = float(info.get("obj_new", info.get("obj_mean", float("nan"))))
 
             if bool(getattr(args, "pq_compare_search_methods", False)):
                 methods = [
@@ -674,6 +813,7 @@ for run in range(int(args.runs)):
                 f"mode={getattr(args, 'pq_epoch_objective_mode', 'batch_solutions')} "
                 f"p_epoch_best={info['p_epoch_best']:.4f} q_epoch_best={info['q_epoch_best']:.6f} "
                 f"p_new={info['p_new']:.4f} q_new={info['q_new']:.6f} "
+                f"rho_new={float(info.get('rho_new', float(q_eff) * float(rho_scale))):.3e} "
                 f"G_data_mean={info['G_data_mean']:.3e} G_reg_best_mean={info['G_reg_best_mean']:.3e} obj_mean={info['obj_mean']:.2e} "
                 f"used_batches={int(info['used_batches'])} skipped_batches={int(info['skipped_batches'])}"
             )
@@ -707,11 +847,18 @@ for run in range(int(args.runs)):
                     "pq/batch_weighting": str(getattr(args, "pq_batch_weighting", "node_count")),
                     "pq/p_epoch_best": float(info["p_epoch_best"]),
                     "pq/q_epoch_best": float(info["q_epoch_best"]),
+                    "pq/rho_epoch_best": float(info.get("rho_epoch_best", float(info["q_epoch_best"]) * float(rho_scale))),
                     "pq/p_new": float(info["p_new"]),
                     "pq/q_new": float(info["q_new"]),
+                    "pq/rho_new": float(info.get("rho_new", float(info["q_new"]) * float(rho_scale))),
                     "pq/used_batches": float(info["used_batches"]),
                     "pq/skipped_batches": float(info["skipped_batches"]),
+                    "pq/optimize_rho": float(bool(info.get("optimize_rho", False))),
                 }
+                if "densification_penalty_best" in info:
+                    pq_log["pq/densification_penalty_best"] = float(info["densification_penalty_best"])
+                if "rho_penalty_best" in info:
+                    pq_log["pq/rho_penalty_best"] = float(info["rho_penalty_best"])
                 if bool(getattr(args, "pq_compare_search_methods", False)):
                     methods = [
                         method for method in str(info.get("comparison_methods", "")).split(",") if method
@@ -723,6 +870,10 @@ for run in range(int(args.runs)):
                         pq_log[f"pq_compare/{method}_obj"] = float(info[f"comparison_{method}_obj"])
                         pq_log[f"pq_compare/{method}_p_best"] = float(info[f"comparison_{method}_p_best"])
                         pq_log[f"pq_compare/{method}_q_best"] = float(info[f"comparison_{method}_q_best"])
+                        if f"comparison_{method}_rho_best" in info:
+                            pq_log[f"pq_compare/{method}_rho_best"] = float(
+                                info[f"comparison_{method}_rho_best"]
+                            )
                         pq_log[f"pq_compare/{method}_G_reg_best"] = float(info[f"comparison_{method}_G_reg_best"])
                         pq_log[f"pq_compare/{method}_n_eval"] = float(info[f"comparison_{method}_n_eval"])
                         pq_log[f"pq_compare/{method}_solver_success"] = float(
@@ -754,6 +905,8 @@ for run in range(int(args.runs)):
             if aug_tech == "rade":
                 log_dict["aug/p"] = float(p_eval_epoch)
                 log_dict["aug/q"] = float(q_eval_epoch)
+                log_dict["aug/rho"] = float(q_eval_epoch) * float(rho_scale)
+                log_dict["aug/rho_next"] = float(q_eff) * float(rho_scale)
                 log_dict["rade/ep_correction"] = bool(getattr(args, "ep_correction", False))
                 log_dict["rade/ep_expectation_mode"] = str(getattr(args, "ep_expectation_mode", "analytic"))
                 log_dict["rade/ep_emp_average_mode"] = ep_emp_average_mode
@@ -777,6 +930,7 @@ for run in range(int(args.runs)):
                     aug_str = f", Drop/Add(mean per batch): -{d_mean:.2f} +{a_mean:.2f} undir"
                 aug_str += (
                     f" (p={p_eval_epoch:.4f}, q={q_eval_epoch:.6f}, mb_mode={mb_rade_mode}, "
+                    f"rho={float(q_eval_epoch) * float(rho_scale):.3e}, "
                     f"ep_correction={bool(getattr(args, 'ep_correction', False))}, "
                     f"ep_mode={getattr(args, 'ep_expectation_mode', 'analytic')}, "
                     f"ep_avg={ep_emp_average_mode}, "
@@ -819,6 +973,8 @@ for run in range(int(args.runs)):
     logger.print_statistics(run)
     p_histories.append(p_trace)
     q_histories.append(q_trace)
+    obj_histories.append(obj_trace)
+    rho_histories.append(rho_trace)
     for method in SEARCH_METHODS:
         method_obj_histories[method].append(method_obj_trace[method])
     if surface_snapshots:
@@ -833,9 +989,27 @@ if getattr(args, "pq_gradnorm", False) and str(getattr(args, "aug_tech", "rade")
     gnn_tag = str(getattr(args, "gnn_raw", getattr(args, "gnn", "gcn"))).lower().strip()
     variant_tag = str(getattr(args, "rade_variant", "rade-of")).lower().strip().replace("-", "")
     search_tag = str(getattr(args, "pq_search_method", "grid")).lower().strip()
-    tag = f"{dataset_tag}_{gnn_tag}_{variant_tag}_{search_tag}_mb"
+    if search_tag == "adam":
+        adam_lr_tag = _format_tag_float(float(getattr(args, "pq_adam_lr", 0.0)))
+        search_tag = f"{search_tag}_lr{adam_lr_tag}"
+    if bool(getattr(args, "pq_optimize_rho", False)):
+        search_tag = f"{search_tag}_rhoopt"
+    lam_tag = f"lam{_format_tag_float(float(getattr(args, 'pq_densification_penalty_lambda', 0.0)))}"
+    penalty_type = str(getattr(args, "pq_densification_penalty_type", "quadratic")).lower().strip()
+    penalty_tag = penalty_type
+    if penalty_type == "hinge":
+        penalty_tag = f"{penalty_type}_rho0{_format_tag_float(float(getattr(args, 'pq_densification_penalty_rho0', 1.0)))}"
+    tag = f"{dataset_tag}_{gnn_tag}_{variant_tag}_{search_tag}_{lam_tag}_{penalty_tag}_mb"
 
-    save_pq_plots(p_histories, q_histories, tag=tag, out_dir="visualization", show_runs=True)
+    save_pq_plots(
+        p_histories,
+        q_histories,
+        obj_histories,
+        rho_histories,
+        tag=tag,
+        out_dir="visualization",
+        show_runs=True,
+    )
     if bool(getattr(args, "pq_compare_search_methods", False)):
         save_pq_search_comparison_plots(method_obj_histories, tag=tag, out_dir="visualization", show_runs=True)
     surface_run = max(1, int(getattr(args, "pq_surface_run", 1)))
@@ -849,6 +1023,91 @@ if getattr(args, "pq_gradnorm", False) and str(getattr(args, "aug_tech", "rade")
         )
 
 save_result(args, results, runtime_summary=runtime_summary)
+
+single_dataset_record = {
+    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+    "dataset": str(args.dataset),
+    "final_test_acc_mean_pct": float(results.mean().item()),
+    "final_test_acc_std_pct": _safe_std(results),
+    "runtime_run_mean_sec": "" if runtime_summary is None else float(runtime_summary["run_mean"]),
+    "runtime_run_std_sec": "" if runtime_summary is None else float(runtime_summary["run_std"]),
+    "runtime_pooled_mean_sec": "" if runtime_summary is None else float(runtime_summary["pooled_mean"]),
+    "runtime_num_runs": "" if runtime_summary is None else int(runtime_summary["num_runs"]),
+    "runtime_num_epochs": "" if runtime_summary is None else int(runtime_summary["num_epochs"]),
+    "model": str(args.model),
+    "gnn_raw": str(getattr(args, "gnn_raw", args.gnn)),
+    "gnn": str(args.gnn),
+    "hidden_channels": int(args.hidden_channels),
+    "local_layers": int(args.local_layers),
+    "lr": float(args.lr),
+    "weight_decay": float(args.weight_decay),
+    "dropout": float(args.dropout),
+    "patience": int(args.patience),
+    "runs": int(args.runs),
+    "epochs": int(args.epochs),
+    "seed": int(args.seed),
+    "device": str(device),
+    "batch_size": int(args.batch_size),
+    "mb_num_workers": int(args.mb_num_workers),
+    "mb_pin_memory": bool(args.mb_pin_memory),
+    "full_eval_cpu": bool(args.full_eval_cpu),
+    "mb_rade_mode": str(args.mb_rade_mode),
+    "graph_density": float(graph_density),
+    "pq_expected_add_ratio_scale": float(rho_scale),
+    "aug_tech": str(args.aug_tech),
+    "aug_mode": str(args.aug_mode),
+    "p": float(args.p),
+    "q": float(args.q),
+    "ep_correction": bool(args.ep_correction),
+    "ep_expectation_mode": str(args.ep_expectation_mode),
+    "ep_emp_beta": float(args.ep_emp_beta),
+    "ep_emp_eps": float(args.ep_emp_eps),
+    "mask_sharing": str(args.mask_sharing),
+    "rade_variant": str(args.rade_variant),
+    "pq_gradnorm": bool(args.pq_gradnorm),
+    "pq_search_method": str(args.pq_search_method),
+    "pq_compare_search_methods": bool(args.pq_compare_search_methods),
+    "pq_optimize_rho": bool(args.pq_optimize_rho),
+    "pq_densification_penalty_lambda": float(args.pq_densification_penalty_lambda),
+    "pq_densification_penalty_type": str(args.pq_densification_penalty_type),
+    "pq_densification_penalty_rho0": float(args.pq_densification_penalty_rho0),
+    "pq_adam_lr": float(args.pq_adam_lr),
+    "pq_epoch_objective_mode": str(args.pq_epoch_objective_mode),
+    "pq_batch_weighting": str(args.pq_batch_weighting),
+    "pq_grid_size": int(args.pq_grid_size),
+    "p_max": float(args.p_max),
+    "q_max": float(args.q_max),
+    "pq_subset_nodes": int(args.pq_subset_nodes),
+    "pq_ema": float(args.pq_ema),
+    "pq_update_every": int(args.pq_update_every),
+    "pq_warmup_epochs": int(args.pq_warmup_epochs),
+    "pq_eps": float(args.pq_eps),
+    "pq_seed": int(args.pq_seed),
+    "pq_data_anchor": str(args.pq_data_anchor),
+    "pq_store_batches": int(args.pq_store_batches),
+    "pq_max_batches_for_tuning": int(args.pq_max_batches_for_tuning),
+    "train_prop": float(args.train_prop),
+    "valid_prop": float(args.valid_prop),
+    "rand_split": bool(args.rand_split),
+    "rand_split_class": bool(args.rand_split_class),
+    "label_num_per_class": int(args.label_num_per_class),
+    "valid_num": int(args.valid_num),
+    "test_num": int(args.test_num),
+    "remove_citeseer_isolated_nodes": bool(args.remove_citeseer_isolated_nodes),
+}
+single_dataset_dataset_tag = str(args.dataset).lower().strip().replace(os.sep, "_").replace("/", "_")
+single_dataset_gnn_tag = (
+    str(getattr(args, "gnn_raw", getattr(args, "gnn", "gcn")))
+    .lower()
+    .strip()
+    .replace(os.sep, "_")
+    .replace("/", "_")
+)
+single_dataset_csv = _write_single_dataset_csv(
+    single_dataset_record,
+    out_path=f"single_dataset/results_mb_{single_dataset_dataset_tag}_{single_dataset_gnn_tag}.csv",
+)
+print(f"[SINGLE-DATASET-MB] Saved summary CSV row to {single_dataset_csv}")
 
 if wandb_run is not None:
     try:

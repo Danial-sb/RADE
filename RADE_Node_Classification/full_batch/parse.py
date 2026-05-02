@@ -23,7 +23,6 @@ FULL_BATCH_AUTO_DEFAULTS = {
         "p": 0.5,
         "q": 0.000721,
         "pq_grid_size": 5,
-        "q_max": 0.001442,
     },
     ("cora", "gin"): {
         "hidden_channels": 256,
@@ -31,7 +30,6 @@ FULL_BATCH_AUTO_DEFAULTS = {
         "p": 0.5,
         "q": 0.000721,
         "pq_grid_size": 11,
-        "q_max": 0.001442,
     },
     ("citeseer", "gcn"): {
         "hidden_channels": 512,
@@ -39,7 +37,6 @@ FULL_BATCH_AUTO_DEFAULTS = {
         "p": 0.2,
         "q": 0.000164,
         "pq_grid_size": 5,
-        "q_max": 0.000328,
     },
     ("citeseer", "gin"): {
         "hidden_channels": 512,
@@ -47,7 +44,6 @@ FULL_BATCH_AUTO_DEFAULTS = {
         "p": 0.2,
         "q": 0.000164,
         "pq_grid_size": 11,
-        "q_max": 0.000328,
     },
     ("pubmed", "gcn"): {
         "hidden_channels": 256,
@@ -55,7 +51,6 @@ FULL_BATCH_AUTO_DEFAULTS = {
         "p": 0.2,
         "q": 0.0000456,
         "pq_grid_size": 5,
-        "q_max": 0.0000912,
     },
     ("pubmed", "gin"): {
         "hidden_channels": 512,
@@ -63,7 +58,6 @@ FULL_BATCH_AUTO_DEFAULTS = {
         "p": 0.2,
         "q": 0.0000456,
         "pq_grid_size": 11,
-        "q_max": 0.0000912,
     },
     ("cs", "gcn"): {
         "hidden_channels": 64,
@@ -71,7 +65,6 @@ FULL_BATCH_AUTO_DEFAULTS = {
         "p": 0.2,
         "q": 0.0000957,
         "pq_grid_size": 5,
-        "q_max": 0.0001914,
     },
     ("cs", "gin"): {
         "hidden_channels": 256,
@@ -79,7 +72,6 @@ FULL_BATCH_AUTO_DEFAULTS = {
         "p": 0.2,
         "q": 0.0000957,
         "pq_grid_size": 11,
-        "q_max": 0.0001914,
     },
     ("computer", "gcn"): {
         "hidden_channels": 128,
@@ -87,7 +79,6 @@ FULL_BATCH_AUTO_DEFAULTS = {
         "p": 0.5,
         "q": 0.001303,
         "pq_grid_size": 5,
-        "q_max": 0.002606,
         "patience": 200,
     },
     ("computer", "gin"): {
@@ -96,7 +87,6 @@ FULL_BATCH_AUTO_DEFAULTS = {
         "p": 0.5,
         "q": 0.001303,
         "pq_grid_size": 11,
-        "q_max": 0.002606,
         "patience": 200,
     },
     ("physics", "gcn"): {
@@ -105,7 +95,6 @@ FULL_BATCH_AUTO_DEFAULTS = {
         "p": 0.2,
         "q": 0.0000834,
         "pq_grid_size": 5,
-        "q_max": 0.0001668,
     },
     ("physics", "gin"): {
         "hidden_channels": 64,
@@ -113,7 +102,6 @@ FULL_BATCH_AUTO_DEFAULTS = {
         "p": 0.2,
         "q": 0.0000834,
         "pq_grid_size": 11,
-        "q_max": 0.0001668,
     },
 }
 
@@ -242,7 +230,7 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--gnn",
         type=str,
-        default="gcn",
+        default="gin",
         choices=["gcn", "gin", "sgc", "gin-linear"],
         help="Backbone: gcn/gin are standard. sgc routes to linear-GCN. gin-linear routes to linear-GIN."
     )
@@ -307,7 +295,7 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--aug_mode",
         type=str,
-        default="both",
+        default="add",
         choices=["none", "drop", "add", "both"],
         help="Per-epoch graph perturbation mode.",
     )
@@ -389,11 +377,11 @@ def parser_add_main_args(parser):
         "--pq_search_method",
         type=str,
         default="adam",
-        choices=["grid", "powell", "newton", "adam"],
+        choices=["grid", "powell", "newton", "adam", "gd"],
         help="How to update (p,q). "
              "'grid'/'powell'/'newton' use the existing epoch-wise search rule. "
-             "'adam' uses a stateful online controller with p=p_max*sigmoid(u), q=q_max*sigmoid(v) "
-             "and one Adam step per PQ update.",
+             "'adam' uses a stateful online controller and one Adam step per PQ update. "
+             "'gd' uses one projected gradient-descent step per PQ update.",
     )
     parser.add_argument(
         "--pq_compare_search_methods",
@@ -411,7 +399,7 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--pq_adam_lr",
         type=float,
-        default=0.2,
+        default=0.01,
         help="Learning rate for the Adam-based p/q controller when --pq_search_method=adam.",
     )
     parser.add_argument(
@@ -432,13 +420,51 @@ def parser_add_main_args(parser):
         default=1e-8,
         help="Adam epsilon for the p/q controller.",
     )
+    parser.add_argument(
+        "--pq_optimize_rho",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="For online PQ-GradNorm controllers, optimize rho = q / d directly and convert back to q for G_reg.",
+    )
+    parser.add_argument(
+        "--pq_densification_penalty_lambda",
+        type=float,
+        default=1,
+        help="Coefficient lambda for the soft expected-densification penalty "
+             "applied to rho = q / d in the full-batch PQ-GradNorm objective, "
+             "where d = |E| / (|E| + |Ebar|) is the undirected graph density.",
+    )
+    parser.add_argument(
+        "--pq_densification_penalty_type",
+        type=str,
+        default="quadratic",
+        choices=["quadratic", "linear", "hinge"],
+        help="Penalty form for full-batch PQ-GradNorm densification control: "
+             "'quadratic' uses lambda * rho^2, 'linear' uses lambda * rho, and 'hinge' uses "
+             "lambda * max(0, rho - rho0)^2 with rho = q / d.",
+    )
+    parser.add_argument(
+        "--pq_densification_penalty_rho0",
+        type=float,
+        default=1.0,
+        help="Hinge threshold rho0 used only when --pq_densification_penalty_type=hinge. "
+             "Default is 1.0.",
+    )
+    parser.add_argument(
+        "--pq_gd_lr",
+        type=float,
+        default=0.1,
+        help="Learning rate for the projected GD p/q controller when --pq_search_method=gd.",
+    )
 
     parser.add_argument("--pq_grid_size", type=int, default=5,
-                        help="Grid size for (p,q) search. Use 11 for GIN; use 3-5 for GCN (costlier).")
+                        help="Grid size for raw (p,q) search. Use 11 for GIN; use 3-5 for GCN (costlier).")
     parser.add_argument(
         "--pq_surface_plot",
         action="store_true",
-        help="Save objective heatmaps/contours over a frozen (p,q) snapshot with solver best points overlaid.",
+        help="Save objective heatmaps/contours over a frozen raw (p,q) snapshot with solver best points overlaid.",
     )
     parser.add_argument(
         "--pq_surface_animation",
@@ -463,9 +489,6 @@ def parser_add_main_args(parser):
         default=1,
         help="1-based run index used for the optional objective surface export.",
     )
-
-    parser.add_argument("--p_max", type=float, default=0.99, help="Upper bound for p during GradNorm tuning.")
-    parser.add_argument("--q_max", type=float, default=0.99, help="Upper bound for q during GradNorm tuning.")
 
     parser.add_argument(
         "--pq_subset_nodes",

@@ -148,7 +148,7 @@ class BatchBernoulliEdgeAugmentor:
         mode: AugMode,
         seed: Optional[int] = None,
         device: Optional[torch.device] = None,
-        safety_max_additions: int = 200_000,
+        safety_max_additions: int = 2000000,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
         """
         Returns:

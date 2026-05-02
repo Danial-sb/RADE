@@ -2,10 +2,11 @@ import os
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 import argparse
+import csv
 import random
 import sys
 import time
-from typing import Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -27,12 +28,13 @@ from viz_pq import save_pq_plots, save_pq_search_comparison_plots, save_pq_objec
 from pq_gradnorm import PQGradNormTuner, PQTunerConfig, SEARCH_METHODS
 
 
-def fix_seed(seed: int = 42) -> None:
+def fix_seed(seed: int = 42, device: Optional[torch.device] = None) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if device is not None and device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.set_device(device)
+        torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     torch.use_deterministic_algorithms(True)
@@ -180,12 +182,12 @@ print(
     f"mask_sharing={getattr(args, 'mask_sharing', '-')}"
 )
 
-fix_seed(args.seed)
-
 if args.cpu:
     device = torch.device("cpu")
 else:
     device = torch.device(f"cuda:{args.device}") if torch.cuda.is_available() else torch.device("cpu")
+
+fix_seed(args.seed, device=device)
 
 
 # -----------------------
@@ -228,6 +230,8 @@ if aug_tech == "rade":
 split_idx_lst = []
 p_histories = []
 q_histories = []
+obj_histories = []
+rho_histories = []
 method_obj_histories = {method: [] for method in SEARCH_METHODS}
 surface_snapshots_by_run = {}
 for run in range(args.runs):
@@ -265,6 +269,113 @@ def _enforce_aug_mode(p_val: float, q_val: float, aug_mode: str) -> Tuple[float,
 def _sync_for_timing(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+def _format_tag_float(value: float) -> str:
+    return str(f"{float(value):g}").replace(".", "p").replace("-", "m")
+
+
+def _safe_std(values: torch.Tensor) -> float:
+    if values.numel() <= 1:
+        return 0.0
+    return float(values.std().item())
+
+
+def _write_single_dataset_csv(record: Dict[str, object], out_path: str = "single_dataset/results.csv") -> str:
+    abs_path = os.path.abspath(out_path)
+    parent = os.path.dirname(abs_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    fieldnames = [
+        "timestamp",
+        "dataset",
+        "final_test_acc_mean_pct",
+        "final_test_acc_std_pct",
+        "runtime_run_mean_sec",
+        "runtime_run_std_sec",
+        "runtime_pooled_mean_sec",
+        "runtime_num_runs",
+        "runtime_num_epochs",
+        "model",
+        "gnn_raw",
+        "gnn",
+        "hidden_channels",
+        "local_layers",
+        "lr",
+        "weight_decay",
+        "dropout",
+        "patience",
+        "runs",
+        "epochs",
+        "seed",
+        "device",
+        "aug_tech",
+        "aug_mode",
+        "p",
+        "q",
+        "ep_correction",
+        "ep_expectation_mode",
+        "ep_emp_beta",
+        "ep_emp_eps",
+        "mask_sharing",
+        "rade_variant",
+        "pq_gradnorm",
+        "pq_search_method",
+        "pq_compare_search_methods",
+        "pq_optimize_rho",
+        "pq_densification_penalty_lambda",
+        "pq_densification_penalty_type",
+        "pq_densification_penalty_rho0",
+        "pq_gd_lr",
+        "pq_adam_lr",
+        "pq_grid_size",
+        "pq_subset_nodes",
+        "pq_ema",
+        "pq_update_every",
+        "pq_warmup_epochs",
+        "pq_eps",
+        "pq_seed",
+        "pq_data_anchor",
+        "train_prop",
+        "valid_prop",
+        "rand_split",
+        "rand_split_class",
+        "label_num_per_class",
+        "valid_num",
+        "test_num",
+        "remove_citeseer_isolated_nodes",
+    ]
+
+    write_header = not os.path.exists(abs_path) or os.path.getsize(abs_path) == 0
+    with open(abs_path, "a", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow({field: record.get(field, "") for field in fieldnames})
+
+    return abs_path
+
+
+def _build_gradnorm_plot_tag(args) -> str:
+    dataset_tag = str(args.dataset).lower().strip()
+    gnn_tag = str(getattr(args, "gnn_raw", getattr(args, "gnn", "gcn"))).lower().strip()
+    variant_tag = str(getattr(args, "rade_variant", "rade-of")).lower().strip().replace("-", "")
+    search_tag = str(getattr(args, "pq_search_method", "grid")).lower().strip()
+
+    if search_tag == "adam":
+        search_tag = f"{search_tag}_lr{_format_tag_float(float(getattr(args, 'pq_adam_lr', 0.0)))}"
+    elif search_tag == "gd":
+        search_tag = f"{search_tag}_lr{_format_tag_float(float(getattr(args, 'pq_gd_lr', 0.0)))}"
+    if bool(getattr(args, "pq_optimize_rho", False)):
+        search_tag = f"{search_tag}_rhoopt"
+
+    lam_tag = f"lam{_format_tag_float(float(getattr(args, 'pq_densification_penalty_lambda', 0.0)))}"
+    penalty_type = str(getattr(args, "pq_densification_penalty_type", "quadratic")).lower().strip()
+    penalty_tag = penalty_type
+    if penalty_type == "hinge":
+        penalty_tag = f"{penalty_type}_rho0{_format_tag_float(float(getattr(args, 'pq_densification_penalty_rho0', 1.0)))}"
+    return f"{dataset_tag}_{search_tag}_{lam_tag}_{penalty_tag}_{gnn_tag}_{variant_tag}"
 
 
 # -----------------------
@@ -314,6 +425,8 @@ for run in range(args.runs):
     # Record p, q used at each epoch
     p_trace = []
     q_trace = []
+    obj_trace = []
+    rho_trace = []
     method_obj_trace = {method: [] for method in SEARCH_METHODS}
     surface_snapshots = []
 
@@ -324,18 +437,22 @@ for run in range(args.runs):
             raise ValueError("--pq_gradnorm requires --aug_mode != none.")
         if not getattr(args, "ep_correction", False):
             raise ValueError("--pq_gradnorm currently requires --ep_correction True.")
-        if str(getattr(args, "pq_search_method", "grid")).lower().strip() == "adam":
+        if str(getattr(args, "pq_search_method", "grid")).lower().strip() in {"adam", "gd"}:
             if bool(getattr(args, "pq_compare_search_methods", False)):
-                raise ValueError("--pq_compare_search_methods is not supported when --pq_search_method=adam.")
+                raise ValueError("--pq_compare_search_methods is not supported when --pq_search_method is adam or gd.")
+        elif bool(getattr(args, "pq_optimize_rho", False)):
+            raise ValueError("--pq_optimize_rho currently requires --pq_search_method adam or gd.")
 
         cfg = PQTunerConfig(
-            p_max=args.p_max,
-            q_max=args.q_max,
             grid_size=args.pq_grid_size,
             ema=args.pq_ema,
             eps=args.pq_eps,
             subset_nodes=args.pq_subset_nodes,
             seed=args.seed,
+            densification_penalty_lambda=args.pq_densification_penalty_lambda,
+            densification_penalty_type=args.pq_densification_penalty_type,
+            densification_penalty_rho0=args.pq_densification_penalty_rho0,
+            optimize_rho=bool(getattr(args, "pq_optimize_rho", False)),
             data_anchor=args.pq_data_anchor,
             search_method=args.pq_search_method,
             compare_search_methods=bool(getattr(args, "pq_compare_search_methods", False)),
@@ -349,6 +466,7 @@ for run in range(args.runs):
             adam_beta1=args.pq_adam_beta1,
             adam_beta2=args.pq_adam_beta2,
             adam_eps=args.pq_adam_eps,
+            gd_lr=args.pq_gd_lr,
         )
         pq_tuner = PQGradNormTuner(
             edge_index_clean=data.edge_index,
@@ -357,6 +475,7 @@ for run in range(args.runs):
             rade_variant=str(args.rade_variant),
             cfg=cfg,
         )
+    rho_scale = 0.0 if pq_tuner is None else float(pq_tuner.expected_add_ratio_scale)
 
     best_val = float("-inf")
     best_test = float("-inf")
@@ -380,6 +499,8 @@ for run in range(args.runs):
 
         p_trace.append(p_epoch)
         q_trace.append(q_epoch)
+        obj_trace.append(float("nan"))
+        rho_trace.append(float(q_epoch) * float(rho_scale))
         for method in SEARCH_METHODS:
             method_obj_trace[method].append(float("nan"))
 
@@ -553,6 +674,10 @@ for run in range(args.runs):
 
                 p_new, q_new = _enforce_aug_mode(p_new, q_new, args.aug_mode)
                 p_eff, q_eff = p_new, q_new
+                p_trace[-1] = float(p_eff)
+                q_trace[-1] = float(q_eff)
+                rho_trace[-1] = float(q_eff) * float(rho_scale)
+                obj_trace[-1] = float(info.get("obj_new", info["obj"]))
 
                 if bool(info.get("comparison_enabled", 0.0)):
                     methods = [
@@ -572,15 +697,33 @@ for run in range(args.runs):
                     print(
                         f"[PQ-GradNorm-Adam] run={run + 1:02d} epoch={epoch + 1:03d} "
                         f"G_data={info['G_data']:.3e} G_reg={info['G_reg_best']:.3e} "
-                        f"p={info['p_best']:.4f} q={info['q_best']:.6f} obj={info['obj']:.2e} "
-                        f"lr={info.get('adam_lr', float('nan')):.2e}"
+                        f"p={info['p_best']:.4f} q={info['q_best']:.6f} "
+                        f"rho={info.get('rho_best', float('nan')):.3e} "
+                        f"obj={info.get('obj_new', info['obj']):.2e} "
+                        f"lr={info.get('adam_lr', float('nan')):.2e} "
+                        f"opt={info.get('optimization_variable', 'q')}"
+                    )
+                elif pq_method == "gd":
+                    print(
+                        f"[PQ-GradNorm-GD] run={run + 1:02d} epoch={epoch + 1:03d} "
+                        f"G_data={info['G_data']:.3e} G_reg={info['G_reg_best']:.3e} "
+                        f"p={info['p_best']:.4f}->{info['p_new']:.4f} "
+                        f"q={info['q_best']:.6f}->{info['q_new']:.6f} "
+                        f"rho={info.get('rho_new', float('nan')):.3e} "
+                        f"obj={info.get('obj_new', info['obj']):.2e} "
+                        f"lr={info.get('gd_lr', float('nan')):.2e} "
+                        f"|dobj/drho|={info.get('grad_rho_abs', float('nan')):.3e} "
+                        f"drho={info.get('delta_rho', float('nan')):.3e} "
+                        f"opt={info.get('optimization_variable', 'q')}"
                     )
                 else:
                     print(
                         f"[PQ-GradNorm] run={run + 1:02d} epoch={epoch + 1:03d} "
                         f"G_data={info['G_data']:.3e} G_reg_best={info['G_reg_best']:.3e} "
                         f"p(best->new)={info['p_best']:.4f}->{info['p_new']:.4f} "
-                        f"q(best->new)={info['q_best']:.6f}->{info['q_new']:.6f} obj={info['obj']:.2e}"
+                        f"q(best->new)={info['q_best']:.6f}->{info['q_new']:.6f} "
+                        f"rho={info.get('rho_new', float('nan')):.3e} "
+                        f"obj={info.get('obj_new', info['obj']):.2e}"
                     )
                 if bool(info.get("comparison_enabled", 0.0)):
                     methods = [
@@ -608,22 +751,50 @@ for run in range(args.runs):
                         "pq/G_data": float(info["G_data"]),
                         "pq/G_reg_best": float(info["G_reg_best"]),
                         "pq/obj": float(info["obj"]),
+                        "pq/obj_selected": float(info.get("obj_new", info["obj"])),
                         "pq/p_used": p_epoch,
                         "pq/q_used": q_epoch,
+                        "pq/rho_used": float(q_epoch) * float(rho_scale),
                         "pq/p_eval": float(info["p_best"]),
                         "pq/q_eval": float(info["q_best"]),
                         "pq/p_next": float(info["p_new"]),
                         "pq/q_next": float(info["q_new"]),
+                        "pq/rho_next": float(info.get("rho_new", float(q_eff) * float(rho_scale))),
                         "pq/p_best": float(info["p_best"]),
                         "pq/q_best": float(info["q_best"]),
                         "pq/p_new": float(info["p_new"]),
                         "pq/q_new": float(info["q_new"]),
+                        "pq/rho_best": float(info.get("rho_best", float("nan"))),
+                        "pq/rho_new": float(info.get("rho_new", float("nan"))),
+                        "pq/optimize_rho": float(bool(info.get("optimize_rho", False))),
                     }
                     if pq_method == "adam":
                         pq_log["pq/G_reg_curr"] = float(info["G_reg_best"])
                         pq_log["pq/G_reg_next"] = float(info.get("G_reg_new", float("nan")))
                         pq_log["pq/obj_curr"] = float(info["obj"])
                         pq_log["pq/obj_next"] = float(info.get("obj_new", float("nan")))
+                    if "densification_penalty_best" in info:
+                        pq_log["pq/densification_penalty_best"] = float(info["densification_penalty_best"])
+                    if "rho_penalty_best" in info:
+                        pq_log["pq/rho_penalty_best"] = float(info["rho_penalty_best"])
+                    if "densification_penalty_new" in info:
+                        pq_log["pq/densification_penalty_new"] = float(info["densification_penalty_new"])
+                    if "rho_penalty_new" in info:
+                        pq_log["pq/rho_penalty_new"] = float(info["rho_penalty_new"])
+                    if "grad_rho" in info:
+                        pq_log["pq/grad_rho"] = float(info["grad_rho"])
+                        pq_log["pq/grad_rho_abs"] = float(
+                            info.get("grad_rho_abs", abs(float(info["grad_rho"])))
+                        )
+                    if "delta_rho" in info:
+                        pq_log["pq/delta_rho"] = float(info["delta_rho"])
+                    if "grad_p" in info:
+                        pq_log["pq/grad_p"] = float(info["grad_p"])
+                        pq_log["pq/grad_p_abs"] = float(info.get("grad_p_abs", abs(float(info["grad_p"]))))
+                    if "delta_p" in info:
+                        pq_log["pq/delta_p"] = float(info["delta_p"])
+                    if "gd_lr" in info:
+                        pq_log["pq/gd_lr"] = float(info["gd_lr"])
                     if bool(info.get("comparison_enabled", 0.0)):
                         methods = [
                             method for method in str(info.get("comparison_methods", "")).split(",") if method
@@ -676,8 +847,10 @@ for run in range(args.runs):
                 log_dict["aug/q"] = q_epoch
                 log_dict["aug/p_used"] = p_epoch
                 log_dict["aug/q_used"] = q_epoch
+                log_dict["aug/rho_used"] = float(q_epoch) * float(rho_scale)
                 log_dict["aug/p_next"] = float(p_eff)
                 log_dict["aug/q_next"] = float(q_eff)
+                log_dict["aug/rho_next"] = float(q_eff) * float(rho_scale)
                 log_dict["rade/ep_correction"] = bool(getattr(args, "ep_correction", False))
                 log_dict["rade/ep_expectation_mode"] = str(getattr(args, "ep_expectation_mode", "analytic"))
                 log_dict["rade/ep_emp_average_mode"] = ep_emp_average_mode
@@ -720,6 +893,7 @@ for run in range(args.runs):
 
                 aug_str += (
                     f" (p={p_epoch:.4f}, q={q_epoch:.6f}, "
+                    f"rho={float(q_epoch) * float(rho_scale):.3e}, "
                     f"ep_correction={bool(getattr(args, 'ep_correction', False))}, "
                     f"ep_mode={getattr(args, 'ep_expectation_mode', 'analytic')}, "
                     f"ep_avg={ep_emp_average_mode}, "
@@ -777,6 +951,8 @@ for run in range(args.runs):
     logger.print_statistics(run)
     p_histories.append(p_trace)
     q_histories.append(q_trace)
+    obj_histories.append(obj_trace)
+    rho_histories.append(rho_trace)
     for method in SEARCH_METHODS:
         method_obj_histories[method].append(method_obj_trace[method])
     if len(surface_snapshots) > 0:
@@ -788,18 +964,13 @@ runtime_summary = logger.get_runtime_summary()
 
 # Save GradNorm p/q schedules (mean±std over runs) when pq_gradnorm is enabled
 if getattr(args, "pq_gradnorm", False) and str(getattr(args, "aug_tech", "rade")).lower().strip() == "rade":
-    dataset_tag = str(args.dataset).lower().strip()
-    gnn_tag = str(getattr(args, "gnn_raw", getattr(args, "gnn", "gcn"))).lower().strip()
-    variant_tag = str(getattr(args, "rade_variant", "rade-of")).lower().strip().replace("-", "")
-    search_tag = str(getattr(args, "pq_search_method", "grid")).lower().strip()
-
-    tag = (
-        f"{dataset_tag}_{gnn_tag}_{variant_tag}_{search_tag}"
-    )  # e.g. "cora_gcn_radeof_grid" or "cora_gcn_radeofs_powell"
+    tag = _build_gradnorm_plot_tag(args)
 
     save_pq_plots(
         p_histories,
         q_histories,
+        obj_histories,
+        rho_histories,
         tag=tag,
         out_dir="visualization",
         show_runs=True,
@@ -822,6 +993,68 @@ if getattr(args, "pq_gradnorm", False) and str(getattr(args, "aug_tech", "rade")
         )
 
 save_result(args, results, runtime_summary=runtime_summary)
+
+single_dataset_record = {
+    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+    "dataset": str(args.dataset),
+    "final_test_acc_mean_pct": float(results.mean().item()),
+    "final_test_acc_std_pct": _safe_std(results),
+    "runtime_run_mean_sec": "" if runtime_summary is None else float(runtime_summary["run_mean"]),
+    "runtime_run_std_sec": "" if runtime_summary is None else float(runtime_summary["run_std"]),
+    "runtime_pooled_mean_sec": "" if runtime_summary is None else float(runtime_summary["pooled_mean"]),
+    "runtime_num_runs": "" if runtime_summary is None else int(runtime_summary["num_runs"]),
+    "runtime_num_epochs": "" if runtime_summary is None else int(runtime_summary["num_epochs"]),
+    "model": str(args.model),
+    "gnn_raw": str(getattr(args, "gnn_raw", args.gnn)),
+    "gnn": str(args.gnn),
+    "hidden_channels": int(args.hidden_channels),
+    "local_layers": int(args.local_layers),
+    "lr": float(args.lr),
+    "weight_decay": float(args.weight_decay),
+    "dropout": float(args.dropout),
+    "patience": int(args.patience),
+    "runs": int(args.runs),
+    "epochs": int(args.epochs),
+    "seed": int(args.seed),
+    "device": str(device),
+    "aug_tech": str(args.aug_tech),
+    "aug_mode": str(args.aug_mode),
+    "p": float(args.p),
+    "q": float(args.q),
+    "ep_correction": bool(args.ep_correction),
+    "ep_expectation_mode": str(args.ep_expectation_mode),
+    "ep_emp_beta": float(args.ep_emp_beta),
+    "ep_emp_eps": float(args.ep_emp_eps),
+    "mask_sharing": str(args.mask_sharing),
+    "rade_variant": str(args.rade_variant),
+    "pq_gradnorm": bool(args.pq_gradnorm),
+    "pq_search_method": str(args.pq_search_method),
+    "pq_compare_search_methods": bool(args.pq_compare_search_methods),
+    "pq_optimize_rho": bool(args.pq_optimize_rho),
+    "pq_densification_penalty_lambda": float(args.pq_densification_penalty_lambda),
+    "pq_densification_penalty_type": str(args.pq_densification_penalty_type),
+    "pq_densification_penalty_rho0": float(args.pq_densification_penalty_rho0),
+    "pq_gd_lr": float(args.pq_gd_lr),
+    "pq_adam_lr": float(args.pq_adam_lr),
+    "pq_grid_size": int(args.pq_grid_size),
+    "pq_subset_nodes": int(args.pq_subset_nodes),
+    "pq_ema": float(args.pq_ema),
+    "pq_update_every": int(args.pq_update_every),
+    "pq_warmup_epochs": int(args.pq_warmup_epochs),
+    "pq_eps": float(args.pq_eps),
+    "pq_seed": int(args.pq_seed),
+    "pq_data_anchor": str(args.pq_data_anchor),
+    "train_prop": float(args.train_prop),
+    "valid_prop": float(args.valid_prop),
+    "rand_split": bool(args.rand_split),
+    "rand_split_class": bool(args.rand_split_class),
+    "label_num_per_class": int(args.label_num_per_class),
+    "valid_num": int(args.valid_num),
+    "test_num": int(args.test_num),
+    "remove_citeseer_isolated_nodes": bool(args.remove_citeseer_isolated_nodes),
+}
+single_dataset_csv = _write_single_dataset_csv(single_dataset_record)
+print(f"[SINGLE-DATASET] Saved summary CSV row to {single_dataset_csv}")
 
 if wandb_run is not None:
     try:

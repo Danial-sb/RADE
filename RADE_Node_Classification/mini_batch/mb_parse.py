@@ -5,12 +5,25 @@ import argparse
 from .mb_models import MPNNsMB
 
 
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+
+    value_norm = str(value).strip().lower()
+    if value_norm in {"1", "true", "t", "yes", "y"}:
+        return True
+    if value_norm in {"0", "false", "f", "no", "n"}:
+        return False
+
+    raise argparse.ArgumentTypeError(f"Expected a boolean value, got {value!r}.")
+
+
 MINI_BATCH_AUTO_DEFAULTS = {
     ("flickr", "gcn"): {
         "hidden_channels": 256,
         "epochs": 1000,
-        "p": 0.2,
-        "q": 0.00001436,
+        "p": 0.0,
+        "q": 0.0,
         "pq_grid_size": 5,
     },
     ("flickr", "gin"): {
@@ -23,8 +36,8 @@ MINI_BATCH_AUTO_DEFAULTS = {
     ("ogbn-arxiv", "gcn"): {
         "hidden_channels": 256,
         "epochs": 2000,
-        "p": 0.2,
-        "q": 0.000013446,
+        "p": 0.0,
+        "q": 0.0,
         "pq_grid_size": 5,
     },
     ("ogbn-arxiv", "gin"): {
@@ -108,7 +121,7 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--dataset",
         type=str,
-        default="flickr",
+        default="ogbn-arxiv",
         choices=["flickr", "ogbn-arxiv"],
         help="Dataset name",
     )
@@ -119,7 +132,7 @@ def parser_add_main_args(parser):
         help="Remove isolated nodes when loading CiteSeer. Ignored for other datasets.",
     )
 
-    parser.add_argument("--device", type=int, default=3, help="GPU id (default: 0)")
+    parser.add_argument("--device", type=int, default=1, help="GPU id (default: 0)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cpu", action="store_true")
 
@@ -281,8 +294,7 @@ def parser_add_main_args(parser):
         choices=["grid", "powell", "newton", "adam"],
         help="How to update (p,q). "
              "'grid'/'powell'/'newton' use the existing mini-batch search rules. "
-             "'adam' uses a stateful online controller with p=p_max*sigmoid(u), q=q_max*sigmoid(v) "
-             "and one Adam step after each mini-batch PQ update.",
+             "'adam' uses a stateful online controller and one Adam step after each mini-batch PQ update.",
     )
     parser.add_argument(
         "--pq_compare_search_methods",
@@ -319,6 +331,33 @@ def parser_add_main_args(parser):
         type=float,
         default=1e-8,
         help="Adam epsilon for the p/q controller.",
+    )
+    parser.add_argument(
+        "--pq_optimize_rho",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="For Adam PQ-GradNorm, optimize rho = q / d directly and convert back to q for G_reg.",
+    )
+    parser.add_argument(
+        "--pq_densification_penalty_lambda",
+        type=float,
+        default=1,
+        help="Coefficient lambda for the soft expected-densification penalty applied to rho = q / d.",
+    )
+    parser.add_argument(
+        "--pq_densification_penalty_type",
+        type=str,
+        default="quadratic",
+        choices=["quadratic", "linear", "hinge"],
+        help="Penalty form for PQ-GradNorm densification control.",
+    )
+    parser.add_argument(
+        "--pq_densification_penalty_rho0",
+        type=float,
+        default=1.0,
+        help="Hinge threshold rho0 used only when --pq_densification_penalty_type=hinge.",
     )
     parser.add_argument(
         "--pq_epoch_objective_mode",
@@ -367,8 +406,8 @@ def parser_add_main_args(parser):
         default=0,
         help="Cap the number of mini-batches used by PQ tuning per epoch. 0 means use all available.",
     )
-    parser.add_argument("--p_max", type=float, default=0.6, help="Upper bound for p during GradNorm tuning.")
-    parser.add_argument("--q_max", type=float, default=1e-3, help="Upper bound for q during GradNorm tuning.")
+    parser.add_argument("--p_max", type=float, default=0.6, help="Upper bound for p in non-Adam mini-batch PQ search.")
+    parser.add_argument("--q_max", type=float, default=1e-3, help="Upper bound for q in non-Adam mini-batch PQ search.")
     parser.add_argument(
         "--pq_subset_nodes",
         type=int,
