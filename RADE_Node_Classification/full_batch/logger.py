@@ -21,6 +21,8 @@ class Logger(object):
 
     def get_runtime_summary(self):
         run_means = []
+        run_stds = []
+        run_epochs = []
         pooled = []
 
         for run_times in self.runtime_results:
@@ -28,6 +30,8 @@ class Logger(object):
                 continue
             t = torch.tensor(run_times, dtype=torch.float64)
             run_means.append(t.mean().item())
+            run_stds.append(t.std(unbiased=False).item())
+            run_epochs.append(int(t.numel()))
             pooled.extend(run_times)
 
         if len(run_means) == 0:
@@ -38,6 +42,9 @@ class Logger(object):
         return {
             "run_mean": run_means_t.mean().item(),
             "run_std": run_means_t.std(unbiased=False).item(),
+            "run_means": run_means,
+            "run_stds": run_stds,
+            "run_epochs": run_epochs,
             "pooled_mean": pooled_t.mean().item(),
             "num_runs": len(run_means),
             "num_epochs": int(pooled_t.numel()),
@@ -64,6 +71,7 @@ class Logger(object):
             if len(self.runtime_results[run]) > 0:
                 runtimes = torch.tensor(self.runtime_results[run], dtype=torch.float64)
                 print(f'Avg Epoch Time: {runtimes.mean():.4f}s')
+                print(f'Std Epoch Time: {runtimes.std(unbiased=False):.4f}s')
                 print(f'Epochs Timed: {int(runtimes.numel())}')
 
         else:
@@ -116,6 +124,14 @@ class Logger(object):
                     f"Avg Epoch Time (pooled): {runtime_summary['pooled_mean']:.4f}s "
                     f"over {runtime_summary['num_epochs']} epochs"
                 )
+                for idx, (run_mean, run_std) in enumerate(
+                    zip(runtime_summary["run_means"], runtime_summary["run_stds"]),
+                    start=1,
+                ):
+                    print(
+                        f"Run {idx:02d} Avg Epoch Time: {run_mean:.4f}s "
+                        f"+- {run_std:.4f}s"
+                    )
             return best_result[:, 4]
 
     def output(self, out_path, info):
@@ -161,9 +177,16 @@ def save_result(args, results, runtime_summary=None):
         if(args.model == 'MPNN'):
             runtime_suffix = ""
             if runtime_summary is not None:
+                per_run_runtime = "; ".join(
+                    f"run{idx + 1}:{mean:.4f}s+-{std:.4f}s"
+                    for idx, (mean, std) in enumerate(
+                        zip(runtime_summary["run_means"], runtime_summary["run_stds"])
+                    )
+                )
                 runtime_suffix = (
                     f" epoch_time {runtime_summary['run_mean']:.4f}s "
                     f"$\\pm$ {runtime_summary['run_std']:.4f}s"
+                    f" per_run_epoch_time [{per_run_runtime}]"
                 )
             write_obj.write(
                 f"{args.model} " + f"{args.lr} " + f"{args.hidden_channels} " + f"{args.local_layers} " + f"{args.dropout} " + f"{args.ln} " +

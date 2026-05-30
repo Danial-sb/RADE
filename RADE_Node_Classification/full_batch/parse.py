@@ -1,5 +1,7 @@
 import argparse
 
+from sympy import false
+
 from models import MPNNs
 
 
@@ -16,6 +18,138 @@ def str2bool(value):
     raise argparse.ArgumentTypeError(f"Expected a boolean value, got {value!r}.")
 
 
+# FULL_BATCH_AUTO_DEFAULTS = {
+#     ("cora", "gcn"): {
+#         "hidden_channels": 512,
+#         "epochs": 500,
+#         "p": 0.2,
+#         "q": 0.0002884,
+#         "pq_grid_size": 5,
+#     },
+#     ("cora", "gin"): {
+#         "hidden_channels": 512,
+#         "epochs": 500,
+#         "p": 0.2,
+#         "q": 0.0002884,
+#         "pq_grid_size": 11,
+#     },
+#     ("cora", "gat"): {
+#         "hidden_channels": 256,
+#         "epochs": 500,
+#         "p": 0.2,
+#         "q": 0.0002884,
+#         "pq_grid_size": 11,
+#     },
+#     ("citeseer", "gcn"): {
+#         "hidden_channels": 512,
+#         "epochs": 500,
+#         "p": 0.2,
+#         "q": 0.000164,
+#         "pq_grid_size": 5,
+#     },
+#     ("citeseer", "gin"): {
+#         "hidden_channels": 512,
+#         "epochs": 500,
+#         "p": 0.2,
+#         "q": 0.000164,
+#         "pq_grid_size": 11,
+#     },
+#     ("citeseer", "gat"): {
+#         "hidden_channels": 512,
+#         "epochs": 500,
+#         "p": 0.2,
+#         "q": 0.000164,
+#         "pq_grid_size": 11,
+#     },
+#     ("pubmed", "gcn"): {
+#         "hidden_channels": 512,
+#         "epochs": 500,
+#         "p": 0.2,
+#         "q": 0.0000456,
+#         "pq_grid_size": 5,
+#     },
+#     ("pubmed", "gin"): {
+#         "hidden_channels": 512,
+#         "epochs": 500,
+#         "p": 0.2,
+#         "q": 0.0000456,
+#         "pq_grid_size": 11,
+#     },
+#     ("pubmed", "gat"): {
+#         "hidden_channels": 256,
+#         "epochs": 500,
+#         "p": 0.2,
+#         "q": 0.0000456,
+#         "pq_grid_size": 11,
+#     },
+#     ("cs", "gcn"): {
+#         "hidden_channels": 64,
+#         "epochs": 1500,
+#         "p": 0.2,
+#         "q": 0.0000957,
+#         "pq_grid_size": 5,
+#     },
+#     ("cs", "gin"): {
+#         "hidden_channels": 256,
+#         "epochs": 1500,
+#         "p": 0.2,
+#         "q": 0.0000957,
+#         "pq_grid_size": 11,
+#     },
+#     ("cs", "gat"): {
+#         "hidden_channels": 128,
+#         "epochs": 1500,
+#         "p": 0.2,
+#         "q": 0.0000957,
+#         "pq_grid_size": 11,
+#     },
+#     ("computer", "gcn"): { # TODO: Run computer again.
+#         "hidden_channels": 128,
+#         "epochs": 1000,
+#         "p": 0.2,
+#         "q": 0.001303,
+#         "pq_grid_size": 5,
+#         "patience": 500,
+#     },
+#     ("computer", "gin"): {
+#         "hidden_channels": 128,
+#         "epochs": 1000,
+#         "p": 0.2,
+#         "q": 0.001303,
+#         "pq_grid_size": 11,
+#         "patience": 500,
+#     },
+#     ("computer", "gat"): {
+#         "hidden_channels": 128,
+#         "epochs": 1000,
+#         "p": 0.2,
+#         "q": 0.001303,
+#         "pq_grid_size": 11,
+#         "patience": 500,
+#     },
+#     ("physics", "gcn"): {
+#         "hidden_channels": 64,
+#         "epochs": 1500,
+#         "p": 0.2,
+#         "q": 0.0000834,
+#         "pq_grid_size": 5,
+#     },
+#     ("physics", "gin"): {
+#         "hidden_channels": 64,
+#         "epochs": 1500,
+#         "p": 0.2,
+#         "q": 0.0000834,
+#         "pq_grid_size": 11,
+#     },
+#     ("physics", "gat"): {
+#         "hidden_channels": 64,
+#         "epochs": 1500,
+#         "p": 0.2,
+#         "q": 0.0000834,
+#         "pq_grid_size": 11,
+#     },
+# }
+
 FULL_BATCH_AUTO_DEFAULTS = {
     ("cora", "gcn"): {
         "hidden_channels": 512,
@@ -25,6 +159,13 @@ FULL_BATCH_AUTO_DEFAULTS = {
         "pq_grid_size": 5,
     },
     ("cora", "gin"): {
+        "hidden_channels": 512,
+        "epochs": 500,
+        "p": 0.5,
+        "q": 0.000721,
+        "pq_grid_size": 11,
+    },
+    ("cora", "gat"): {
         "hidden_channels": 256,
         "epochs": 500,
         "p": 0.5,
@@ -34,74 +175,282 @@ FULL_BATCH_AUTO_DEFAULTS = {
     ("citeseer", "gcn"): {
         "hidden_channels": 512,
         "epochs": 500,
-        "p": 0.2,
-        "q": 0.000164,
+        "p": 0.5,
+        "q": 0.00041,
         "pq_grid_size": 5,
     },
     ("citeseer", "gin"): {
         "hidden_channels": 512,
         "epochs": 500,
-        "p": 0.2,
-        "q": 0.000164,
+        "p": 0.5,
+        "q": 0.00041,
+        "pq_grid_size": 11,
+    },
+    ("citeseer", "gat"): {
+        "hidden_channels": 512,
+        "epochs": 500,
+        "p": 0.5,
+        "q": 0.00041,
         "pq_grid_size": 11,
     },
     ("pubmed", "gcn"): {
-        "hidden_channels": 256,
+        "hidden_channels": 512,
         "epochs": 500,
-        "p": 0.2,
-        "q": 0.0000456,
+        "p": 0.5,
+        "q": 0.000114,
         "pq_grid_size": 5,
     },
     ("pubmed", "gin"): {
         "hidden_channels": 512,
         "epochs": 500,
-        "p": 0.2,
-        "q": 0.0000456,
+        "p": 0.5,
+        "q": 0.000114,
+        "pq_grid_size": 11,
+    },
+    ("pubmed", "gat"): {
+        "hidden_channels": 256,
+        "epochs": 500,
+        "p": 0.5,
+        "q": 0.0000114,
         "pq_grid_size": 11,
     },
     ("cs", "gcn"): {
         "hidden_channels": 64,
         "epochs": 1500,
-        "p": 0.2,
-        "q": 0.0000957,
+        "p": 0.5,
+        "q": 0.00023925,
         "pq_grid_size": 5,
     },
     ("cs", "gin"): {
         "hidden_channels": 256,
         "epochs": 1500,
-        "p": 0.2,
-        "q": 0.0000957,
+        "p": 0.5,
+        "q": 0.00023925,
+        "pq_grid_size": 11,
+    },
+    ("cs", "gat"): {
+        "hidden_channels": 128,
+        "epochs": 1500,
+        "p": 0.5,
+        "q": 0.00023925,
         "pq_grid_size": 11,
     },
     ("computer", "gcn"): {
         "hidden_channels": 128,
         "epochs": 1000,
         "p": 0.5,
-        "q": 0.001303,
+        "q": 0.001300138,
         "pq_grid_size": 5,
-        "patience": 200,
+        "patience": 500,
     },
     ("computer", "gin"): {
         "hidden_channels": 128,
         "epochs": 1000,
         "p": 0.5,
-        "q": 0.001303,
+        "q": 0.001300138,
         "pq_grid_size": 11,
-        "patience": 200,
+        "patience": 500,
+    },
+    ("computer", "gat"): {
+        "hidden_channels": 128,
+        "epochs": 1000,
+        "p": 0.5,
+        "q": 0.001300138,
+        "pq_grid_size": 11,
+        "patience": 500,
     },
     ("physics", "gcn"): {
         "hidden_channels": 64,
         "epochs": 1500,
-        "p": 0.2,
-        "q": 0.0000834,
+        "p": 0.5,
+        "q": 0.0002085,
         "pq_grid_size": 5,
     },
     ("physics", "gin"): {
         "hidden_channels": 64,
         "epochs": 1500,
-        "p": 0.2,
-        "q": 0.0000834,
+        "p": 0.5,
+        "q": 0.0002085,
         "pq_grid_size": 11,
+    },
+    ("physics", "gat"): {
+        "hidden_channels": 64,
+        "epochs": 1500,
+        "p": 0.5,
+        "q": 0.0002085,
+        "pq_grid_size": 11,
+    },
+}
+
+# FULL_BATCH_AUTO_DEFAULTS = { # Half and full
+#     ("cora", "gcn"): {
+#         "hidden_channels": 512,
+#         "epochs": 500,
+#         "p": 0.5,
+#         "q": 0.001442,
+#         "pq_grid_size": 5,
+#     },
+#     ("cora", "gin"): {
+#         "hidden_channels": 512,
+#         "epochs": 500,
+#         "p": 0.5,
+#         "q": 0.001442,
+#         "pq_grid_size": 11,
+#     },
+#     ("cora", "gat"): {
+#         "hidden_channels": 256,
+#         "epochs": 500,
+#         "p": 0.5,
+#         "q": 0.001442,
+#         "pq_grid_size": 11,
+#     },
+#     ("citeseer", "gcn"): {
+#         "hidden_channels": 512,
+#         "epochs": 500,
+#         "p": 0.5,
+#         "q": 0.00082,
+#         "pq_grid_size": 5,
+#     },
+#     ("citeseer", "gin"): {
+#         "hidden_channels": 512,
+#         "epochs": 500,
+#         "p": 0.5,
+#         "q": 0.00082,
+#         "pq_grid_size": 11,
+#     },
+#     ("citeseer", "gat"): {
+#         "hidden_channels": 512,
+#         "epochs": 500,
+#         "p": 0.5,
+#         "q": 0.00082,
+#         "pq_grid_size": 11,
+#     },
+#     ("pubmed", "gcn"): {
+#         "hidden_channels": 512,
+#         "epochs": 500,
+#         "p": 0.5,
+#         "q": 0.000228,
+#         "pq_grid_size": 5,
+#     },
+#     ("pubmed", "gin"): {
+#         "hidden_channels": 512,
+#         "epochs": 500,
+#         "p": 0.5,
+#         "q": 0.000228,
+#         "pq_grid_size": 11,
+#     },
+#     ("pubmed", "gat"): {
+#         "hidden_channels": 256,
+#         "epochs": 500,
+#         "p": 0.5,
+#         "q": 0.000228,
+#         "pq_grid_size": 11,
+#     },
+#     ("cs", "gcn"): {
+#         "hidden_channels": 64,
+#         "epochs": 1500,
+#         "p": 0.5,
+#         "q": 0.0004785,
+#         "pq_grid_size": 5,
+#     },
+#     ("cs", "gin"): {
+#         "hidden_channels": 256,
+#         "epochs": 1500,
+#         "p": 0.5,
+#         "q": 0.0004785,
+#         "pq_grid_size": 11,
+#     },
+#     ("cs", "gat"): {
+#         "hidden_channels": 128,
+#         "epochs": 1500,
+#         "p": 0.5,
+#         "q": 0.0004785,
+#         "pq_grid_size": 11,
+#     },
+#     ("computer", "gcn"): { # TODO: Run computer again.
+#         "hidden_channels": 128,
+#         "epochs": 1000,
+#         "p": 0.5,
+#         "q": 0.006515,
+#         "pq_grid_size": 5,
+#         "patience": 500,
+#     },
+#     ("computer", "gin"): {
+#         "hidden_channels": 128,
+#         "epochs": 1000,
+#         "p": 0.5,
+#         "q": 0.006515,
+#         "pq_grid_size": 11,
+#         "patience": 500,
+#     },
+#     ("computer", "gat"): {
+#         "hidden_channels": 128,
+#         "epochs": 1000,
+#         "p": 0.5,
+#         "q": 0.006515,
+#         "pq_grid_size": 11,
+#         "patience": 500,
+#     },
+#     ("physics", "gcn"): {
+#         "hidden_channels": 64,
+#         "epochs": 1500,
+#         "p": 0.5,
+#         "q": 0.000417,
+#         "pq_grid_size": 5,
+#     },
+#     ("physics", "gin"): {
+#         "hidden_channels": 64,
+#         "epochs": 1500,
+#         "p": 0.5,
+#         "q": 0.000417,
+#         "pq_grid_size": 11,
+#     },
+#     ("physics", "gat"): {
+#         "hidden_channels": 64,
+#         "epochs": 1500,
+#         "p": 0.5,
+#         "q": 0.000417,
+#         "pq_grid_size": 11,
+#     },
+# }
+
+
+FULL_BATCH_AUG_DEFAULTS = { # range of search {0.2, 0.3, 0.5, 0.7, 0.9}
+    "cora": {
+        "dropout": 0.7,
+        "dropedge_rate": 0.5,
+        "dropnode_rate": 0.9,
+        "dropmessage_rate": 0.5,
+    },
+    "citeseer": {
+        "dropout": 0.5,
+        "dropedge_rate": 0.2,
+        "dropnode_rate": 0.9,
+        "dropmessage_rate": 0.9,
+    },
+    "pubmed": {
+        "dropout": 0.7,
+        "dropedge_rate": 0.2,
+        "dropnode_rate": 0.2,
+        "dropmessage_rate": 0.9,
+    },
+    "computer": {
+        "dropout": 0.5,
+        "dropedge_rate": 0.5,
+        "dropnode_rate": 0.5,
+        "dropmessage_rate": 0.5,
+    },
+    "cs": {
+        "dropout": 0.3,
+        "dropedge_rate": 0.2,
+        "dropnode_rate": 0.5,
+        "dropmessage_rate": 0.9,
+    },
+    "physics": {
+        "dropout": 0.3,
+        "dropedge_rate": 0.2,
+        "dropnode_rate": 0.2,
+        "dropmessage_rate": 0.2,
     },
 }
 
@@ -145,8 +494,65 @@ def apply_full_batch_auto_defaults(args, explicit_arg_names=None):
     return preset_key, applied, skipped
 
 
+def apply_full_batch_aug_defaults(args, explicit_arg_names=None):
+    explicit_arg_names = explicit_arg_names or set()
+
+    dataset = str(getattr(args, "dataset", "")).lower().strip()
+    aug_tech = str(getattr(args, "aug_tech", "")).lower().strip()
+    preset = FULL_BATCH_AUG_DEFAULTS.get(dataset)
+
+    if preset is None:
+        return None, {}, {}
+
+    applied = {}
+    skipped = {}
+
+    def set_if_not_explicit(field_name, field_value):
+        if field_name in explicit_arg_names:
+            skipped[field_name] = getattr(args, field_name)
+            return
+        setattr(args, field_name, field_value)
+        applied[field_name] = field_value
+
+    if aug_tech == "none":
+        set_if_not_explicit("dropout", 0.0)
+        set_if_not_explicit("aug_mode", "none")
+    elif aug_tech == "dropout":
+        set_if_not_explicit("dropout", preset["dropout"])
+        set_if_not_explicit("aug_mode", "none")
+    elif aug_tech == "dropedge":
+        set_if_not_explicit("p", preset["dropedge_rate"])
+        set_if_not_explicit("q", 0.0)
+        set_if_not_explicit("aug_mode", "drop")
+        set_if_not_explicit("dropout", 0.0)
+    elif aug_tech == "dropnode":
+        set_if_not_explicit("dropnode_rate", preset["dropnode_rate"])
+        set_if_not_explicit("aug_mode", "none")
+        set_if_not_explicit("dropout", 0.0)
+    elif aug_tech == "dropmessage":
+        set_if_not_explicit("dropmessage_rate", preset["dropmessage_rate"])
+        set_if_not_explicit("aug_mode", "none")
+        set_if_not_explicit("dropout", 0.0)
+    elif aug_tech == "rade":
+        return (dataset, aug_tech), applied, skipped
+    else:
+        return None, applied, skipped
+
+    # Non-RADE baselines must not use RADE correction or p/q tuning. Force these
+    # even when a shared W&B sweep passes RADE-only flags.
+    args.ep_correction = False
+    args.pq_gradnorm = False
+    applied["ep_correction"] = False
+    applied["pq_gradnorm"] = False
+
+    return (dataset, aug_tech), applied, skipped
+
+
 def parse_method(args, num_nodes, num_classes, in_dim, device):
-    ep_emp_average_mode = "ema" if bool(getattr(args, "pq_gradnorm", False)) else "running_mean"
+    ep_emp_average_mode = getattr(args, "ep_emp_average_mode", None)
+    if ep_emp_average_mode is None:
+        ep_emp_average_mode = "ema" if bool(getattr(args, "pq_gradnorm", False)) else "running_mean"
+    ep_emp_average_mode = str(ep_emp_average_mode).lower().strip()
     model = MPNNs(
         in_channels=in_dim,
         hidden_channels=args.hidden_channels,
@@ -167,6 +573,16 @@ def parse_method(args, num_nodes, num_classes, in_dim, device):
         rade_variant=args.rade_variant,
         linear=bool(getattr(args, "linear", False)),
         aug_tech=str(getattr(args, "aug_tech", "rade")),
+        gat_heads=int(getattr(args, "gat_heads", 1)),
+        gat_concat=bool(getattr(args, "gat_concat", True)),
+        gat_negative_slope=float(getattr(args, "gat_negative_slope", 0.2)),
+        gat_moment_chunk_size=int(getattr(args, "gat_moment_chunk_size", 1024)),
+        gat_moment_mode=str(getattr(args, "gat_moment_mode", "exact")),
+        gat_moment_samples=int(getattr(args, "gat_moment_samples", 256)),
+        gat_nonedge_samples=int(getattr(args, "gat_nonedge_samples", 256)),
+        gat_bernoulli_samples=int(getattr(args, "gat_bernoulli_samples", 64)),
+        gat_moment_seed=int(getattr(args, "gat_moment_seed", 0)),
+        gat_ep_corr_clip=float(getattr(args, "gat_ep_corr_clip", 2.0)),
     ).to(device)
     return model
 
@@ -176,7 +592,7 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--dataset",
         type=str,
-        default="cora",
+        default="physics",
         choices=["cora", "citeseer", "pubmed", "cs", "computer", "physics", "flickr", "ogbn-arxiv"],
         help="Dataset name (must match nc_datasets_simple.py)",
     )
@@ -230,11 +646,11 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--gnn",
         type=str,
-        default="gin",
-        choices=["gcn", "gin", "sgc", "gin-linear"],
-        help="Backbone: gcn/gin are standard. sgc routes to linear-GCN. gin-linear routes to linear-GIN."
+        default="gcn",
+        choices=["gcn", "gin", "gat", "sgc", "gin-linear"],
+        help="Backbone: gcn/gin/gat are standard. sgc routes to linear-GCN. gin-linear routes to linear-GIN."
     )
-    parser.add_argument("--hidden_channels", type=int, default=256)
+    parser.add_argument("--hidden_channels", type=int, default=512)
     parser.add_argument("--local_layers", type=int, default=2)
     parser.add_argument("--pre_linear", type=str2bool, nargs="?", const=True, default=True)
     parser.add_argument("--res", action="store_true")
@@ -247,7 +663,70 @@ def parser_add_main_args(parser):
         nargs="?",
         const=True,
         default=False,
-        help="Use strictly linear model: disables ReLU/Dropout/BN/LN and makes GIN MLP linear.",
+        help="Use strictly linear model for supported backbones: disables ReLU/Dropout/BN/LN "
+             "and makes GIN MLP linear. Unavailable with --gnn gat.",
+    )
+    parser.add_argument(
+        "--gat_heads",
+        type=int,
+        default=1,
+        help="Number of GAT attention heads. GAT PQ-GradNorm variance currently requires gat_heads=1.",
+    )
+    parser.add_argument(
+        "--gat_concat",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="Concatenate GAT heads. If false, heads are averaged.",
+    )
+    parser.add_argument("--gat_negative_slope", type=float, default=0.2, help="LeakyReLU slope for GAT attention.")
+    parser.add_argument(
+        "--gat_moment_chunk_size",
+        type=int,
+        default=1024,
+        help="Source-node chunk size for exact full-batch GAT attention moment computations.",
+    )
+    parser.add_argument(
+        "--gat_moment_mode",
+        type=str,
+        default="sampled",
+        choices=["exact", "sampled", "bernoulli"],
+        help=(
+            "GAT attention moment computation mode. exact uses chunked all-pairs sums; "
+            "sampled uses sampled-index denominator/non-edge estimates; bernoulli samples "
+            "perturbed denominator masks under the current p,q."
+        ),
+    )
+    parser.add_argument(
+        "--gat_moment_samples",
+        type=int,
+        default=256,
+        help="Candidate source samples per target for sampled GAT denominator moments.",
+    )
+    parser.add_argument(
+        "--gat_nonedge_samples",
+        type=int,
+        default=256,
+        help="Candidate source samples per target for sampled GAT non-edge centering, OFS inference, and variance sums.",
+    )
+    parser.add_argument(
+        "--gat_bernoulli_samples",
+        type=int,
+        default=64,
+        help="Bernoulli-mask Monte Carlo samples per candidate pair for GAT denominator moments.",
+    )
+    parser.add_argument(
+        "--gat_moment_seed",
+        type=int,
+        default=0,
+        help="Deterministic sampling seed for sampled GAT moment estimates.",
+    )
+    parser.add_argument(
+        "--gat_ep_corr_clip",
+        type=float,
+        default=0.0,
+        help="GAT RADE EP correction multiplier cap. Use 0 to disable clipping.",
     )
 
     # optimization
@@ -269,12 +748,14 @@ def parser_add_main_args(parser):
         "--aug_tech",
         type=str,
         default="rade",
-        choices=["rade", "dropmessage", "dropnode", "none"],
+        choices=["rade", "dropout", "dropedge", "dropmessage", "dropnode", "none"],
         help="Which augmentation family to use. "
              "'rade' uses the edge drop/add RADE pipeline. "
+             "'dropout' uses feature dropout without graph/message/node augmentation. "
+             "'dropedge' drops clean edges without RADE correction. "
              "'dropmessage' uses message dropout. "
              "'dropnode' uses node-wise feature masking. "
-             "'none' is clean training.",
+             "'none' is clean training without dropout or augmentation.",
     )
 
     parser.add_argument(
@@ -295,20 +776,20 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--aug_mode",
         type=str,
-        default="add",
+        default="both",
         choices=["none", "drop", "add", "both"],
         help="Per-epoch graph perturbation mode.",
     )
     parser.add_argument(
         "--p",
         type=float,
-        default=0.2,
+        default=0.5,
         help="Edge-drop probability for clean edges (i,j) in E.",
     )
     parser.add_argument(
         "--q",
         type=float,
-        default=0.0000456,
+        default=0.000721,
         help="Non-edge-add probability for clean non-edges (i,j) not in E.",
     )
 
@@ -320,6 +801,16 @@ def parser_add_main_args(parser):
         default=True,
         help="Use expectation-preserving aggregation correction for RADE.",
     )
+
+    parser.add_argument(
+        "--pq_gradnorm",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="Enable epoch-wise GradNorm matching to adapt (p,q).",
+    )
+
     parser.add_argument(
         "--ep_expectation_mode",
         type=str,
@@ -336,10 +827,25 @@ def parser_add_main_args(parser):
         help="EMA update weight for the empirical expectation ablation.",
     )
     parser.add_argument(
+        "--ep_emp_average_mode",
+        type=str,
+        default="ema",
+        choices=["ema", "running_mean"],
+        help="Averaging mode for empirical EP moment buffers. Defaults to ema with pq_gradnorm, otherwise running_mean.",
+    )
+    parser.add_argument(
         "--ep_emp_eps",
         type=float,
         default=1e-12,
         help="Small epsilon used to clamp empirical expectation denominators.",
+    )
+    parser.add_argument(
+        "--skip_nonfinite_grad_step",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="Skip the optimizer step when the training loss or any model gradient is nonfinite.",
     )
 
     parser.add_argument(
@@ -364,14 +870,6 @@ def parser_add_main_args(parser):
     )
 
     # ---- GradNorm p/q tuning (epoch-wise) ----
-    parser.add_argument(
-        "--pq_gradnorm",
-        type=str2bool,
-        nargs="?",
-        const=True,
-        default=True,
-        help="Enable epoch-wise GradNorm matching to adapt (p,q).",
-    )
 
     parser.add_argument(
         "--pq_search_method",
@@ -399,7 +897,7 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--pq_adam_lr",
         type=float,
-        default=0.01,
+        default=0.001,
         help="Learning rate for the Adam-based p/q controller when --pq_search_method=adam.",
     )
     parser.add_argument(
@@ -429,9 +927,44 @@ def parser_add_main_args(parser):
         help="For online PQ-GradNorm controllers, optimize rho = q / d directly and convert back to q for G_reg.",
     )
     parser.add_argument(
+        "--pq_cap_p",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Enable an explicit upper bound on the PQ-GradNorm deletion probability p.",
+    )
+    parser.add_argument(
+        "--pq_p_max",
+        type=float,
+        default=0.9,
+        help="Maximum p used when --pq_cap_p is enabled. Must be in [0, 1).",
+    )
+    parser.add_argument(
+        "--pq_cap_rho",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Enable an explicit upper bound on rho = q / graph_density for PQ-GradNorm.",
+    )
+    parser.add_argument(
+        "--pq_rho_max",
+        type=float,
+        default=0.2,
+        help="Maximum rho used when --pq_cap_rho is enabled. Must be >= 0.",
+    )
+    parser.add_argument(
+        "--pq_deletion_penalty_lambda",
+        type=float,
+        default=0.0,
+        help="Coefficient lambda_p for the soft edge-deletion penalty lambda_p * p^2 "
+             "in the full-batch PQ-GradNorm objective. Default 0 disables the penalty.",
+    )
+    parser.add_argument(
         "--pq_densification_penalty_lambda",
         type=float,
-        default=1,
+        default=0.1,
         help="Coefficient lambda for the soft expected-densification penalty "
              "applied to rho = q / d in the full-batch PQ-GradNorm objective, "
              "where d = |E| / (|E| + |Ebar|) is the undirected graph density.",
@@ -501,7 +1034,7 @@ def parser_add_main_args(parser):
                         help="EMA smoothing for p,q updates in search-based PQ tuning (grid/powell/newton only).")
     parser.add_argument("--pq_update_every", type=int, default=1, help="Update (p,q) every k epochs.")
     parser.add_argument("--pq_warmup_epochs", type=int, default=0, help="Number of initial epochs to skip pq updates.")
-    parser.add_argument("--pq_eps", type=float, default=1e-3, help="Small epsilon for log/denominator stabilizers.")
+    parser.add_argument("--pq_eps", type=float, default=1e-12, help="Small epsilon for log/denominator stabilizers.")
     parser.add_argument("--pq_seed", type=int, default=0, help="Seed for selecting the subset of nodes for pq selection.")
 
     parser.add_argument(

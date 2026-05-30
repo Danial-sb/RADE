@@ -1,11 +1,11 @@
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
-from torch_geometric.nn import GCNConv, GINConv
+from torch_geometric.nn import GATConv, GCNConv, GINConv
 from typing import Optional, Union, List
 
-from rade_convs import GraphCache, RADEGCNConv, RADEGINConv
-from dropmessage_convs import DropMessageGCNConv, DropMessageGINConv
+from rade_convs import GraphCache, RADEGATConv, RADEGCNConv, RADEGINConv
+from dropmessage_convs import DropMessageGATConv, DropMessageGCNConv, DropMessageGINConv
 
 
 EdgeIndexObj = Union[torch.Tensor, List[torch.Tensor]]
@@ -33,10 +33,20 @@ class MPNNs(torch.nn.Module):
         rade_variant: str = "rade-of",
         linear: bool = False,
         aug_tech: str = "rade",
+        gat_heads: int = 1,
+        gat_concat: bool = True,
+        gat_negative_slope: float = 0.2,
+        gat_moment_chunk_size: int = 1024,
+        gat_moment_mode: str = "exact",
+        gat_moment_samples: int = 256,
+        gat_nonedge_samples: int = 256,
+        gat_bernoulli_samples: int = 64,
+        gat_moment_seed: int = 0,
+        gat_ep_corr_clip: float = 2.0,
     ):
         super(MPNNs, self).__init__()
 
-        assert gnn in ("gcn", "gin"), "gnn must be 'gcn' or 'gin'"
+        assert gnn in ("gcn", "gin", "gat"), "gnn must be 'gcn', 'gin', or 'gat'"
         assert local_layers >= 1, "local_layers must be >= 1"
         if rade_variant not in ("rade-of", "rade-ofs"):
             raise ValueError(
@@ -49,6 +59,12 @@ class MPNNs(torch.nn.Module):
             )
 
         self.linear = bool(linear)
+        if gnn == "gat" and self.linear:
+            raise ValueError(
+                "linear=True is unavailable for gnn='gat' because GAT attention is "
+                "feature-dependent and nonlinear. Use linear=False for GAT, or use "
+                "the sgc / gin-linear CLI backbones for strict linear baselines."
+            )
 
         # Enforce strict linearity at the architecture level
         if self.linear:
@@ -66,6 +82,16 @@ class MPNNs(torch.nn.Module):
         self.bn = bool(bn)
         self.jk = bool(jk)
         self.gnn = gnn
+        self.gat_heads = int(gat_heads)
+        self.gat_concat = bool(gat_concat)
+        self.gat_negative_slope = float(gat_negative_slope)
+        self.gat_moment_chunk_size = int(gat_moment_chunk_size)
+        self.gat_moment_mode = str(gat_moment_mode).lower().strip()
+        self.gat_moment_samples = int(gat_moment_samples)
+        self.gat_nonedge_samples = int(gat_nonedge_samples)
+        self.gat_bernoulli_samples = int(gat_bernoulli_samples)
+        self.gat_moment_seed = int(gat_moment_seed)
+        self.gat_ep_corr_clip = max(0.0, float(gat_ep_corr_clip))
 
         self.ep_correction = bool(ep_correction)
         self.ep_expectation_mode = str(ep_expectation_mode).lower().strip()
@@ -75,9 +101,9 @@ class MPNNs(torch.nn.Module):
         self.rade_variant = str(rade_variant)
 
         self.aug_tech = str(aug_tech).lower().strip()
-        if self.aug_tech not in {"rade", "dropmessage", "dropnode", "none"}:
+        if self.aug_tech not in {"rade", "dropout", "dropedge", "dropmessage", "dropnode", "none"}:
             raise ValueError(
-                f"aug_tech must be one of {{rade, dropmessage, dropnode, none}}. Got {self.aug_tech}"
+                f"aug_tech must be one of {{rade, dropout, dropedge, dropmessage, dropnode, none}}. Got {self.aug_tech}"
             )
 
         self.lin_in = torch.nn.Linear(in_channels, hidden_channels) if self.pre_linear else None
@@ -124,7 +150,7 @@ class MPNNs(torch.nn.Module):
                 else:
                     conv = GINConv(mlp)
 
-            else:
+            elif gnn == "gcn":
                 if self.aug_tech == "rade":
                     conv = RADEGCNConv(
                         in_dim,
@@ -142,6 +168,59 @@ class MPNNs(torch.nn.Module):
                     conv = DropMessageGCNConv(in_dim, out_dim, bias=True)
                 else:
                     conv = GCNConv(in_dim, out_dim, cached=False, normalize=True)
+            else:
+                if self.aug_tech == "rade":
+                    conv = RADEGATConv(
+                        in_dim,
+                        out_dim,
+                        heads=self.gat_heads,
+                        concat=self.gat_concat,
+                        negative_slope=self.gat_negative_slope,
+                        bias=True,
+                        rade_variant=self.rade_variant,
+                        ep_correction=self.ep_correction,
+                        ep_expectation_mode=self.ep_expectation_mode,
+                        ep_emp_eps=self.ep_emp_eps,
+                        moment_chunk_size=self.gat_moment_chunk_size,
+                        moment_mode=self.gat_moment_mode,
+                        moment_samples=self.gat_moment_samples,
+                        nonedge_samples=self.gat_nonedge_samples,
+                        bernoulli_samples=self.gat_bernoulli_samples,
+                        moment_seed=self.gat_moment_seed,
+                        ep_corr_clip=self.gat_ep_corr_clip,
+                    )
+                elif self.aug_tech == "dropmessage":
+                    if self.gat_concat and out_dim % self.gat_heads != 0:
+                        raise ValueError(
+                            "For GAT concat=True, hidden_channels must be divisible by gat_heads. "
+                            f"Got hidden_channels={out_dim}, gat_heads={self.gat_heads}."
+                        )
+                    gat_out = out_dim // self.gat_heads if self.gat_concat else out_dim
+                    conv = DropMessageGATConv(
+                        in_dim,
+                        gat_out,
+                        heads=self.gat_heads,
+                        concat=self.gat_concat,
+                        negative_slope=self.gat_negative_slope,
+                        bias=True,
+                    )
+                else:
+                    if self.gat_concat and out_dim % self.gat_heads != 0:
+                        raise ValueError(
+                            "For GAT concat=True, hidden_channels must be divisible by gat_heads. "
+                            f"Got hidden_channels={out_dim}, gat_heads={self.gat_heads}."
+                        )
+                    gat_out = out_dim // self.gat_heads if self.gat_concat else out_dim
+                    conv = GATConv(
+                        in_dim,
+                        gat_out,
+                        heads=self.gat_heads,
+                        concat=self.gat_concat,
+                        negative_slope=self.gat_negative_slope,
+                        dropout=0.0,
+                        add_self_loops=False,
+                        bias=True,
+                    )
 
             self.local_convs.append(conv)
 
@@ -202,8 +281,8 @@ class MPNNs(torch.nn.Module):
                 if len(obj) != L:
                     raise ValueError(f"Expected list length={L}, got {len(obj)}")
                 t = obj[i]
-                return None if (t is None or t.numel() == 0) else t
-            return None if obj.numel() == 0 else obj
+                return None if t is None else t
+            return obj
 
         for i, conv in enumerate(self.local_convs):
             if hasattr(conv, "update_ep_stats"):
@@ -273,8 +352,8 @@ class MPNNs(torch.nn.Module):
                 if len(obj) != L:
                     raise ValueError(f"Expected list length={L}, got {len(obj)}")
                 t = obj[i]
-                return None if (t is None or t.numel() == 0) else t
-            return None if obj.numel() == 0 else obj
+                return None if t is None else t
+            return obj
 
         x_final = None
 

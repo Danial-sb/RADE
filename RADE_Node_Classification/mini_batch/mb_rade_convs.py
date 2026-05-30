@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 from torch_geometric.nn.inits import reset
 
+from ..full_batch.rade_convs import RADEGATConv as _RADEGATConvBase
+
 
 def _scatter_add_rows(values: torch.Tensor, index: torch.Tensor, dim_size: int) -> torch.Tensor:
     out = torch.zeros((dim_size, values.size(1)), device=values.device, dtype=values.dtype)
@@ -130,6 +132,19 @@ class BatchGraphCache:
         return num / den
 
 
+class RADEGATConvMB(_RADEGATConvBase):
+    """
+    Mini-batch/local-subgraph GAT RADE operator.
+
+    The mini-batch cache exposes the same clean directed-edge and node-count
+    contract as the full-batch cache, so the full-batch attention moment
+    implementation applies unchanged over the sampled local node set.
+    """
+
+    def set_graph(self, graph_cache: BatchGraphCache) -> None:
+        self.graph_cache = graph_cache
+
+
 def _delta_E_inv_caseA(deg_clean: torch.Tensor, comp_size: torch.Tensor, p: float, q: float, eps: float = 1e-12) -> torch.Tensor:
     d_minus = (deg_clean - 1.0).clamp(min=0.0)
     mu = (1.0 - p) * d_minus + q * comp_size + 2.0
@@ -197,14 +212,20 @@ class RADEGCNConvMB(nn.Module):
         self.register_buffer("emp_clean_edge_dst", torch.empty(0, dtype=torch.long))
         self.register_buffer("emp_clean_edge_raw", torch.empty(0, dtype=torch.float32))
         self.register_buffer("emp_clean_edge_scale", torch.tensor(1.0, dtype=torch.float32))
+        self.register_buffer("emp_clean_edge_sq_raw", torch.empty(0, dtype=torch.float32))
+        self.register_buffer("emp_clean_edge_sq_scale", torch.tensor(1.0, dtype=torch.float32))
 
         self.register_buffer("emp_self_raw", torch.empty(0, dtype=torch.float32))
         self.register_buffer("emp_self_scale", torch.tensor(1.0, dtype=torch.float32))
+        self.register_buffer("emp_self_sq_raw", torch.empty(0, dtype=torch.float32))
+        self.register_buffer("emp_self_sq_scale", torch.tensor(1.0, dtype=torch.float32))
 
         self.register_buffer("emp_nonedge_src", torch.empty(0, dtype=torch.long))
         self.register_buffer("emp_nonedge_dst", torch.empty(0, dtype=torch.long))
         self.register_buffer("emp_nonedge_raw", torch.empty(0, dtype=torch.float32))
         self.register_buffer("emp_nonedge_scale", torch.tensor(1.0, dtype=torch.float32))
+        self.register_buffer("emp_nonedge_sq_raw", torch.empty(0, dtype=torch.float32))
+        self.register_buffer("emp_nonedge_sq_scale", torch.tensor(1.0, dtype=torch.float32))
         self.register_buffer("emp_num_updates", torch.tensor(0, dtype=torch.long))
 
         self._emp_clean_edge_lookup: dict[int, int] = {}
@@ -238,16 +259,22 @@ class RADEGCNConvMB(nn.Module):
         assert self.graph_cache is not None, "set_graph(...) must be called before empirical EP state updates."
         total = int(self.graph_cache.global_num_nodes_total)
         device = self.emp_self_scale.device
-        if self.emp_self_raw.numel() == total:
+        if self.emp_self_raw.numel() == total and self.emp_self_sq_raw.numel() == total:
             return
         if self.emp_self_raw.numel() == 0:
             self.emp_self_raw = torch.zeros((total,), dtype=torch.float32, device=device)
-            return
+        if self.emp_self_sq_raw.numel() == 0:
+            self.emp_self_sq_raw = torch.zeros((total,), dtype=torch.float32, device=device)
         if self.emp_self_raw.numel() < total:
             pad = torch.zeros((total - self.emp_self_raw.numel(),), dtype=torch.float32, device=device)
             self.emp_self_raw = torch.cat([self.emp_self_raw, pad], dim=0)
-            return
-        self.emp_self_raw = self.emp_self_raw[:total]
+        elif self.emp_self_raw.numel() > total:
+            self.emp_self_raw = self.emp_self_raw[:total]
+        if self.emp_self_sq_raw.numel() < total:
+            pad = torch.zeros((total - self.emp_self_sq_raw.numel(),), dtype=torch.float32, device=device)
+            self.emp_self_sq_raw = torch.cat([self.emp_self_sq_raw, pad], dim=0)
+        elif self.emp_self_sq_raw.numel() > total:
+            self.emp_self_sq_raw = self.emp_self_sq_raw[:total]
 
     def set_graph(self, graph_cache: BatchGraphCache) -> None:
         self.graph_cache = graph_cache
@@ -260,6 +287,8 @@ class RADEGCNConvMB(nn.Module):
             torch.nn.init.zeros_(self.bias)
 
     def _emp_update_weights(self) -> tuple[float, float]:
+        if int(self.emp_num_updates.item()) <= 0:
+            return 0.0, 1.0
         if self.ep_emp_average_mode == "ema":
             beta = float(self.ep_emp_beta)
             if beta <= 0.0:
@@ -279,18 +308,25 @@ class RADEGCNConvMB(nn.Module):
         self.emp_clean_edge_dst = torch.empty(0, dtype=torch.long, device=self.emp_clean_edge_dst.device)
         self.emp_clean_edge_raw = torch.empty(0, dtype=torch.float32, device=self.emp_clean_edge_raw.device)
         self.emp_clean_edge_scale.fill_(1.0)
+        self.emp_clean_edge_sq_raw = torch.empty(0, dtype=torch.float32, device=self.emp_clean_edge_sq_raw.device)
+        self.emp_clean_edge_sq_scale.fill_(1.0)
 
         if self.graph_cache is not None:
             self._ensure_self_storage()
             self.emp_self_raw.zero_()
+            self.emp_self_sq_raw.zero_()
         else:
             self.emp_self_raw = torch.empty(0, dtype=torch.float32, device=self.emp_self_raw.device)
+            self.emp_self_sq_raw = torch.empty(0, dtype=torch.float32, device=self.emp_self_sq_raw.device)
         self.emp_self_scale.fill_(1.0)
+        self.emp_self_sq_scale.fill_(1.0)
 
         self.emp_nonedge_src = torch.empty(0, dtype=torch.long, device=self.emp_nonedge_src.device)
         self.emp_nonedge_dst = torch.empty(0, dtype=torch.long, device=self.emp_nonedge_dst.device)
         self.emp_nonedge_raw = torch.empty(0, dtype=torch.float32, device=self.emp_nonedge_raw.device)
         self.emp_nonedge_scale.fill_(1.0)
+        self.emp_nonedge_sq_raw = torch.empty(0, dtype=torch.float32, device=self.emp_nonedge_sq_raw.device)
+        self.emp_nonedge_sq_scale.fill_(1.0)
         self.emp_num_updates.zero_()
         self._rebuild_sparse_lookup()
 
@@ -303,15 +339,22 @@ class RADEGCNConvMB(nn.Module):
 
         src_list = src.detach().cpu().tolist()
         dst_list = dst.detach().cpu().tolist()
-        val_list = (float(new_mult) * values.detach().to(dtype=torch.float32) / scale).cpu().tolist()
+        values_detached = values.detach().to(dtype=torch.float32)
+        val_list = (float(new_mult) * values_detached / scale).cpu().tolist()
+        sq_scale = float(self.emp_clean_edge_sq_scale.item())
+        if sq_scale <= 0.0:
+            raise RuntimeError("emp_clean_edge_sq_scale must be positive when beta < 1.")
+        sq_val_list = (float(new_mult) * values_detached.square() / sq_scale).cpu().tolist()
 
         new_src = []
         new_dst = []
         new_vals = []
+        new_sq_vals = []
         existing_idx = []
         existing_vals = []
+        existing_sq_vals = []
 
-        for src_i, dst_i, val_i in zip(src_list, dst_list, val_list):
+        for src_i, dst_i, val_i, sq_val_i in zip(src_list, dst_list, val_list, sq_val_list):
             key = self._edge_key(src_i, dst_i)
             idx = self._emp_clean_edge_lookup.get(key)
             if idx is None:
@@ -320,14 +363,18 @@ class RADEGCNConvMB(nn.Module):
                 new_src.append(int(src_i))
                 new_dst.append(int(dst_i))
                 new_vals.append(float(val_i))
+                new_sq_vals.append(float(sq_val_i))
             else:
                 existing_idx.append(int(idx))
                 existing_vals.append(float(val_i))
+                existing_sq_vals.append(float(sq_val_i))
 
         if existing_idx:
             idx_t = torch.tensor(existing_idx, dtype=torch.long, device=self.emp_clean_edge_raw.device)
             val_t = torch.tensor(existing_vals, dtype=torch.float32, device=self.emp_clean_edge_raw.device)
             self.emp_clean_edge_raw.index_add_(0, idx_t, val_t)
+            sq_val_t = torch.tensor(existing_sq_vals, dtype=torch.float32, device=self.emp_clean_edge_sq_raw.device)
+            self.emp_clean_edge_sq_raw.index_add_(0, idx_t.to(self.emp_clean_edge_sq_raw.device), sq_val_t)
 
         if new_src:
             device = self.emp_clean_edge_raw.device
@@ -343,6 +390,10 @@ class RADEGCNConvMB(nn.Module):
                 [self.emp_clean_edge_raw, torch.tensor(new_vals, dtype=torch.float32, device=device)],
                 dim=0,
             )
+            self.emp_clean_edge_sq_raw = torch.cat(
+                [self.emp_clean_edge_sq_raw, torch.tensor(new_sq_vals, dtype=torch.float32, device=self.emp_clean_edge_sq_raw.device)],
+                dim=0,
+            )
 
     def _append_nonedge_raw(self, src: torch.Tensor, dst: torch.Tensor, values: torch.Tensor, *, new_mult: float) -> None:
         if src.numel() == 0:
@@ -353,15 +404,22 @@ class RADEGCNConvMB(nn.Module):
 
         src_list = src.detach().cpu().tolist()
         dst_list = dst.detach().cpu().tolist()
-        val_list = (float(new_mult) * values.detach().to(dtype=torch.float32) / scale).cpu().tolist()
+        values_detached = values.detach().to(dtype=torch.float32)
+        val_list = (float(new_mult) * values_detached / scale).cpu().tolist()
+        sq_scale = float(self.emp_nonedge_sq_scale.item())
+        if sq_scale <= 0.0:
+            raise RuntimeError("emp_nonedge_sq_scale must be positive when beta < 1.")
+        sq_val_list = (float(new_mult) * values_detached.square() / sq_scale).cpu().tolist()
 
         new_src = []
         new_dst = []
         new_vals = []
+        new_sq_vals = []
         existing_idx = []
         existing_vals = []
+        existing_sq_vals = []
 
-        for src_i, dst_i, val_i in zip(src_list, dst_list, val_list):
+        for src_i, dst_i, val_i, sq_val_i in zip(src_list, dst_list, val_list, sq_val_list):
             key = self._edge_key(src_i, dst_i)
             idx = self._emp_nonedge_lookup.get(key)
             if idx is None:
@@ -370,14 +428,18 @@ class RADEGCNConvMB(nn.Module):
                 new_src.append(int(src_i))
                 new_dst.append(int(dst_i))
                 new_vals.append(float(val_i))
+                new_sq_vals.append(float(sq_val_i))
             else:
                 existing_idx.append(int(idx))
                 existing_vals.append(float(val_i))
+                existing_sq_vals.append(float(sq_val_i))
 
         if existing_idx:
             idx_t = torch.tensor(existing_idx, dtype=torch.long, device=self.emp_nonedge_raw.device)
             val_t = torch.tensor(existing_vals, dtype=torch.float32, device=self.emp_nonedge_raw.device)
             self.emp_nonedge_raw.index_add_(0, idx_t, val_t)
+            sq_val_t = torch.tensor(existing_sq_vals, dtype=torch.float32, device=self.emp_nonedge_sq_raw.device)
+            self.emp_nonedge_sq_raw.index_add_(0, idx_t.to(self.emp_nonedge_sq_raw.device), sq_val_t)
 
         if new_src:
             device = self.emp_nonedge_raw.device
@@ -391,6 +453,10 @@ class RADEGCNConvMB(nn.Module):
             )
             self.emp_nonedge_raw = torch.cat(
                 [self.emp_nonedge_raw, torch.tensor(new_vals, dtype=torch.float32, device=device)],
+                dim=0,
+            )
+            self.emp_nonedge_sq_raw = torch.cat(
+                [self.emp_nonedge_sq_raw, torch.tensor(new_sq_vals, dtype=torch.float32, device=self.emp_nonedge_sq_raw.device)],
                 dim=0,
             )
 
@@ -454,8 +520,11 @@ class RADEGCNConvMB(nn.Module):
             return
 
         device = self.graph_cache.deg_clean.device
+        edge_index_keep_stats = edge_index_keep
+        if edge_index_keep_stats is None and edge_index_add is not None:
+            edge_index_keep_stats = self.graph_cache.edge_index_clean_dir
         row_k, col_k, gamma_k, row_a, col_a, gamma_a, gamma_self = self._gcn_sample_coeffs(
-            edge_index_keep=edge_index_keep,
+            edge_index_keep=edge_index_keep_stats,
             edge_index_add=edge_index_add,
             device=device,
             dtype=torch.float32,
@@ -472,41 +541,65 @@ class RADEGCNConvMB(nn.Module):
             self.emp_clean_edge_dst = torch.empty(0, dtype=torch.long, device=self.emp_clean_edge_dst.device)
             self.emp_clean_edge_raw = torch.empty(0, dtype=torch.float32, device=self.emp_clean_edge_raw.device)
             self.emp_clean_edge_scale.fill_(1.0)
+            self.emp_clean_edge_sq_raw = torch.empty(0, dtype=torch.float32, device=self.emp_clean_edge_sq_raw.device)
+            self.emp_clean_edge_sq_scale.fill_(1.0)
             self._emp_clean_edge_lookup = {}
             self._append_clean_edge_raw(src_k, dst_k, gamma_k, new_mult=1.0)
 
             self.emp_self_scale.fill_(1.0)
+            self.emp_self_sq_scale.fill_(1.0)
             self.emp_self_raw.zero_()
+            self.emp_self_sq_raw.zero_()
             if global_ids.numel() > 0:
+                gamma_self_detached = gamma_self.detach().to(self.emp_self_raw.device, dtype=torch.float32)
                 self.emp_self_raw.index_copy_(
                     0,
                     global_ids.to(self.emp_self_raw.device, dtype=torch.long),
-                    gamma_self.detach().to(self.emp_self_raw.device, dtype=torch.float32),
+                    gamma_self_detached,
+                )
+                self.emp_self_sq_raw.index_copy_(
+                    0,
+                    global_ids.to(self.emp_self_sq_raw.device, dtype=torch.long),
+                    gamma_self_detached.square().to(self.emp_self_sq_raw.device),
                 )
 
             self.emp_nonedge_src = torch.empty(0, dtype=torch.long, device=self.emp_nonedge_src.device)
             self.emp_nonedge_dst = torch.empty(0, dtype=torch.long, device=self.emp_nonedge_dst.device)
             self.emp_nonedge_raw = torch.empty(0, dtype=torch.float32, device=self.emp_nonedge_raw.device)
             self.emp_nonedge_scale.fill_(1.0)
+            self.emp_nonedge_sq_raw = torch.empty(0, dtype=torch.float32, device=self.emp_nonedge_sq_raw.device)
+            self.emp_nonedge_sq_scale.fill_(1.0)
             self._emp_nonedge_lookup = {}
             self._append_nonedge_raw(src_a, dst_a, gamma_a, new_mult=1.0)
             self.emp_num_updates.add_(1)
             return
 
         self.emp_clean_edge_scale.mul_(old_mult)
+        self.emp_clean_edge_sq_scale.mul_(old_mult)
         self._append_clean_edge_raw(src_k, dst_k, gamma_k, new_mult=new_mult)
 
         self.emp_self_scale.mul_(old_mult)
+        self.emp_self_sq_scale.mul_(old_mult)
+        gamma_self_detached = gamma_self.detach().to(self.emp_self_raw.device, dtype=torch.float32)
         upd_self = (
-            new_mult * gamma_self.detach().to(self.emp_self_raw.device, dtype=torch.float32)
+            new_mult * gamma_self_detached
         ) / self.emp_self_scale
         self.emp_self_raw.index_add_(
             0,
             global_ids.to(self.emp_self_raw.device, dtype=torch.long),
             upd_self,
         )
+        upd_self_sq = (
+            new_mult * gamma_self_detached.square().to(self.emp_self_sq_raw.device)
+        ) / self.emp_self_sq_scale
+        self.emp_self_sq_raw.index_add_(
+            0,
+            global_ids.to(self.emp_self_sq_raw.device, dtype=torch.long),
+            upd_self_sq,
+        )
 
         self.emp_nonedge_scale.mul_(old_mult)
+        self.emp_nonedge_sq_scale.mul_(old_mult)
         self._append_nonedge_raw(src_a, dst_a, gamma_a, new_mult=new_mult)
         self.emp_num_updates.add_(1)
 
@@ -586,6 +679,96 @@ class RADEGCNConvMB(nn.Module):
 
         return out
 
+    def empirical_gcn_variance_proxy(
+        self,
+        m: torch.Tensor,
+        m_sq: torch.Tensor,
+        *,
+        p: float,
+        q: float,
+        eps: float,
+    ) -> Optional[torch.Tensor]:
+        if self.ep_expectation_mode != "empirical_ema":
+            return None
+        assert self.graph_cache is not None, "set_graph(...) must be called before empirical variance lookup."
+
+        device = m_sq.device
+        dtype = m_sq.dtype
+        n = int(self.graph_cache.num_nodes)
+        global_ids = self.graph_cache.global_n_id.detach().cpu().tolist()
+        local_pos = {int(global_id): idx for idx, global_id in enumerate(global_ids)}
+        total = int(self.graph_cache.global_num_nodes_total)
+
+        row, col = self.graph_cache.edge_index_clean_dir
+        row_cpu = row.detach().cpu().tolist()
+        col_cpu = col.detach().cpu().tolist()
+        found = []
+        target_pos = []
+        for pos, (src_l, dst_l) in enumerate(zip(row_cpu, col_cpu)):
+            src_g = int(global_ids[int(src_l)])
+            dst_g = int(global_ids[int(dst_l)])
+            idx = self._emp_clean_edge_lookup.get(src_g * total + dst_g)
+            if idx is not None:
+                found.append(int(idx))
+                target_pos.append(int(pos))
+
+        e = torch.zeros(row.numel(), device=device, dtype=dtype)
+        e2 = torch.zeros_like(e)
+        if found:
+            idx_t = torch.tensor(found, dtype=torch.long, device=device)
+            pos_t = torch.tensor(target_pos, dtype=torch.long, device=device)
+            e.index_copy_(
+                0,
+                pos_t,
+                self.emp_clean_edge_scale.to(device=device, dtype=dtype)
+                * self.emp_clean_edge_raw.to(device=device, dtype=dtype).index_select(0, idx_t),
+            )
+            e2.index_copy_(
+                0,
+                pos_t,
+                self.emp_clean_edge_sq_scale.to(device=device, dtype=dtype)
+                * self.emp_clean_edge_sq_raw.to(device=device, dtype=dtype).index_select(0, idx_t),
+            )
+
+        var_g = (e2 - e * e).clamp_min(0.0)
+
+        deg = self.graph_cache.deg_clean.to(device=device, dtype=dtype)
+        d_hat = (deg + 1.0).clamp_min(1.0)
+        row_d = row.to(device)
+        col_d = col.to(device)
+        alpha_sq = 1.0 / (d_hat[row_d] * d_hat[col_d])
+        factor = alpha_sq * (var_g / (e * e + float(eps)))
+        neigh_var = _scatter_add_rows(factor.unsqueeze(1) * m_sq[row_d], col_d, n)
+
+        add_var = torch.zeros_like(neigh_var)
+        if self.emp_nonedge_raw.numel() == 0:
+            return neigh_var
+
+        src_list = self.emp_nonedge_src.detach().cpu().tolist()
+        dst_list = self.emp_nonedge_dst.detach().cpu().tolist()
+        local_src = []
+        local_dst = []
+        sparse_idx = []
+        for idx, (src_g, dst_g) in enumerate(zip(src_list, dst_list)):
+            src_l = local_pos.get(int(src_g))
+            dst_l = local_pos.get(int(dst_g))
+            if src_l is None or dst_l is None:
+                continue
+            local_src.append(src_l)
+            local_dst.append(dst_l)
+            sparse_idx.append(idx)
+        if not sparse_idx:
+            return neigh_var
+
+        sparse_idx_t = torch.tensor(sparse_idx, dtype=torch.long, device=device)
+        row_a = torch.tensor(local_src, dtype=torch.long, device=device)
+        col_a = torch.tensor(local_dst, dtype=torch.long, device=device)
+        e_a = self.emp_nonedge_scale.to(device=device, dtype=dtype) * self.emp_nonedge_raw.to(device=device, dtype=dtype).index_select(0, sparse_idx_t)
+        e2_a = self.emp_nonedge_sq_scale.to(device=device, dtype=dtype) * self.emp_nonedge_sq_raw.to(device=device, dtype=dtype).index_select(0, sparse_idx_t)
+        var_a = (e2_a - e_a * e_a).clamp_min(0.0)
+        add_var = _scatter_add_rows(var_a.unsqueeze(1) * m_sq[row_a], col_a, n)
+        return neigh_var + add_var
+
     def forward(
         self,
         x: torch.Tensor,
@@ -602,7 +785,7 @@ class RADEGCNConvMB(nn.Module):
         n = x.size(0)
         use_ofs = self.rade_variant == "rade-ofs"
 
-        if edge_index_keep is None:
+        if edge_index_keep is None and edge_index_add is None:
             row, col = edge_index_clean[0], edge_index_clean[1]
             mask = row != col
             row, col = row[mask], col[mask]
@@ -630,7 +813,12 @@ class RADEGCNConvMB(nn.Module):
                 out = out + self.bias
             return out
 
-        row_k, col_k = edge_index_keep[0], edge_index_keep[1]
+        if edge_index_keep is None:
+            row_k, col_k = edge_index_clean[0], edge_index_clean[1]
+            mask = row_k != col_k
+            row_k, col_k = row_k[mask], col_k[mask]
+        else:
+            row_k, col_k = edge_index_keep[0], edge_index_keep[1]
         if edge_index_add is not None and edge_index_add.numel() > 0:
             row_a, col_a = edge_index_add[0], edge_index_add[1]
         else:
@@ -670,17 +858,17 @@ class RADEGCNConvMB(nn.Module):
         alpha_k = inv_sqrt_hat[row_k] * inv_sqrt_hat[col_k]
         alpha_self = inv_sqrt_hat * inv_sqrt_hat
 
-        t_a = _delta_E_inv_sqrt_caseA(deg_clean, comp_size, p=p, q=q).to(x.device, dtype=x.dtype)
-        analytic_edge = (1.0 - p) * t_a[row_k] * t_a[col_k]
         if self.ep_expectation_mode == "empirical_ema":
             e_gamma_k = self._get_clean_edge_emp(
                 row_k,
                 col_k,
-                fallback=analytic_edge,
+                fallback=gamma_k.detach().to(x.device, dtype=x.dtype),
                 dtype=x.dtype,
                 device=x.device,
             )
         else:
+            t_a = _delta_E_inv_sqrt_caseA(deg_clean, comp_size, p=p, q=q).to(x.device, dtype=x.dtype)
+            analytic_edge = (1.0 - p) * t_a[row_k] * t_a[col_k]
             e_gamma_k = analytic_edge
 
         corr_k = alpha_k / e_gamma_k.clamp(min=self.ep_emp_eps)
@@ -702,10 +890,14 @@ class RADEGCNConvMB(nn.Module):
             out_a = torch.zeros_like(out_k)
 
         if self.correct_self_loop:
-            analytic_self = _delta_E_inv_self(deg_clean, comp_size, p=p, q=q).to(x.device, dtype=x.dtype)
             if self.ep_expectation_mode == "empirical_ema":
-                e_gamma_self = self._get_self_emp(fallback=analytic_self, dtype=x.dtype, device=x.device)
+                e_gamma_self = self._get_self_emp(
+                    fallback=gamma_self.detach().to(x.device, dtype=x.dtype),
+                    dtype=x.dtype,
+                    device=x.device,
+                )
             else:
+                analytic_self = _delta_E_inv_self(deg_clean, comp_size, p=p, q=q).to(x.device, dtype=x.dtype)
                 e_gamma_self = analytic_self
             corr_self = alpha_self / e_gamma_self.clamp(min=self.ep_emp_eps)
             out_self = (gamma_self * corr_self).unsqueeze(1) * x
@@ -764,6 +956,8 @@ class RADEGINConvMB(nn.Module):
         self.emp_num_updates.zero_()
 
     def _emp_update_weights(self) -> tuple[float, float]:
+        if int(self.emp_num_updates.item()) <= 0:
+            return 0.0, 1.0
         if self.ep_emp_average_mode == "ema":
             beta = float(self.ep_emp_beta)
             if beta <= 0.0:
@@ -796,7 +990,9 @@ class RADEGINConvMB(nn.Module):
         num_nonedge_dir = int(round(float(self.graph_cache.comp_size.sum().item())))
 
         keep_obs = 0.0
-        if edge_index_keep is not None and edge_index_keep.numel() > 0 and num_clean_dir > 0:
+        if edge_index_keep is None and edge_index_add is not None and num_clean_dir > 0:
+            keep_obs = 1.0
+        elif edge_index_keep is not None and edge_index_keep.numel() > 0 and num_clean_dir > 0:
             keep_obs = float(edge_index_keep.size(1)) / float(num_clean_dir)
 
         add_obs = 0.0
@@ -835,7 +1031,7 @@ class RADEGINConvMB(nn.Module):
         n = x.size(0)
         use_ofs = self.rade_variant == "rade-ofs"
 
-        if edge_index_keep is None:
+        if edge_index_keep is None and edge_index_add is None:
             row, col = edge_index_clean[0], edge_index_clean[1]
             mask = row != col
             row, col = row[mask], col[mask]
@@ -849,7 +1045,12 @@ class RADEGINConvMB(nn.Module):
             out = (1.0 + self.eps.to(x.device)) * x + neigh_sum
             return self.mlp(out)
 
-        row_k, col_k = edge_index_keep[0], edge_index_keep[1]
+        if edge_index_keep is None:
+            row_k, col_k = edge_index_clean[0], edge_index_clean[1]
+            mask = row_k != col_k
+            row_k, col_k = row_k[mask], col_k[mask]
+        else:
+            row_k, col_k = edge_index_keep[0], edge_index_keep[1]
         if edge_index_add is not None and edge_index_add.numel() > 0:
             row_a, col_a = edge_index_add[0], edge_index_add[1]
         else:

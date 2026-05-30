@@ -11,13 +11,18 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
-import wandb
+
+try:
+    import wandb
+except Exception:
+    wandb = None
 
 from logger import Logger, save_model, save_result
 from dataset import load_nc_dataset
 from data_utils import eval_acc_nc, class_rand_splits, make_random_split_idx, eval_f1_nc
 from eval import evaluate
 from parse import (
+    apply_full_batch_aug_defaults,
     apply_full_batch_auto_defaults,
     get_explicit_arg_names,
     parse_method,
@@ -39,6 +44,16 @@ def fix_seed(seed: int = 42, device: Optional[torch.device] = None) -> None:
     torch.backends.cudnn.benchmark = False
     torch.use_deterministic_algorithms(True)
     torch.set_deterministic_debug_mode("error")
+
+
+def _first_nonfinite_gradient(model: nn.Module) -> Optional[Tuple[str, torch.Size, int]]:
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        finite = torch.isfinite(param.grad)
+        if not bool(finite.all()):
+            return name, param.grad.shape, int((~finite).sum().item())
+    return None
 
 
 # -----------------------
@@ -103,6 +118,22 @@ if preset_key is not None:
             f"{', '.join(skipped_parts)}"
         )
 
+aug_preset_key, aug_auto_applied, aug_auto_skipped = apply_full_batch_aug_defaults(args, explicit_arg_names)
+if aug_preset_key is not None:
+    auto_parts = [f"{name}={value}" for name, value in aug_auto_applied.items()]
+    skipped_parts = [f"{name}={value}" for name, value in aug_auto_skipped.items()]
+
+    if auto_parts:
+        print(
+            f"[AUTO-CONFIG] full-batch augmentation preset {aug_preset_key[0]}/{aug_preset_key[1]} applied: "
+            f"{', '.join(auto_parts)}"
+        )
+    if skipped_parts:
+        print(
+            f"[AUTO-CONFIG] kept explicit augmentation overrides for {aug_preset_key[0]}/{aug_preset_key[1]}: "
+            f"{', '.join(skipped_parts)}"
+        )
+
 
 # -----------------------
 # Linear-backbone routing
@@ -118,6 +149,12 @@ elif gnn_raw == "gin-linear":
     # GIN-Linear = linearized version of GIN stack (no nonlinearity, no augmentation)
     args.gnn = "gin"
     args.linear = True
+elif gnn_raw == "gat" and bool(getattr(args, "linear", False)):
+    raise ValueError(
+        "--linear is unavailable for --gnn gat because GAT attention is feature-dependent "
+        "and nonlinear. Use --linear False, or use --gnn sgc / --gnn gin-linear for "
+        "strict linear baselines."
+    )
 
 # If routed to a strict linear backbone, disable stochastic augmentation / tuning
 if getattr(args, "linear", False) and gnn_raw in {"sgc", "gin-linear"}:
@@ -141,8 +178,10 @@ if wandb_run is not None:
 # Augmentation technique routing
 # -----------------------
 aug_tech = str(getattr(args, "aug_tech", "rade")).lower().strip()
-if aug_tech not in {"rade", "dropmessage", "dropnode", "none"}:
-    raise ValueError(f"--aug_tech must be one of {{rade, dropmessage, dropnode, none}}. Got {aug_tech}")
+if aug_tech not in {"rade", "dropout", "dropedge", "dropmessage", "dropnode", "none"}:
+    raise ValueError(
+        f"--aug_tech must be one of {{rade, dropout, dropedge, dropmessage, dropnode, none}}. Got {aug_tech}"
+    )
 
 
 def _require_no_rade_contrib(name: str) -> None:
@@ -164,8 +203,36 @@ if aug_tech == "dropmessage":
 if aug_tech == "dropnode":
     _require_no_rade_contrib("dropnode")
 
+if aug_tech == "dropout":
+    _require_no_rade_contrib("dropout")
+
+if aug_tech == "dropedge":
+    if getattr(args, "ep_correction", False):
+        raise ValueError("--aug_tech=dropedge must be used with --ep_correction False.")
+    if getattr(args, "pq_gradnorm", False):
+        raise ValueError("--aug_tech=dropedge must be used with --pq_gradnorm False.")
+    if str(getattr(args, "aug_mode", "drop")).lower().strip() != "drop":
+        raise ValueError("--aug_tech=dropedge requires --aug_mode drop.")
+    args.q = 0.0
+
 if aug_tech == "none":
     args.aug_mode = "none"
+    args.ep_correction = False
+    args.pq_gradnorm = False
+
+if (
+    str(getattr(args, "gnn", "")).lower().strip() == "gat"
+    and bool(getattr(args, "pq_gradnorm", False))
+    and int(getattr(args, "gat_heads", 1)) != 1
+):
+    raise ValueError("GAT PQ-GradNorm variance currently supports only --gat_heads 1.")
+
+if bool(getattr(args, "pq_cap_p", False)) and not (0.0 <= float(getattr(args, "pq_p_max", 0.9)) < 1.0):
+    raise ValueError(f"--pq_p_max must be in [0, 1) when --pq_cap_p is enabled. Got {args.pq_p_max}")
+if bool(getattr(args, "pq_cap_rho", False)) and float(getattr(args, "pq_rho_max", 0.2)) < 0.0:
+    raise ValueError(f"--pq_rho_max must be >= 0 when --pq_cap_rho is enabled. Got {args.pq_rho_max}")
+if float(getattr(args, "gat_ep_corr_clip", 2.0)) < 0.0:
+    raise ValueError(f"--gat_ep_corr_clip must be >= 0. Got {args.gat_ep_corr_clip}")
 
 ep_emp_average_mode = "ema" if bool(getattr(args, "pq_gradnorm", False)) else "running_mean"
 
@@ -177,9 +244,16 @@ print(
     f"(mode={getattr(args, 'ep_expectation_mode', 'analytic')}, avg={ep_emp_average_mode}, variant={getattr(args, 'rade_variant', '-')}) | "
     f"pq_gradnorm={bool(getattr(args, 'pq_gradnorm', False))} "
     f"(search={getattr(args, 'pq_search_method', '-')}, "
-    f"compare={bool(getattr(args, 'pq_compare_search_methods', False))}) | "
+    f"compare={bool(getattr(args, 'pq_compare_search_methods', False))}, "
+    f"p_cap={'ON' if bool(getattr(args, 'pq_cap_p', False)) else 'OFF'}"
+    f"{'@' + str(float(getattr(args, 'pq_p_max', 0.9))) if bool(getattr(args, 'pq_cap_p', False)) else ''}, "
+    f"rho_cap={'ON' if bool(getattr(args, 'pq_cap_rho', False)) else 'OFF'}"
+    f"{'@' + str(float(getattr(args, 'pq_rho_max', 0.2))) if bool(getattr(args, 'pq_cap_rho', False)) else ''}) | "
     f"p={float(getattr(args, 'p', 0.0)):.4f} q={float(getattr(args, 'q', 0.0)):.6f} | "
-    f"mask_sharing={getattr(args, 'mask_sharing', '-')}"
+    f"mask_sharing={getattr(args, 'mask_sharing', '-')} | "
+    f"gat_moment={getattr(args, 'gat_moment_mode', 'exact')} "
+    f"(bernoulli_R={int(getattr(args, 'gat_bernoulli_samples', 64))}, "
+    f"corr_clip={float(getattr(args, 'gat_ep_corr_clip', 2.0)):g})"
 )
 
 if args.cpu:
@@ -209,18 +283,29 @@ n = int(data.num_nodes)
 e = int(data.edge_index.size(1)) // 2
 d = int(data.x.size(1))
 c = int(data.y.max().item()) + 1
+total_undir_pairs = max(float(n) * float(max(n - 1, 0)) / 2.0, 1.0)
+graph_density = float(e) / total_undir_pairs
+rho_scale_once = 0.0 if graph_density <= 0.0 else 1.0 / graph_density
 
 print(f"dataset {args.dataset} | num nodes {n} | num edges {e} | num feats {d} | num classes {c}")
+print(f"[DATASET] graph_density={graph_density:.6e} | rho_scale=1/d={rho_scale_once:.6e}")
 if wandb_run is not None:
     wandb.config.update(
-        {"num_nodes": n, "num_edges": e, "num_feats": d, "num_classes": c},
+        {
+            "num_nodes": n,
+            "num_edges": e,
+            "num_feats": d,
+            "num_classes": c,
+            "graph_density": graph_density,
+            "pq_expected_add_ratio_scale": rho_scale_once,
+        },
         allow_val_change=True,
     )
 
 
 # Cache clean edges on CPU for fast per-epoch augmentation
 augmentor = None
-if aug_tech == "rade":
+if aug_tech in {"rade", "dropedge"}:
     augmentor = BernoulliEdgeAugmentor.from_edge_index(data.edge_index, num_nodes=int(data.num_nodes))
 
 
@@ -266,6 +351,12 @@ def _enforce_aug_mode(p_val: float, q_val: float, aug_mode: str) -> Tuple[float,
     return float(p_val), float(q_val)
 
 
+def _apply_p_cap(p_val: float) -> float:
+    if not bool(getattr(args, "pq_cap_p", False)):
+        return float(p_val)
+    return float(min(float(p_val), float(getattr(args, "pq_p_max", 0.9))))
+
+
 def _sync_for_timing(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -281,6 +372,10 @@ def _safe_std(values: torch.Tensor) -> float:
     return float(values.std().item())
 
 
+def _format_runtime_list(values) -> str:
+    return ";".join(f"{float(value):.6f}" for value in values)
+
+
 def _write_single_dataset_csv(record: Dict[str, object], out_path: str = "single_dataset/results.csv") -> str:
     abs_path = os.path.abspath(out_path)
     parent = os.path.dirname(abs_path)
@@ -294,6 +389,9 @@ def _write_single_dataset_csv(record: Dict[str, object], out_path: str = "single
         "final_test_acc_std_pct",
         "runtime_run_mean_sec",
         "runtime_run_std_sec",
+        "runtime_per_run_mean_sec",
+        "runtime_per_run_std_sec",
+        "runtime_per_run_num_epochs",
         "runtime_pooled_mean_sec",
         "runtime_num_runs",
         "runtime_num_epochs",
@@ -302,6 +400,16 @@ def _write_single_dataset_csv(record: Dict[str, object], out_path: str = "single
         "gnn",
         "hidden_channels",
         "local_layers",
+        "gat_heads",
+        "gat_concat",
+        "gat_negative_slope",
+        "gat_moment_chunk_size",
+        "gat_moment_mode",
+        "gat_moment_samples",
+        "gat_nonedge_samples",
+        "gat_bernoulli_samples",
+        "gat_moment_seed",
+        "gat_ep_corr_clip",
         "lr",
         "weight_decay",
         "dropout",
@@ -324,6 +432,11 @@ def _write_single_dataset_csv(record: Dict[str, object], out_path: str = "single
         "pq_search_method",
         "pq_compare_search_methods",
         "pq_optimize_rho",
+        "pq_cap_p",
+        "pq_p_max",
+        "pq_cap_rho",
+        "pq_rho_max",
+        "pq_deletion_penalty_lambda",
         "pq_densification_penalty_lambda",
         "pq_densification_penalty_type",
         "pq_densification_penalty_rho0",
@@ -369,13 +482,18 @@ def _build_gradnorm_plot_tag(args) -> str:
         search_tag = f"{search_tag}_lr{_format_tag_float(float(getattr(args, 'pq_gd_lr', 0.0)))}"
     if bool(getattr(args, "pq_optimize_rho", False)):
         search_tag = f"{search_tag}_rhoopt"
+    if bool(getattr(args, "pq_cap_p", False)):
+        search_tag = f"{search_tag}_pcap{_format_tag_float(float(getattr(args, 'pq_p_max', 0.9)))}"
+    if bool(getattr(args, "pq_cap_rho", False)):
+        search_tag = f"{search_tag}_rhocap{_format_tag_float(float(getattr(args, 'pq_rho_max', 0.2)))}"
 
+    lam_p_tag = f"plam{_format_tag_float(float(getattr(args, 'pq_deletion_penalty_lambda', 0.0)))}"
     lam_tag = f"lam{_format_tag_float(float(getattr(args, 'pq_densification_penalty_lambda', 0.0)))}"
     penalty_type = str(getattr(args, "pq_densification_penalty_type", "quadratic")).lower().strip()
     penalty_tag = penalty_type
     if penalty_type == "hinge":
         penalty_tag = f"{penalty_type}_rho0{_format_tag_float(float(getattr(args, 'pq_densification_penalty_rho0', 1.0)))}"
-    return f"{dataset_tag}_{search_tag}_{lam_tag}_{penalty_tag}_{gnn_tag}_{variant_tag}"
+    return f"{dataset_tag}_{search_tag}_{lam_p_tag}_{lam_tag}_{penalty_tag}_{gnn_tag}_{variant_tag}"
 
 
 # -----------------------
@@ -409,6 +527,7 @@ for run in range(args.runs):
 
     # (p, q) used for this run
     p_eff, q_eff = _enforce_aug_mode(float(args.p), float(args.q), args.aug_mode)
+    p_eff = _apply_p_cap(p_eff)
 
     # Initialize lagged empirical EP state once per run.
     if (
@@ -449,10 +568,15 @@ for run in range(args.runs):
             eps=args.pq_eps,
             subset_nodes=args.pq_subset_nodes,
             seed=args.seed,
+            deletion_penalty_lambda=args.pq_deletion_penalty_lambda,
             densification_penalty_lambda=args.pq_densification_penalty_lambda,
             densification_penalty_type=args.pq_densification_penalty_type,
             densification_penalty_rho0=args.pq_densification_penalty_rho0,
             optimize_rho=bool(getattr(args, "pq_optimize_rho", False)),
+            cap_p=bool(getattr(args, "pq_cap_p", False)),
+            p_max=float(getattr(args, "pq_p_max", 0.9)),
+            cap_rho=bool(getattr(args, "pq_cap_rho", False)),
+            rho_max=float(getattr(args, "pq_rho_max", 0.2)),
             data_anchor=args.pq_data_anchor,
             search_method=args.pq_search_method,
             compare_search_methods=bool(getattr(args, "pq_compare_search_methods", False)),
@@ -467,6 +591,7 @@ for run in range(args.runs):
             adam_beta2=args.pq_adam_beta2,
             adam_eps=args.pq_adam_eps,
             gd_lr=args.pq_gd_lr,
+            ep_expectation_mode=str(getattr(args, "ep_expectation_mode", "analytic")),
         )
         pq_tuner = PQGradNormTuner(
             edge_index_clean=data.edge_index,
@@ -476,6 +601,8 @@ for run in range(args.runs):
             cfg=cfg,
         )
     rho_scale = 0.0 if pq_tuner is None else float(pq_tuner.expected_add_ratio_scale)
+    if pq_tuner is not None:
+        q_eff = float(max(0.0, min(q_eff, float(pq_tuner.q_probability_upper))))
 
     best_val = float("-inf")
     best_test = float("-inf")
@@ -508,6 +635,7 @@ for run in range(args.runs):
         # Augment per epoch
         # -----------------------
         aug_stats = None
+        edge_index_train = data.edge_index
         edge_index_keep = None
         edge_index_add = None
 
@@ -515,7 +643,7 @@ for run in range(args.runs):
         dropnode_rate = float(getattr(args, "dropnode_rate", 0.0)) if aug_tech == "dropnode" else 0.0
 
         do_aug = (
-            aug_tech == "rade"
+            aug_tech in {"rade", "dropedge"}
             and (str(args.aug_mode).lower().strip() != "none")
             and (p_epoch > 0.0 or q_epoch > 0.0)
         )
@@ -523,7 +651,16 @@ for run in range(args.runs):
         if do_aug:
             base_seed = args.seed + 10_000 * run + epoch
 
-            if str(getattr(args, "mask_sharing", "shared")).lower().strip() == "shared":
+            if aug_tech == "dropedge":
+                edge_index_train, aug_stats = augmentor.augment_edge_index(
+                    p=p_epoch,
+                    q=0.0,
+                    mode="drop",
+                    seed=base_seed,
+                    device=device,
+                    return_stats=True,
+                )
+            elif str(getattr(args, "mask_sharing", "shared")).lower().strip() == "shared":
                 _, edge_index_keep, edge_index_add, aug_stats = augmentor.augment_edge_indices(
                     p=p_epoch,
                     q=q_epoch,
@@ -560,6 +697,8 @@ for run in range(args.runs):
             logits = model(data.x, data.edge_index, dropmessage_rate=dropmessage_rate)
         elif aug_tech == "dropnode":
             logits = model(data.x, data.edge_index, dropnode_rate=dropnode_rate)
+        elif aug_tech == "dropedge" and do_aug:
+            logits = model(data.x, edge_index_train)
         elif aug_tech == "rade" and do_aug:
             logits = model(
                 data.x,
@@ -573,8 +712,32 @@ for run in range(args.runs):
             logits = model(data.x, data.edge_index)
 
         loss = criterion(logits[train_idx], data.y[train_idx])
-        loss.backward()
-        optimizer.step()
+        skipped_optimizer_step = False
+        if bool(getattr(args, "skip_nonfinite_grad_step", True)):
+            if not bool(torch.isfinite(loss).all()):
+                print(
+                    f"[NonfiniteGuard] run={run + 1:02d} epoch={epoch + 1:03d} "
+                    f"loss={float(loss.detach().cpu())}; skipped optimizer step."
+                )
+                skipped_optimizer_step = True
+                optimizer.zero_grad(set_to_none=True)
+            else:
+                loss.backward()
+                bad_grad = _first_nonfinite_gradient(model)
+                if bad_grad is not None:
+                    name, shape, count = bad_grad
+                    print(
+                        f"[NonfiniteGuard] run={run + 1:02d} epoch={epoch + 1:03d} "
+                        f"nonfinite gradient in {name} shape={tuple(shape)} count={count}; "
+                        "skipped optimizer step."
+                    )
+                    skipped_optimizer_step = True
+                    optimizer.zero_grad(set_to_none=True)
+                else:
+                    optimizer.step()
+        else:
+            loss.backward()
+            optimizer.step()
 
         # -----------------------
         # Lagged empirical-EP update (after optimizer step)
@@ -584,6 +747,7 @@ for run in range(args.runs):
             and do_aug
             and bool(getattr(args, "ep_correction", False))
             and str(getattr(args, "ep_expectation_mode", "analytic")).lower().strip() == "empirical_ema"
+            and not skipped_optimizer_step
         ):
             if not hasattr(model, "update_ep_stats"):
                 raise RuntimeError(
@@ -605,6 +769,8 @@ for run in range(args.runs):
                 logits_eval = model(data.x, data.edge_index, dropmessage_rate=0.0)
             elif aug_tech == "dropnode":
                 logits_eval = model(data.x, data.edge_index, dropnode_rate=0.0)
+            elif aug_tech == "dropedge":
+                logits_eval = model(data.x, data.edge_index)
             elif getattr(args, "ep_correction", False) and str(getattr(args, "rade_variant", "rade-of")) == "rade-ofs":
                 logits_eval = model(data.x, data.edge_index, p=p_epoch, q=q_epoch)
             else:
@@ -673,6 +839,7 @@ for run in range(args.runs):
                     model.eval()
 
                 p_new, q_new = _enforce_aug_mode(p_new, q_new, args.aug_mode)
+                p_new = _apply_p_cap(p_new)
                 p_eff, q_eff = p_new, q_new
                 p_trace[-1] = float(p_eff)
                 q_trace[-1] = float(q_eff)
@@ -694,13 +861,18 @@ for run in range(args.runs):
 
                 pq_method = str(info.get("search_method", getattr(args, "pq_search_method", "grid")))
                 if pq_method == "adam":
+                    g_reg_floor = " floor" if bool(info.get("G_reg_best_at_eps_floor", False)) else ""
+                    p_cap = "ON" if bool(info.get("p_cap_enabled", False)) else "OFF"
                     print(
                         f"[PQ-GradNorm-Adam] run={run + 1:02d} epoch={epoch + 1:03d} "
-                        f"G_data={info['G_data']:.3e} G_reg={info['G_reg_best']:.3e} "
-                        f"p={info['p_best']:.4f} q={info['q_best']:.6f} "
-                        f"rho={info.get('rho_best', float('nan')):.3e} "
+                        f"G_data={info['G_data']:.3e} G_reg={info['G_reg_best']:.3e}{g_reg_floor} "
+                        f"p={info['p_best']:.6f}->{info['p_new']:.6f} "
+                        f"q={info['q_best']:.6f}->{info['q_new']:.6f} "
+                        f"rho={info.get('rho_best', float('nan')):.3e}->{info.get('rho_new', float('nan')):.3e} "
                         f"obj={info.get('obj_new', info['obj']):.2e} "
                         f"lr={info.get('adam_lr', float('nan')):.2e} "
+                        f"p_cap={p_cap}@{info.get('p_probability_upper', float('nan')):.4f} "
+                        f"eps={info.get('pq_eps', float(getattr(args, 'pq_eps', float('nan')))):.1e} "
                         f"opt={info.get('optimization_variable', 'q')}"
                     )
                 elif pq_method == "gd":
@@ -767,12 +939,24 @@ for run in range(args.runs):
                         "pq/rho_best": float(info.get("rho_best", float("nan"))),
                         "pq/rho_new": float(info.get("rho_new", float("nan"))),
                         "pq/optimize_rho": float(bool(info.get("optimize_rho", False))),
+                        "pq/p_cap_enabled": float(bool(info.get("p_cap_enabled", False))),
+                        "pq/p_probability_upper": float(info.get("p_probability_upper", float("nan"))),
+                        "pq/rho_cap_enabled": float(bool(info.get("rho_cap_enabled", False))),
+                        "pq/rho_probability_upper": float(info.get("rho_probability_upper", float("nan"))),
+                        "pq/q_probability_upper": float(info.get("q_probability_upper", float("nan"))),
                     }
                     if pq_method == "adam":
                         pq_log["pq/G_reg_curr"] = float(info["G_reg_best"])
                         pq_log["pq/G_reg_next"] = float(info.get("G_reg_new", float("nan")))
                         pq_log["pq/obj_curr"] = float(info["obj"])
                         pq_log["pq/obj_next"] = float(info.get("obj_new", float("nan")))
+                        pq_log["pq/eps"] = float(info.get("pq_eps", getattr(args, "pq_eps", float("nan"))))
+                        pq_log["pq/G_reg_best_at_eps_floor"] = float(bool(info.get("G_reg_best_at_eps_floor", False)))
+                        pq_log["pq/G_reg_new_at_eps_floor"] = float(bool(info.get("G_reg_new_at_eps_floor", False)))
+                    if "deletion_penalty_best" in info:
+                        pq_log["pq/deletion_penalty_best"] = float(info["deletion_penalty_best"])
+                    if "deletion_penalty_new" in info:
+                        pq_log["pq/deletion_penalty_new"] = float(info["deletion_penalty_new"])
                     if "densification_penalty_best" in info:
                         pq_log["pq/densification_penalty_best"] = float(info["densification_penalty_best"])
                     if "rho_penalty_best" in info:
@@ -806,6 +990,10 @@ for run in range(args.runs):
                             pq_log[f"pq_compare/{method}_obj"] = float(info[f"comparison_{method}_obj"])
                             pq_log[f"pq_compare/{method}_p_best"] = float(info[f"comparison_{method}_p_best"])
                             pq_log[f"pq_compare/{method}_q_best"] = float(info[f"comparison_{method}_q_best"])
+                            if f"comparison_{method}_deletion_penalty_best" in info:
+                                pq_log[f"pq_compare/{method}_deletion_penalty_best"] = float(
+                                    info[f"comparison_{method}_deletion_penalty_best"]
+                                )
                             pq_log[f"pq_compare/{method}_G_reg_best"] = float(
                                 info[f"comparison_{method}_G_reg_best"]
                             )
@@ -840,6 +1028,7 @@ for run in range(args.runs):
                 "best/valid_acc": float(best_val),
                 "best/test_acc_at_best_valid": float(best_test),
                 "runtime/epoch_sec": float(epoch_time),
+                "train/skipped_optimizer_step": float(skipped_optimizer_step),
             }
 
             if aug_tech == "rade":
@@ -871,6 +1060,17 @@ for run in range(args.runs):
 
             elif aug_tech == "dropnode":
                 log_dict["aug/dropnode_rate"] = float(dropnode_rate)
+
+            elif aug_tech == "dropedge":
+                log_dict["aug/dropedge_rate"] = float(p_epoch)
+                if aug_stats is not None:
+                    if "dropped_undir" in aug_stats:
+                        log_dict["aug/dropped_undir"] = float(aug_stats["dropped_undir"])
+                    if "kept_undir" in aug_stats:
+                        log_dict["aug/kept_undir"] = float(aug_stats["kept_undir"])
+
+            elif aug_tech == "dropout":
+                log_dict["regularization/dropout"] = float(getattr(args, "dropout", 0.0))
 
             wandb.log(log_dict, step=step)
 
@@ -906,6 +1106,16 @@ for run in range(args.runs):
             elif aug_tech == "dropnode":
                 aug_str = f" (dropnode={dropnode_rate:.3f})"
 
+            elif aug_tech == "dropedge":
+                aug_str = f" (dropedge={p_epoch:.3f})"
+                if aug_stats is not None and "dropped_undir" in aug_stats:
+                    aug_str += f", DropEdge: -{aug_stats['dropped_undir']} edges"
+
+            elif aug_tech == "dropout" and float(getattr(args, "dropout", 0.0)) > 0.0:
+                aug_str = f" (dropout={float(getattr(args, 'dropout', 0.0)):.3f})"
+
+            if skipped_optimizer_step:
+                aug_str += ", skipped_optimizer_step=True"
             aug_str += f", Epoch Time: {epoch_time:.4f}s"
 
             print(
@@ -1001,6 +1211,11 @@ single_dataset_record = {
     "final_test_acc_std_pct": _safe_std(results),
     "runtime_run_mean_sec": "" if runtime_summary is None else float(runtime_summary["run_mean"]),
     "runtime_run_std_sec": "" if runtime_summary is None else float(runtime_summary["run_std"]),
+    "runtime_per_run_mean_sec": "" if runtime_summary is None else _format_runtime_list(runtime_summary["run_means"]),
+    "runtime_per_run_std_sec": "" if runtime_summary is None else _format_runtime_list(runtime_summary["run_stds"]),
+    "runtime_per_run_num_epochs": "" if runtime_summary is None else ";".join(
+        str(int(value)) for value in runtime_summary["run_epochs"]
+    ),
     "runtime_pooled_mean_sec": "" if runtime_summary is None else float(runtime_summary["pooled_mean"]),
     "runtime_num_runs": "" if runtime_summary is None else int(runtime_summary["num_runs"]),
     "runtime_num_epochs": "" if runtime_summary is None else int(runtime_summary["num_epochs"]),
@@ -1009,6 +1224,16 @@ single_dataset_record = {
     "gnn": str(args.gnn),
     "hidden_channels": int(args.hidden_channels),
     "local_layers": int(args.local_layers),
+    "gat_heads": int(getattr(args, "gat_heads", 1)),
+    "gat_concat": bool(getattr(args, "gat_concat", True)),
+    "gat_negative_slope": float(getattr(args, "gat_negative_slope", 0.2)),
+    "gat_moment_chunk_size": int(getattr(args, "gat_moment_chunk_size", 1024)),
+    "gat_moment_mode": str(getattr(args, "gat_moment_mode", "exact")),
+    "gat_moment_samples": int(getattr(args, "gat_moment_samples", 256)),
+    "gat_nonedge_samples": int(getattr(args, "gat_nonedge_samples", 256)),
+    "gat_bernoulli_samples": int(getattr(args, "gat_bernoulli_samples", 64)),
+    "gat_moment_seed": int(getattr(args, "gat_moment_seed", 0)),
+    "gat_ep_corr_clip": float(getattr(args, "gat_ep_corr_clip", 2.0)),
     "lr": float(args.lr),
     "weight_decay": float(args.weight_decay),
     "dropout": float(args.dropout),
@@ -1031,6 +1256,11 @@ single_dataset_record = {
     "pq_search_method": str(args.pq_search_method),
     "pq_compare_search_methods": bool(args.pq_compare_search_methods),
     "pq_optimize_rho": bool(args.pq_optimize_rho),
+    "pq_cap_p": bool(args.pq_cap_p),
+    "pq_p_max": float(args.pq_p_max),
+    "pq_cap_rho": bool(args.pq_cap_rho),
+    "pq_rho_max": float(args.pq_rho_max),
+    "pq_deletion_penalty_lambda": float(args.pq_deletion_penalty_lambda),
     "pq_densification_penalty_lambda": float(args.pq_densification_penalty_lambda),
     "pq_densification_penalty_type": str(args.pq_densification_penalty_type),
     "pq_densification_penalty_rho0": float(args.pq_densification_penalty_rho0),
@@ -1065,6 +1295,17 @@ if wandb_run is not None:
             wandb_run.summary["runtime/epoch_sec_run_mean"] = float(runtime_summary["run_mean"])
             wandb_run.summary["runtime/epoch_sec_run_std"] = float(runtime_summary["run_std"])
             wandb_run.summary["runtime/epoch_sec_pooled_mean"] = float(runtime_summary["pooled_mean"])
+            for idx, (run_mean, run_std, run_epochs) in enumerate(
+                zip(
+                    runtime_summary["run_means"],
+                    runtime_summary["run_stds"],
+                    runtime_summary["run_epochs"],
+                ),
+                start=1,
+            ):
+                wandb_run.summary[f"runtime/run_{idx:02d}_epoch_sec_mean"] = float(run_mean)
+                wandb_run.summary[f"runtime/run_{idx:02d}_epoch_sec_std"] = float(run_std)
+                wandb_run.summary[f"runtime/run_{idx:02d}_num_epochs"] = int(run_epochs)
     except Exception:
         pass
     wandb.finish()

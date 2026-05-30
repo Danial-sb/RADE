@@ -1,5 +1,4 @@
-project: rade-nc
-entity: removed-to-preserve-anonymity
+project: rade_gat_ogbn
 
 method: grid
 metric:
@@ -10,61 +9,61 @@ parameters:
   dataset:
     values: [ogbn-arxiv]
   gnn:
-    values: [gcn,gin]
+    values: [gat]
   local_layers:
     values: [2]
-  hidden_channels:
-    values: [256]
+#  hidden_channels:
+#    values: [256]
   lr:
     values: [0.001]
-
-  dropout:
+  weight_decay:
     values: [0.0]
+#  dropout:
+#    values: [0.0]
 
-  aug_tech: #Dropmessage, Dropnode, RADE
+  aug_tech:
     values: [rade]
   aug_mode:
-    values: [both] # only when rade (both, add, drop)
-  p:
-    values: [0.2,0.5,0.8] #ogbn-arxiv: 0.2, flickr: 0.2
-  q:
-    values: [0.000013446,0.000033615,0.000053784] #Flickr: 0.0000136, ogbn-arxiv: 0.000013446
-
-  dropmessage_rate:
-    values: [0.0]
-
-  dropnode_rate:
-    values: [0.0]
-
-  unbiased:
+    values: [both]
+  ep_correction:
     values: [True]
-  pq_gradnorm:
-    values: [False]
+  ep_expectation_mode:
+    values: [analytic]
+  rade_variant:
+    values: [rade-of,rade-ofs]
   mask_sharing:
     values: [layerwise]
   linear:
     values: [False]
-  unbiased_mode:
-    values: [rade,rade-ic]
-  p_max:
-    values: [0.8]
-  q_max:
-    values: [0.000026892]  #Flickr: 0.0000718, ogbn-arxiv: 0.000026892
-  pq_grid_size:
-    values: [11]
-  pq_warmup_epochs:
-    values: [20]
-#  pq_data_anchor: # TO BE ADDED LATER
-#    values: [aug]
+
+  pq_gradnorm:
+    values: [True]
+  pq_search_method:
+    values: [adam]
+  pq_adam_lr:
+    values: [0.001]
+  pq_optimize_rho:
+    values: [True]
+  pq_densification_penalty_lambda:
+    values: [1.0]
+  pq_densification_penalty_type:
+    values: [quadratic]
+
+  gat_heads:
+    values: [1]
+  gat_concat:
+    values: [True]
+  gat_moment_mode:
+    values: [sampled]
+  gat_moment_samples:
+    values: [128]
+  gat_nonedge_samples:
+    values: [128]
 
   device:
-    values: [1]
+    values: [3]
   runs:
     values: [5]
-  epochs:
-    values: [2000] # 1000 for flickr
-  patience:
-    values: [100] # 100 for flickr
 
 command:
   - ${env}
@@ -73,5 +72,5 @@ command:
   - RADE_Node_Classification.mini_batch.mb_main
   - --wandb
   - --wandb_project
-  - rade-nc
+  - rade_gat_ogbn
   - ${args}

@@ -1,5 +1,4 @@
-project: rade-nc
-entity: removed-to-preserve-anonymity
+project: rade_computer_new
 
 method: grid
 metric:
@@ -8,66 +7,42 @@ metric:
 
 parameters:
   dataset:
-    values: [cora]
+    values: [computer, cs, physics]
   gnn:
-    values: [gcn]
+    values: [gcn, gin, gat]
   local_layers:
     values: [2]
-  hidden_channels:
-    values: [512] #GCN 256 pubmed, CS 64 for GCN and 256 for GIN
+#  hidden_channels:
+#    values: [64, 256, 512]
   lr:
     values: [0.001]
-
-  dropout:
+  weight_decay:
     values: [0.0]
 
-  aug_tech: #Dropmessage, Dropnode, RADE
+  aug_tech:
     values: [rade]
+  rade_variant:
+    values: [rade-of, rade-ofs]
   aug_mode:
-    values: [both] # only when rade (both, add, drop)
-  p:
-    values: [0.8]
-  q:
-    values: [0.0011536] #CORA: 0.000721, CITESEER: 0.000164, PUBMED: 0.0000456, CS: 0.0000957, PHYSICS: 0.0000834, COMPUTER: 0.001303
-
-  dropmessage_rate:
-    values: [0.0]
-
-  dropnode_rate:
-    values: [0.0]
-
-  unbiased:
+    values: [both]
+#  dropout:
+#    values: [0.0]
+  ep_correction:
     values: [True]
   pq_gradnorm:
-    values: [False]
-  mask_sharing:
-    values: [layerwise]
+    values: [True]
   linear:
     values: [False]
-  unbiased_mode:
-    values: [rade]
-  p_max:
-    values: [0.8]
-  q_max:
-    values: [0.0023072]  #Cora: 0.001442, CITESEER: 0.000328, PUBMED: 0.0000912, CS: 0.000195, PHYSICS: 0.000166, COMPUTER: 0.0026070
-#    [0.0005768] #0.001442,0.0023072]
-  pq_grid_size:
-    values: [5]
-  pq_warmup_epochs:
-    values: [20]
-  pq_data_anchor:
-    values: [clean]
-  pq_subset_nodes:
-    values: [1024]
+
+  gat_heads:
+    values: [1]
+  gat_concat:
+    values: [True]
 
   device:
-    values: [1]
+    values: [3]
   runs:
     values: [5]
-  epochs:
-    values: [500]
-  patience:
-    values: [100] # 200 for computer
 
 command:
   - ${env}
@@ -75,5 +50,5 @@ command:
   - main.py
   - --wandb
   - --wandb_project
-  - rade-nc
+  - rade_computer_new
   - ${args}

@@ -5,10 +5,10 @@ from typing import List, Optional, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv, GINConv
+from torch_geometric.nn import GATConv, GCNConv, GINConv
 
-from .mb_rade_convs import BatchGraphCache, RADEGCNConvMB, RADEGINConvMB
-from ..full_batch.dropmessage_convs import DropMessageGCNConv, DropMessageGINConv
+from .mb_rade_convs import BatchGraphCache, RADEGATConvMB, RADEGCNConvMB, RADEGINConvMB
+from ..full_batch.dropmessage_convs import DropMessageGATConv, DropMessageGCNConv, DropMessageGINConv
 
 EdgeIndexObj = Union[torch.Tensor, List[torch.Tensor]]
 
@@ -37,14 +37,29 @@ class MPNNsMB(nn.Module):
         linear: bool = False,
         aug_tech: str = "rade",
         mb_rade_mode: str = "local",
+        gat_heads: int = 1,
+        gat_concat: bool = True,
+        gat_negative_slope: float = 0.2,
+        gat_moment_chunk_size: int = 1024,
+        gat_moment_mode: str = "exact",
+        gat_moment_samples: int = 256,
+        gat_nonedge_samples: int = 256,
+        gat_moment_seed: int = 0,
+        gat_ep_corr_clip: float = 2.0,
     ):
         super().__init__()
 
-        assert gnn in ("gcn", "gin"), "gnn must be 'gcn' or 'gin'"
+        assert gnn in ("gcn", "gin", "gat"), "gnn must be 'gcn', 'gin', or 'gat'"
         assert local_layers >= 1, "local_layers must be >= 1"
 
         self.global_num_nodes = int(num_nodes)
         self.linear = bool(linear)
+        if gnn == "gat" and self.linear:
+            raise ValueError(
+                "linear=True is unavailable for gnn='gat' because GAT attention is "
+                "feature-dependent and nonlinear. Use linear=False for GAT, or use "
+                "the sgc / gin-linear CLI backbones for strict linear baselines."
+            )
         if self.linear:
             dropout = 0.0
             ln = False
@@ -66,14 +81,33 @@ class MPNNsMB(nn.Module):
         self.ep_emp_beta = float(ep_emp_beta)
         self.ep_emp_eps = float(ep_emp_eps)
         self.rade_variant = str(rade_variant).lower().strip()
+        self.gat_heads = int(gat_heads)
+        self.gat_concat = bool(gat_concat)
+        self.gat_negative_slope = float(gat_negative_slope)
+        self.gat_moment_chunk_size = int(gat_moment_chunk_size)
+        self.gat_moment_mode = str(gat_moment_mode).lower().strip()
+        self.gat_moment_samples = int(gat_moment_samples)
+        self.gat_nonedge_samples = int(gat_nonedge_samples)
+        self.gat_moment_seed = int(gat_moment_seed)
+        self.gat_ep_corr_clip = max(0.0, float(gat_ep_corr_clip))
+        if self.gat_heads <= 0:
+            raise ValueError(f"gat_heads must be positive. Got {gat_heads}")
+        if self.gnn == "gat" and self.gat_concat and (hidden_channels % self.gat_heads != 0):
+            raise ValueError(
+                "For GAT with gat_concat=True, hidden_channels must be divisible by gat_heads. "
+                f"Got hidden_channels={hidden_channels}, gat_heads={gat_heads}."
+            )
 
         self.mb_rade_mode = str(mb_rade_mode).lower().strip()
         if self.mb_rade_mode not in {"local", "disabled"}:
             raise ValueError(f"mb_rade_mode must be 'local' or 'disabled'. Got {mb_rade_mode}")
 
         self.aug_tech = str(aug_tech).lower().strip()
-        if self.aug_tech not in {"rade", "dropmessage", "dropnode", "none"}:
-            raise ValueError(f"aug_tech must be one of {{rade, dropmessage, dropnode, none}}. Got {self.aug_tech}")
+        if self.aug_tech not in {"rade", "dropout", "dropedge", "dropmessage", "dropnode", "none"}:
+            raise ValueError(
+                f"aug_tech must be one of {{rade, dropout, dropedge, dropmessage, dropnode, none}}. "
+                f"Got {self.aug_tech}"
+            )
 
         self.lin_in = nn.Linear(in_channels, hidden_channels) if self.pre_linear else None
         self.local_convs = nn.ModuleList()
@@ -111,6 +145,44 @@ class MPNNsMB(nn.Module):
                     conv = DropMessageGINConv(mlp)
                 else:
                     conv = GINConv(mlp)
+            elif self.gnn == "gat":
+                if self.aug_tech == "rade":
+                    conv = RADEGATConvMB(
+                        in_dim,
+                        out_dim,
+                        heads=self.gat_heads,
+                        concat=self.gat_concat,
+                        negative_slope=self.gat_negative_slope,
+                        bias=True,
+                        rade_variant=self.rade_variant,
+                        ep_correction=self.ep_correction,
+                        ep_expectation_mode=self.ep_expectation_mode,
+                        ep_emp_eps=self.ep_emp_eps,
+                        moment_chunk_size=self.gat_moment_chunk_size,
+                        moment_mode=self.gat_moment_mode,
+                        moment_samples=self.gat_moment_samples,
+                        nonedge_samples=self.gat_nonedge_samples,
+                        moment_seed=self.gat_moment_seed,
+                        ep_corr_clip=self.gat_ep_corr_clip,
+                    )
+                elif self.aug_tech == "dropmessage":
+                    conv = DropMessageGATConv(
+                        in_dim,
+                        out_dim // self.gat_heads if self.gat_concat else out_dim,
+                        heads=self.gat_heads,
+                        concat=self.gat_concat,
+                        negative_slope=self.gat_negative_slope,
+                        bias=True,
+                    )
+                else:
+                    conv = GATConv(
+                        in_dim,
+                        out_dim // self.gat_heads if self.gat_concat else out_dim,
+                        heads=self.gat_heads,
+                        concat=self.gat_concat,
+                        negative_slope=self.gat_negative_slope,
+                        add_self_loops=False,
+                    )
             else:
                 if self.aug_tech == "rade":
                     conv = RADEGCNConvMB(
@@ -208,8 +280,8 @@ class MPNNsMB(nn.Module):
                 if len(obj) != num_layers:
                     raise ValueError(f"Expected list length={num_layers}, got {len(obj)}")
                 tensor = obj[idx]
-                return None if (tensor is None or tensor.numel() == 0) else tensor
-            return None if obj.numel() == 0 else obj
+                return None if tensor is None else tensor
+            return obj
 
         for layer_idx, conv in enumerate(self.local_convs):
             if hasattr(conv, "update_ep_stats"):
@@ -265,8 +337,8 @@ class MPNNsMB(nn.Module):
                 if len(obj) != num_layers:
                     raise ValueError(f"Expected list length={num_layers}, got {len(obj)}")
                 tensor = obj[idx]
-                return None if (tensor is None or tensor.numel() == 0) else tensor
-            return None if obj.numel() == 0 else obj
+                return None if tensor is None else tensor
+            return obj
 
         x_final = None
         for layer_idx, conv in enumerate(self.local_convs):

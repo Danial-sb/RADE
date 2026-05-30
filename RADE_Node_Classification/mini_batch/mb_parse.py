@@ -21,31 +21,61 @@ def str2bool(value):
 MINI_BATCH_AUTO_DEFAULTS = {
     ("flickr", "gcn"): {
         "hidden_channels": 256,
-        "epochs": 1000,
-        "p": 0.0,
-        "q": 0.0,
+        "epochs": 100,
+        "p": 0.5,
+        "q": 0.0000564785,
         "pq_grid_size": 5,
     },
     ("flickr", "gin"): {
         "hidden_channels": 256,
         "epochs": 1000,
-        "p": 0.2,
-        "q": 0.00001436,
+        "p": 0.5,
+        "q": 0.0000564785,
+        "pq_grid_size": 11,
+    },
+    ("flickr", "gat"): {
+        "hidden_channels": 256,
+        "epochs": 1000,
+        "p": 0.5,
+        "q": 0.0000564785,
         "pq_grid_size": 11,
     },
     ("ogbn-arxiv", "gcn"): {
         "hidden_channels": 256,
-        "epochs": 2000,
-        "p": 0.0,
-        "q": 0.0,
+        "epochs": 100,
+        "p": 0.5,
+        "q": 0.00004037395,
         "pq_grid_size": 5,
     },
     ("ogbn-arxiv", "gin"): {
         "hidden_channels": 256,
         "epochs": 2000,
-        "p": 0.2,
-        "q": 0.000013446,
+        "p": 0.5,
+        "q": 0.00004037395,
         "pq_grid_size": 11,
+    },
+    ("ogbn-arxiv", "gat"): {
+        "hidden_channels": 256,
+        "epochs": 2000,
+        "p": 0.5,
+        "q": 0.00004037395,
+        "pq_grid_size": 11,
+    },
+}
+
+
+MINI_BATCH_AUG_DEFAULTS = {
+    "flickr": {
+        "dropout": 0.50,
+        "dropedge_rate": 0.20,
+        "dropnode_rate": 0.20,
+        "dropmessage_rate": 0.50,
+    },
+    "ogbn-arxiv": {
+        "dropout": 0.20,
+        "dropedge_rate": 0.20,
+        "dropnode_rate": 0.50,
+        "dropmessage_rate": 0.50,
     },
 }
 
@@ -89,8 +119,64 @@ def apply_mini_batch_auto_defaults(args, explicit_arg_names=None):
     return preset_key, applied, skipped
 
 
+def apply_mini_batch_aug_defaults(args, explicit_arg_names=None):
+    explicit_arg_names = explicit_arg_names or set()
+
+    dataset = str(getattr(args, "dataset", "")).lower().strip()
+    aug_tech = str(getattr(args, "aug_tech", "")).lower().strip()
+    preset = MINI_BATCH_AUG_DEFAULTS.get(dataset)
+
+    if preset is None:
+        return None, {}, {}
+
+    applied = {}
+    skipped = {}
+
+    def set_if_not_explicit(field_name, field_value):
+        if field_name in explicit_arg_names:
+            skipped[field_name] = getattr(args, field_name)
+            return
+        setattr(args, field_name, field_value)
+        applied[field_name] = field_value
+
+    if aug_tech == "none":
+        set_if_not_explicit("dropout", 0.0)
+        set_if_not_explicit("aug_mode", "none")
+    elif aug_tech == "dropout":
+        set_if_not_explicit("dropout", preset["dropout"])
+        set_if_not_explicit("aug_mode", "none")
+    elif aug_tech == "dropedge":
+        set_if_not_explicit("dropedge_rate", preset["dropedge_rate"])
+        set_if_not_explicit("p", float(getattr(args, "dropedge_rate", preset["dropedge_rate"])))
+        set_if_not_explicit("q", 0.0)
+        set_if_not_explicit("aug_mode", "drop")
+        set_if_not_explicit("dropout", 0.0)
+    elif aug_tech == "dropnode":
+        set_if_not_explicit("dropnode_rate", preset["dropnode_rate"])
+        set_if_not_explicit("aug_mode", "none")
+        set_if_not_explicit("dropout", 0.0)
+    elif aug_tech == "dropmessage":
+        set_if_not_explicit("dropmessage_rate", preset["dropmessage_rate"])
+        set_if_not_explicit("aug_mode", "none")
+        set_if_not_explicit("dropout", 0.0)
+    elif aug_tech == "rade":
+        return (dataset, aug_tech), applied, skipped
+    else:
+        return None, applied, skipped
+
+    args.ep_correction = False
+    args.pq_gradnorm = False
+    applied["ep_correction"] = False
+    applied["pq_gradnorm"] = False
+
+    return (dataset, aug_tech), applied, skipped
+
+
 def parse_method(args, num_nodes, num_classes, in_dim, device):
-    ep_emp_average_mode = "ema" if bool(getattr(args, "pq_gradnorm", False)) else "running_mean"
+    ep_emp_average_mode = getattr(args, "ep_emp_average_mode", None)
+    if ep_emp_average_mode is None:
+        ep_emp_average_mode = "ema" if bool(getattr(args, "pq_gradnorm", False)) else "running_mean"
+    ep_emp_average_mode = str(ep_emp_average_mode).lower().strip()
     model = MPNNsMB(
         in_channels=in_dim,
         hidden_channels=args.hidden_channels,
@@ -113,6 +199,15 @@ def parse_method(args, num_nodes, num_classes, in_dim, device):
         linear=bool(getattr(args, "linear", False)),
         aug_tech=str(getattr(args, "aug_tech", "none")),
         mb_rade_mode=str(getattr(args, "mb_rade_mode", "local")),
+        gat_heads=int(getattr(args, "gat_heads", 1)),
+        gat_concat=bool(getattr(args, "gat_concat", True)),
+        gat_negative_slope=float(getattr(args, "gat_negative_slope", 0.2)),
+        gat_moment_chunk_size=int(getattr(args, "gat_moment_chunk_size", 1024)),
+        gat_moment_mode=str(getattr(args, "gat_moment_mode", "exact")),
+        gat_moment_samples=int(getattr(args, "gat_moment_samples", 256)),
+        gat_nonedge_samples=int(getattr(args, "gat_nonedge_samples", 256)),
+        gat_moment_seed=int(getattr(args, "gat_moment_seed", 0)),
+        gat_ep_corr_clip=float(getattr(args, "gat_ep_corr_clip", 2.0)),
     ).to(device)
     return model
 
@@ -132,12 +227,12 @@ def parser_add_main_args(parser):
         help="Remove isolated nodes when loading CiteSeer. Ignored for other datasets.",
     )
 
-    parser.add_argument("--device", type=int, default=1, help="GPU id (default: 0)")
+    parser.add_argument("--device", type=int, default=0, help="GPU id (default: 0)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cpu", action="store_true")
 
     parser.add_argument("--epochs", type=int, default=500, help="number of training epochs")
-    parser.add_argument("--runs", type=int, default=5, help="number of distinct runs")
+    parser.add_argument("--runs", type=int, default=1, help="number of distinct runs")
 
     parser.add_argument("--train_prop", type=float, default=0.6, help="training proportion (random-split datasets)")
     parser.add_argument("--valid_prop", type=float, default=0.2, help="validation proportion (random-split datasets)")
@@ -165,7 +260,9 @@ def parser_add_main_args(parser):
     )
     parser.add_argument(
         "--mb_shuffle",
-        type=bool,
+        type=str2bool,
+        nargs="?",
+        const=True,
         default=True,
         help="Shuffle seed nodes each epoch before sampling mini-batches.",
     )
@@ -189,21 +286,64 @@ def parser_add_main_args(parser):
         "--gnn",
         type=str,
         default="gcn",
-        choices=["gcn", "gin", "sgc", "gin-linear"],
-        help="Backbone: gcn/gin are standard. sgc routes to linear-GCN. gin-linear routes to linear-GIN.",
+        choices=["gcn", "gin", "gat", "sgc", "gin-linear"],
+        help="Backbone: gcn/gin/gat are standard. sgc routes to linear-GCN. gin-linear routes to linear-GIN.",
     )
     parser.add_argument("--hidden_channels", type=int, default=256)
     parser.add_argument("--local_layers", type=int, default=2)
-    parser.add_argument("--pre_linear", type=bool, default=True)
+    parser.add_argument("--pre_linear", type=str2bool, nargs="?", const=True, default=True)
     parser.add_argument("--res", action="store_true")
     parser.add_argument("--ln", action="store_true")
     parser.add_argument("--bn", action="store_true")
     parser.add_argument("--jk", action="store_true")
     parser.add_argument(
         "--linear",
-        type=bool,
+        type=str2bool,
+        nargs="?",
+        const=True,
         default=False,
-        help="Use strictly linear model: disables ReLU/Dropout/BN/LN and makes GIN MLP linear.",
+        help="Use strictly linear model for supported backbones: disables ReLU/Dropout/BN/LN "
+             "and makes GIN MLP linear. Unavailable with --gnn gat.",
+    )
+    parser.add_argument("--gat_heads", type=int, default=1, help="Number of GAT attention heads. GAT PQ-GradNorm currently requires 1.")
+    parser.add_argument("--gat_concat", type=str2bool, default=True, help="Concatenate GAT heads instead of averaging them.")
+    parser.add_argument("--gat_negative_slope", type=float, default=0.2, help="LeakyReLU slope for GAT attention.")
+    parser.add_argument(
+        "--gat_moment_chunk_size",
+        type=int,
+        default=1024,
+        help="Source-node chunk size for mini-batch GAT attention moment computations.",
+    )
+    parser.add_argument(
+        "--gat_moment_mode",
+        type=str,
+        default="sampled",
+        choices=["exact", "sampled"],
+        help="GAT attention moment computation mode. 'sampled' estimates mini-batch local non-edge terms.",
+    )
+    parser.add_argument(
+        "--gat_moment_samples",
+        type=int,
+        default=64,
+        help="Per-target sampled non-neighbor count for mini-batch GAT denominator moments.",
+    )
+    parser.add_argument(
+        "--gat_nonedge_samples",
+        type=int,
+        default=64,
+        help="Per-target sampled non-neighbor count for mini-batch GAT non-edge corrections and variance.",
+    )
+    parser.add_argument(
+        "--gat_moment_seed",
+        type=int,
+        default=0,
+        help="Deterministic seed for sampled mini-batch GAT moment estimates.",
+    )
+    parser.add_argument(
+        "--gat_ep_corr_clip",
+        type=float,
+        default=2.0,
+        help="GAT RADE EP correction multiplier cap. Use 0 to disable clipping.",
     )
 
     parser.add_argument("--lr", type=float, default=0.001)
@@ -220,8 +360,20 @@ def parser_add_main_args(parser):
         "--aug_tech",
         type=str,
         default="rade",
-        choices=["rade", "dropmessage", "dropnode", "none"],
-        help="Which augmentation family to use.",
+        choices=["rade", "dropout", "dropedge", "dropmessage", "dropnode", "none"],
+        help="Which augmentation family to use. "
+             "'rade' uses the edge drop/add RADE pipeline. "
+             "'dropout' uses feature dropout without graph/message/node augmentation. "
+             "'dropedge' drops clean edges without RADE correction. "
+             "'dropmessage' uses message dropout. "
+             "'dropnode' uses node-wise feature masking. "
+             "'none' is clean training without dropout or augmentation.",
+    )
+    parser.add_argument(
+        "--dropedge_rate",
+        type=float,
+        default=0.2,
+        help="DropEdge rate. Used as p when --aug_tech=dropedge.",
     )
     parser.add_argument(
         "--dropmessage_rate",
@@ -248,9 +400,20 @@ def parser_add_main_args(parser):
 
     parser.add_argument(
         "--ep_correction",
-        type=bool,
-        default=True,
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
         help="Use expectation-preserving aggregation correction for RADE.",
+    )
+
+    parser.add_argument(
+        "--pq_gradnorm",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Enable GradNorm matching for p,q.",
     )
     parser.add_argument(
         "--ep_expectation_mode",
@@ -266,10 +429,25 @@ def parser_add_main_args(parser):
         help="EMA update weight for the empirical expectation ablation.",
     )
     parser.add_argument(
+        "--ep_emp_average_mode",
+        type=str,
+        default=None,
+        choices=["ema", "running_mean"],
+        help="Averaging mode for empirical EP moment buffers. Defaults to ema with pq_gradnorm, otherwise running_mean.",
+    )
+    parser.add_argument(
         "--ep_emp_eps",
         type=float,
-        default=1e-12,
+        default=1e-6,
         help="Small epsilon used to clamp empirical expectation denominators.",
+    )
+    parser.add_argument(
+        "--skip_nonfinite_grad_step",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="Skip the optimizer step when the training loss or any model gradient is nonfinite.",
     )
     parser.add_argument(
         "--mask_sharing",
@@ -286,7 +464,6 @@ def parser_add_main_args(parser):
         help="RADE variant: RADE-OF or RADE-OFS.",
     )
 
-    parser.add_argument("--pq_gradnorm", type=bool, default=True, help="Enable epoch-wise GradNorm matching.")
     parser.add_argument(
         "--pq_search_method",
         type=str,
@@ -311,7 +488,7 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--pq_adam_lr",
         type=float,
-        default=0.1,
+        default=0.001,
         help="Learning rate for the Adam-based p/q controller when --pq_search_method=adam.",
     )
     parser.add_argument(
@@ -339,6 +516,41 @@ def parser_add_main_args(parser):
         const=True,
         default=True,
         help="For Adam PQ-GradNorm, optimize rho = q / d directly and convert back to q for G_reg.",
+    )
+    parser.add_argument(
+        "--pq_cap_p",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="Enable an explicit upper bound on the PQ-GradNorm deletion probability p.",
+    )
+    parser.add_argument(
+        "--pq_p_max",
+        type=float,
+        default=0.9,
+        help="Maximum p used when --pq_cap_p is enabled. Must be in [0, 1).",
+    )
+    parser.add_argument(
+        "--pq_cap_rho",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Enable an explicit upper bound on rho = q / graph_density for PQ-GradNorm.",
+    )
+    parser.add_argument(
+        "--pq_rho_max",
+        type=float,
+        default=0.2,
+        help="Maximum rho used when --pq_cap_rho is enabled. Must be >= 0.",
+    )
+    parser.add_argument(
+        "--pq_deletion_penalty_lambda",
+        type=float,
+        default=0.0,
+        help="Coefficient lambda_p for the soft edge-deletion penalty lambda_p * p^2. "
+             "Default 0 disables the penalty.",
     )
     parser.add_argument(
         "--pq_densification_penalty_lambda",
@@ -421,6 +633,26 @@ def parser_add_main_args(parser):
         help="EMA smoothing for p,q updates in search-based PQ tuning (grid/powell/newton only).",
     )
     parser.add_argument("--pq_update_every", type=int, default=1, help="Update (p,q) every k epochs.")
+    parser.add_argument(
+        "--pq_update_unit",
+        type=str,
+        default="batch",
+        choices=["batch", "epoch"],
+        help="For Adam PQ-GradNorm, update (p,q) by mini-batch interval or once at the end of each eligible epoch.",
+    )
+    parser.add_argument(
+        "--pq_update_every_batches",
+        type=int,
+        default=1,
+        help="For Adam PQ-GradNorm, update (p,q) every K training mini-batches. Default 1 preserves per-batch updates.",
+    )
+    parser.add_argument(
+        "--pq_update_batch_fraction",
+        type=float,
+        default=0.0,
+        help="For Adam PQ-GradNorm, set update interval as ceil(fraction * batches_per_epoch). "
+             "Use 0 to rely on --pq_update_every_batches.",
+    )
     parser.add_argument("--pq_warmup_epochs", type=int, default=1, help="Number of initial epochs to skip pq updates.")
     parser.add_argument("--pq_eps", type=float, default=1e-12, help="Small epsilon for log/denominator stabilizers.")
     parser.add_argument("--pq_seed", type=int, default=0, help="Seed for selecting the subset of nodes for pq selection.")

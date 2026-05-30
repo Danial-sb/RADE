@@ -120,10 +120,15 @@ class PQTunerMBConfig:
     p_max: float = 0.8
     q_max: float = 1e-3
     expected_add_ratio_scale: float = 0.0
+    deletion_penalty_lambda: float = 0.0
     densification_penalty_lambda: float = 1.0
     densification_penalty_type: str = "quadratic"
     densification_penalty_rho0: float = 1.0
     optimize_rho: bool = False
+    cap_p: bool = False
+    p_cap_max: float = 0.9
+    cap_rho: bool = False
+    rho_max: float = 0.2
     grid_size: int = 11
     ema: float = 0.9
     eps: float = 1e-12
@@ -145,6 +150,7 @@ class PQTunerMBConfig:
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_eps: float = 1e-8
+    ep_expectation_mode: str = "analytic"
 
 
 class PQGradNormTunerMB:
@@ -152,11 +158,40 @@ class PQGradNormTunerMB:
         self.cfg = cfg
         self.gnn = str(gnn).lower().strip()
         self.rade_variant = _validate_rade_variant(rade_variant)
+        self.ep_expectation_mode = str(getattr(cfg, "ep_expectation_mode", "analytic")).lower().strip()
+        if self.gnn not in {"gin", "gcn", "gat"}:
+            raise ValueError("gnn must be 'gin', 'gcn', or 'gat'")
+        if self.ep_expectation_mode not in {"analytic", "empirical_ema"}:
+            raise ValueError(
+                "PQTunerMBConfig.ep_expectation_mode must be one of {'analytic', 'empirical_ema'}. "
+                f"Got {self.ep_expectation_mode}"
+            )
+        if self.gnn == "gat" and self.ep_expectation_mode != "analytic":
+            raise ValueError("GAT PQ-GradNorm currently requires ep_expectation_mode='analytic'.")
         self.search_method = _validate_search_method(cfg.search_method)
         self.optimize_rho = bool(getattr(cfg, "optimize_rho", False))
         if self.optimize_rho and self.search_method != "adam":
             raise ValueError("--pq_optimize_rho is supported only with pq_search_method='adam' in mini-batch.")
         self.expected_add_ratio_scale = max(0.0, float(getattr(cfg, "expected_add_ratio_scale", 0.0)))
+        self.cap_p = bool(getattr(cfg, "cap_p", False))
+        p_cap_max = float(getattr(cfg, "p_cap_max", 0.9))
+        if not (0.0 <= p_cap_max < 1.0):
+            raise ValueError(f"p_cap_max must be in [0, 1). Got {p_cap_max}")
+        self.p_probability_upper = min(P_PROBABILITY_UPPER, p_cap_max) if self.cap_p else P_PROBABILITY_UPPER
+
+        self.rho_probability_upper = float(self.expected_add_ratio_scale) * float(Q_PROBABILITY_UPPER)
+        self.cap_rho = bool(getattr(cfg, "cap_rho", False))
+        rho_max = float(getattr(cfg, "rho_max", 0.2))
+        if rho_max < 0.0:
+            raise ValueError(f"rho_max must be >= 0. Got {rho_max}")
+        self.rho_upper = min(self.rho_probability_upper, rho_max) if self.cap_rho else self.rho_probability_upper
+        self.q_probability_upper = (
+            min(Q_PROBABILITY_UPPER, self._q_from_rho_float(self.rho_upper))
+            if self.cap_rho
+            else Q_PROBABILITY_UPPER
+        )
+        self.search_p_max = min(float(cfg.p_max), float(self.p_probability_upper))
+        self.search_q_max = min(float(cfg.q_max), float(self.q_probability_upper))
         self.penalty_type = _validate_penalty_type(getattr(cfg, "densification_penalty_type", "quadratic"))
         self.penalty_rho0 = float(getattr(cfg, "densification_penalty_rho0", 1.0))
         if self.penalty_rho0 < 0.0:
@@ -202,13 +237,13 @@ class PQGradNormTunerMB:
 
     def _add_parameter_upper(self) -> float:
         if self.optimize_rho:
-            return float(self._rho_from_q_float(float(self.cfg.q_max)))
-        return float(self.cfg.q_max)
+            return float(self._rho_from_q_float(float(self.search_q_max)))
+        return float(self.search_q_max)
 
     def _adam_add_parameter_upper(self) -> float:
         if self.optimize_rho:
-            return float(self._rho_from_q_float(Q_PROBABILITY_UPPER))
-        return Q_PROBABILITY_UPPER
+            return float(self.rho_upper)
+        return float(self.q_probability_upper)
 
     def _add_parameter_name(self) -> str:
         return "rho" if self.optimize_rho else "q"
@@ -247,15 +282,36 @@ class PQGradNormTunerMB:
         excess = torch.clamp_min(rho - rho0_t, 0.0)
         return rho.new_tensor(lam) * excess * excess
 
-    def _objective_penalty_float(self, q: float) -> float:
-        return self._densification_penalty_float(self._rho_from_q_float(q))
+    def _deletion_penalty_float(self, p: float) -> float:
+        lam = float(getattr(self.cfg, "deletion_penalty_lambda", 0.0))
+        if lam <= 0.0:
+            return 0.0
+        p = float(p)
+        return lam * p * p
 
-    def _objective_penalty_tensor(self, q: torch.Tensor) -> torch.Tensor:
-        return self._densification_penalty_tensor(self._rho_from_q_tensor(q))
+    def _deletion_penalty_tensor(self, p: torch.Tensor) -> torch.Tensor:
+        lam = float(getattr(self.cfg, "deletion_penalty_lambda", 0.0))
+        if lam <= 0.0:
+            return p.new_zeros(())
+        return p.new_tensor(lam) * p * p
+
+    def _objective_penalty_float(self, p: float, q: float) -> float:
+        return self._deletion_penalty_float(p) + self._densification_penalty_float(self._rho_from_q_float(q))
+
+    def _objective_penalty_tensor(self, p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+        return self._deletion_penalty_tensor(p) + self._densification_penalty_tensor(self._rho_from_q_tensor(q))
 
     def _annotate_surface_data(self, surface_data: Dict[str, Any], *, q_max: float) -> Dict[str, Any]:
         surface_data["rho_upper"] = float(self._rho_from_q_float(float(q_max)))
         surface_data["expected_add_ratio_scale"] = float(self.expected_add_ratio_scale)
+        surface_data["p_cap_enabled"] = bool(self.cap_p)
+        surface_data["p_probability_upper"] = float(self.p_probability_upper)
+        surface_data["rho_cap_enabled"] = bool(self.cap_rho)
+        surface_data["rho_probability_upper"] = float(self.rho_upper)
+        surface_data["q_probability_upper"] = float(self.q_probability_upper)
+        surface_data["deletion_penalty_lambda"] = float(
+            getattr(self.cfg, "deletion_penalty_lambda", 0.0)
+        )
         surface_data["densification_penalty_lambda"] = float(
             getattr(self.cfg, "densification_penalty_lambda", 0.0)
         )
@@ -382,6 +438,88 @@ class PQGradNormTunerMB:
         add_var = (q * u_b.unsqueeze(1) * s1) - ((q * q) * t_b2.unsqueeze(1) * s2)
         return neigh_var + add_var
 
+    @staticmethod
+    def _collect_gat_modules(model: nn.Module) -> List[nn.Module]:
+        modules = [
+            module
+            for module in model.modules()
+            if callable(getattr(module, "gat_variance_proxy", None))
+        ]
+        return modules[-1:] if modules else []
+
+    def _var_gat(
+        self,
+        cache: BatchGraphCache,
+        p: float,
+        q: float,
+        msg: torch.Tensor,
+        msg_sq: torch.Tensor,
+    ) -> torch.Tensor:
+        _ = cache
+        modules = getattr(self, "_gat_modules", None)
+        if not modules:
+            return torch.zeros_like(msg_sq)
+        estimates = [
+            module.gat_variance_proxy(msg, msg_sq, p=float(p), q=float(q), eps=float(self.cfg.eps))
+            for module in modules
+        ]
+        return estimates[0] if len(estimates) == 1 else torch.stack(estimates, dim=0).mean(dim=0)
+
+    def _var_gat_tensor(
+        self,
+        cache: BatchGraphCache,
+        p: torch.Tensor,
+        q: torch.Tensor,
+        msg: torch.Tensor,
+        msg_sq: torch.Tensor,
+    ) -> torch.Tensor:
+        _ = cache
+        modules = getattr(self, "_gat_modules", None)
+        if not modules:
+            return torch.zeros_like(msg_sq) + (p * 0.0 + q * 0.0)
+        estimates = [
+            module.gat_variance_proxy(msg, msg_sq, p=p, q=q, eps=float(self.cfg.eps))
+            for module in modules
+        ]
+        value = estimates[0] if len(estimates) == 1 else torch.stack(estimates, dim=0).mean(dim=0)
+        return value + (p * 0.0 + q * 0.0)
+
+    def _empirical_gcn_variance(
+        self,
+        msg: torch.Tensor,
+        msg_sq: torch.Tensor,
+        *,
+        p: float,
+        q: float,
+        eps: float,
+    ) -> Optional[torch.Tensor]:
+        if self.ep_expectation_mode != "empirical_ema":
+            return None
+        modules = getattr(self, "_empirical_gcn_modules", None)
+        if not modules:
+            return torch.zeros_like(msg_sq)
+        estimates = []
+        for module in modules:
+            fn = getattr(module, "empirical_gcn_variance_proxy", None)
+            if not callable(fn):
+                continue
+            value = fn(msg, msg_sq, p=float(p), q=float(q), eps=float(eps))
+            if value is not None:
+                estimates.append(value)
+        if not estimates:
+            return torch.zeros_like(msg_sq)
+        if len(estimates) == 1:
+            return estimates[0]
+        return torch.stack(estimates, dim=0).mean(dim=0)
+
+    @staticmethod
+    def _collect_empirical_gcn_modules(model: nn.Module) -> List[nn.Module]:
+        return [
+            module
+            for module in model.modules()
+            if callable(getattr(module, "empirical_gcn_variance_proxy", None))
+        ]
+
     def _build_q_grid(self, q_max: float) -> List[float]:
         if q_max <= 0.0:
             return [0.0]
@@ -410,8 +548,8 @@ class PQGradNormTunerMB:
             return
 
         cfg = self.cfg
-        p0 = float(max(0.0, min(current_p, P_PROBABILITY_UPPER)))
-        q0 = float(max(0.0, min(current_q, Q_PROBABILITY_UPPER)))
+        p0 = float(max(0.0, min(current_p, self.p_probability_upper)))
+        q0 = float(max(0.0, min(current_q, self.q_probability_upper)))
         add_upper = max(float(self._adam_add_parameter_upper()), 0.0)
         add0 = float(max(0.0, min(self._add_parameter_from_q_float(q0), add_upper)))
         self._adam_p = nn.Parameter(torch.tensor(p0, device=device, dtype=torch.float32))
@@ -430,16 +568,37 @@ class PQGradNormTunerMB:
         if self._adam_p is None or self._adam_q is None:
             raise RuntimeError("Adam pq controller is not initialized.")
 
-        p = torch.clamp(self._adam_p, 0.0, P_PROBABILITY_UPPER)
+        p = torch.clamp(self._adam_p, 0.0, self.p_probability_upper)
         add_param = torch.clamp(self._adam_q, 0.0, float(self._adam_add_parameter_upper()))
-        q = torch.clamp(self._q_from_add_parameter_tensor(add_param), 0.0, Q_PROBABILITY_UPPER)
+        q = torch.clamp(self._q_from_add_parameter_tensor(add_param), 0.0, self.q_probability_upper)
         return p, q
 
     @torch.no_grad()
     def _project_adam_state_(self) -> None:
         if self._adam_p is None or self._adam_q is None:
             raise RuntimeError("Adam pq controller is not initialized.")
-        self._adam_p.clamp_(0.0, P_PROBABILITY_UPPER)
+        self._adam_p.copy_(
+            torch.nan_to_num(
+                self._adam_p,
+                nan=0.0,
+                posinf=self.p_probability_upper,
+                neginf=0.0,
+            )
+        )
+        self._adam_q.copy_(
+            torch.nan_to_num(
+                self._adam_q,
+                nan=0.0,
+                posinf=float(self._adam_add_parameter_upper()),
+                neginf=0.0,
+            )
+        )
+        if self._adam_opt is not None:
+            for state in self._adam_opt.state.values():
+                for value in state.values():
+                    if torch.is_tensor(value):
+                        value.copy_(torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0))
+        self._adam_p.clamp_(0.0, self.p_probability_upper)
         self._adam_q.clamp_(0.0, float(self._adam_add_parameter_upper()))
 
     @torch.no_grad()
@@ -456,8 +615,8 @@ class PQGradNormTunerMB:
         elif aug_mode == "none":
             p, q = 0.0, 0.0
 
-        p = float(max(0.0, min(p, P_PROBABILITY_UPPER)))
-        q = float(max(0.0, min(q, Q_PROBABILITY_UPPER)))
+        p = float(max(0.0, min(p, self.p_probability_upper)))
+        q = float(max(0.0, min(q, self.q_probability_upper)))
         return p, q
 
     def _make_objective(
@@ -472,6 +631,7 @@ class PQGradNormTunerMB:
         log_gd: float,
         eps: float,
         batch_nodes: int,
+        empirical_gcn_variance: Optional[torch.Tensor] = None,
     ) -> Callable[[float, float], Tuple[float, float]]:
         if self.gnn == "gin":
             v_drop, v_add = self._var_gin_bases(cache, msg, msg_sq, batch_nodes)
@@ -490,14 +650,23 @@ class PQGradNormTunerMB:
                 t = q_try * (1.0 - q_try)
                 g2 = (s * s) * a + (t * t) * b + 2.0 * s * t * c
                 g_reg = math.sqrt(max(g2, 0.0))
-                obj = (math.log(g_reg + eps) - log_gd) ** 2 + self._objective_penalty_float(float(q_try))
+                obj = (math.log(g_reg + eps) - log_gd) ** 2 + self._objective_penalty_float(
+                    float(p_try), float(q_try)
+                )
                 return float(obj), float(g_reg)
 
             return objective
 
-        if self.gnn == "gcn":
+        if self.gnn in {"gcn", "gat"}:
             def objective(p_try: float, q_try: float) -> Tuple[float, float]:
-                v = self._var_gcn(cache, float(p_try), float(q_try), msg, msg_sq, batch_nodes)
+                if self.gnn == "gcn":
+                    v = (
+                        empirical_gcn_variance
+                        if empirical_gcn_variance is not None
+                        else self._var_gcn(cache, float(p_try), float(q_try), msg, msg_sq, batch_nodes)
+                    )
+                else:
+                    v = self._var_gat(cache, float(p_try), float(q_try), msg, msg_sq)
                 regularizer = 0.5 * (weight[idx] * v[idx]).sum() / max(int(idx.numel()), 1)
                 g_reg = torch.autograd.grad(
                     regularizer,
@@ -507,12 +676,14 @@ class PQGradNormTunerMB:
                     allow_unused=True,
                 )
                 greg = _grad_norm(g_reg)
-                obj = (math.log(greg + eps) - log_gd) ** 2 + self._objective_penalty_float(float(q_try))
+                obj = (math.log(greg + eps) - log_gd) ** 2 + self._objective_penalty_float(
+                    float(p_try), float(q_try)
+                )
                 return float(obj), float(greg)
 
             return objective
 
-        raise ValueError(f"Unsupported gnn={self.gnn}. Expected 'gin' or 'gcn'.")
+        raise ValueError(f"Unsupported gnn={self.gnn}. Expected 'gin', 'gcn', or 'gat'.")
 
     def _make_objective_tensor(
         self,
@@ -526,6 +697,7 @@ class PQGradNormTunerMB:
         log_gd: float,
         eps: float,
         batch_nodes: int,
+        empirical_gcn_variance: Optional[torch.Tensor] = None,
     ) -> Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
         log_gd_t = weight.new_tensor(float(log_gd))
         eps_t = weight.new_tensor(float(eps))
@@ -548,14 +720,23 @@ class PQGradNormTunerMB:
                 t = q_try * (one - q_try)
                 g2 = (s * s) * a + (t * t) * b + 2.0 * s * t * c
                 g_reg = torch.sqrt(torch.clamp_min(g2, 0.0))
-                obj = (torch.log(g_reg + eps_t) - log_gd_t) ** 2 + self._objective_penalty_tensor(q_try)
+                obj = (torch.log(g_reg + eps_t) - log_gd_t) ** 2 + self._objective_penalty_tensor(
+                    p_try, q_try
+                )
                 return obj, g_reg
 
             return objective
 
-        if self.gnn == "gcn":
+        if self.gnn in {"gcn", "gat"}:
             def objective(p_try: torch.Tensor, q_try: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-                v = self._var_gcn_tensor(cache, p_try, q_try, msg, msg_sq, batch_nodes)
+                if self.gnn == "gcn":
+                    v = (
+                        empirical_gcn_variance + (p_try * 0.0 + q_try * 0.0)
+                        if empirical_gcn_variance is not None
+                        else self._var_gcn_tensor(cache, p_try, q_try, msg, msg_sq, batch_nodes)
+                    )
+                else:
+                    v = self._var_gat_tensor(cache, p_try, q_try, msg, msg_sq)
                 regularizer = 0.5 * (weight[idx] * v[idx]).sum() / max(int(idx.numel()), 1)
                 g_reg = torch.autograd.grad(
                     regularizer,
@@ -570,12 +751,14 @@ class PQGradNormTunerMB:
                         continue
                     g2 = g2 + (grad * grad).sum()
                 greg = torch.sqrt(torch.clamp_min(g2, 0.0))
-                obj = (torch.log(greg + eps_t) - log_gd_t) ** 2 + self._objective_penalty_tensor(q_try)
+                obj = (torch.log(greg + eps_t) - log_gd_t) ** 2 + self._objective_penalty_tensor(
+                    p_try, q_try
+                )
                 return obj, greg
 
             return objective
 
-        raise ValueError(f"Unsupported gnn={self.gnn}. Expected 'gin' or 'gcn'.")
+        raise ValueError(f"Unsupported gnn={self.gnn}. Expected 'gin', 'gcn', or 'gat'.")
 
     def _search_grid(
         self,
@@ -856,6 +1039,7 @@ class PQGradNormTunerMB:
             "rho_best": float(rho_best),
             "G_reg_best": float(g_reg_best),
             "obj": float(obj_best),
+            "deletion_penalty_best": float(self._deletion_penalty_float(p_best)),
             "densification_penalty_best": float(self._densification_penalty_float(rho_best)),
             "rho_penalty_best": float(self._densification_penalty_float(rho_best)),
             "n_eval": float(meta.get("n_eval", 0.0)),
@@ -916,6 +1100,8 @@ class PQGradNormTunerMB:
             if "rho_best" in result:
                 info[f"comparison_{method}_rho_best"] = float(result["rho_best"])
             info[f"comparison_{method}_G_reg_best"] = float(result["G_reg_best"])
+            if "deletion_penalty_best" in result:
+                info[f"comparison_{method}_deletion_penalty_best"] = float(result["deletion_penalty_best"])
             info[f"comparison_{method}_n_eval"] = float(result["n_eval"])
             info[f"comparison_{method}_solver_success"] = float(result["solver_success"])
         return info
@@ -1251,10 +1437,21 @@ class PQGradNormTunerMB:
 
             weight = _w_multiclass(logits)
             msg, msg_sq = self._messages_detached(emb, model.pred_local.weight)
+            self._empirical_gcn_modules = (
+                self._collect_empirical_gcn_modules(model)
+                if self.ep_expectation_mode == "empirical_ema" and self.gnn == "gcn"
+                else []
+            )
+            self._gat_modules = self._collect_gat_modules(model) if self.gnn == "gat" else []
+            empirical_gcn_variance = (
+                self._empirical_gcn_variance(msg, msg_sq, p=float(current_p), q=float(current_q), eps=float(eps))
+                if self.ep_expectation_mode == "empirical_ema" and self.gnn == "gcn"
+                else None
+            )
 
             aug_mode_norm = str(aug_mode).lower().strip()
-            p_max = cfg.p_max if aug_mode_norm in ("both", "drop") else 0.0
-            q_max = cfg.q_max if aug_mode_norm in ("both", "add") else 0.0
+            p_max = self.search_p_max if aug_mode_norm in ("both", "drop") else 0.0
+            q_max = self.search_q_max if aug_mode_norm in ("both", "add") else 0.0
 
         _restore_batchnorm_buffers(bn_states)
         if not was_training:
@@ -1267,6 +1464,7 @@ class PQGradNormTunerMB:
             "weight": weight,
             "msg": msg,
             "msg_sq": msg_sq,
+            "empirical_gcn_variance": empirical_gcn_variance,
             "log_gd": float(log_gd),
             "eps": float(eps),
             "batch_nodes": int(batch_nodes),
@@ -1296,6 +1494,7 @@ class PQGradNormTunerMB:
             log_gd=snapshot["log_gd"],
             eps=snapshot["eps"],
             batch_nodes=snapshot["batch_nodes"],
+            empirical_gcn_variance=snapshot.get("empirical_gcn_variance"),
         )
 
         objective_tensor = None
@@ -1310,6 +1509,7 @@ class PQGradNormTunerMB:
                 log_gd=snapshot["log_gd"],
                 eps=snapshot["eps"],
                 batch_nodes=snapshot["batch_nodes"],
+                empirical_gcn_variance=snapshot.get("empirical_gcn_variance"),
             )
 
         return objective, objective_tensor
@@ -1373,7 +1573,10 @@ class PQGradNormTunerMB:
                 obj = (math.log(greg + eps) - float(stats["log_gd"])) ** 2
                 obj_sum += weight_b * obj
                 greg_sum += weight_b * greg
-            return obj_sum / total_weight + self._objective_penalty_float(float(q_try)), greg_sum / total_weight
+            return (
+                obj_sum / total_weight + self._objective_penalty_float(float(p_try), float(q_try)),
+                greg_sum / total_weight,
+            )
 
         objective_tensor = None
         if include_tensor:
@@ -1396,7 +1599,7 @@ class PQGradNormTunerMB:
                     obj_sum_t = obj_sum_t + float(weight_b) * obj
                     greg_sum_t = greg_sum_t + float(weight_b) * greg
                 denom = float(total_weight)
-                return obj_sum_t / denom + self._objective_penalty_tensor(q_try), greg_sum_t / denom
+                return obj_sum_t / denom + self._objective_penalty_tensor(p_try, q_try), greg_sum_t / denom
 
         return objective, objective_tensor
 
@@ -1415,8 +1618,8 @@ class PQGradNormTunerMB:
         if len(cached_gin_stats) == 0:
             return {}
 
-        p_max = cfg.p_max if aug_mode in ("both", "drop") else 0.0
-        q_max = cfg.q_max if aug_mode in ("both", "add") else 0.0
+        p_max = self.search_p_max if aug_mode in ("both", "drop") else 0.0
+        q_max = self.search_q_max if aug_mode in ("both", "add") else 0.0
         include_tensor = (self.search_method == "newton") or bool(cfg.compare_search_methods) or bool(capture_surface)
         objective, objective_tensor = self._make_joint_epoch_objective_from_gin_stats(
             cached_gin_stats,
@@ -1486,6 +1689,7 @@ class PQGradNormTunerMB:
             "rho_epoch_best": float(self._rho_from_q_float(best_q)),
             "G_reg_best_mean": float(best_greg),
             "obj_mean": float(best_obj),
+            "deletion_penalty_best": float(self._deletion_penalty_float(best_p)),
             "densification_penalty_best": float(
                 self._densification_penalty_float(self._rho_from_q_float(best_q))
             ),
@@ -1587,8 +1791,8 @@ class PQGradNormTunerMB:
 
                 surface_data = None
                 if capture_surface:
-                    p_surface_upper = P_PROBABILITY_UPPER if aug_mode in ("both", "drop") else 0.0
-                    q_surface_upper = Q_PROBABILITY_UPPER if aug_mode in ("both", "add") else 0.0
+                    p_surface_upper = self.p_probability_upper if aug_mode in ("both", "drop") else 0.0
+                    q_surface_upper = self.q_probability_upper if aug_mode in ("both", "add") else 0.0
                     surface_data = self._sample_objective_surface(
                         objective,
                         p_max=p_surface_upper,
@@ -1608,6 +1812,8 @@ class PQGradNormTunerMB:
                             "rho_new": float(self._rho_from_q_float(q_new)),
                             "G_reg_new": float(greg_new),
                             "obj_new": float(obj_new),
+                            "deletion_penalty_best": float(self._deletion_penalty_float(best_p)),
+                            "deletion_penalty_new": float(self._deletion_penalty_float(p_new)),
                             "densification_penalty_best": float(
                                 self._densification_penalty_float(self._rho_from_q_float(best_q))
                             ),
@@ -1637,10 +1843,12 @@ class PQGradNormTunerMB:
                     "obj": float(best_obj),
                     "G_reg_new": float(greg_new),
                     "obj_new": float(obj_new),
+                    "deletion_penalty_best": float(self._deletion_penalty_float(best_p)),
                     "densification_penalty_best": float(
                         self._densification_penalty_float(self._rho_from_q_float(best_q))
                     ),
                     "rho_penalty_best": float(self._densification_penalty_float(self._rho_from_q_float(best_q))),
+                    "deletion_penalty_new": float(self._deletion_penalty_float(p_new)),
                     "densification_penalty_new": float(
                         self._densification_penalty_float(self._rho_from_q_float(q_new))
                     ),
@@ -1650,6 +1858,7 @@ class PQGradNormTunerMB:
                     "search_method": "adam",
                     "optimize_rho": bool(self.optimize_rho),
                     "optimization_variable": self._add_parameter_name(),
+                    "deletion_penalty_lambda": float(getattr(cfg, "deletion_penalty_lambda", 0.0)),
                     "densification_penalty_lambda": float(getattr(cfg, "densification_penalty_lambda", 0.0)),
                     "densification_penalty_type": str(self.penalty_type),
                     "densification_penalty_rho0": float(self.penalty_rho0),
@@ -1726,8 +1935,8 @@ class PQGradNormTunerMB:
         elif aug_mode == "none":
             best_p, best_q = 0.0, 0.0
 
-        best_p = float(max(0.0, min(best_p, cfg.p_max)))
-        best_q = float(max(0.0, min(best_q, cfg.q_max)))
+        best_p = float(max(0.0, min(best_p, self.search_p_max)))
+        best_q = float(max(0.0, min(best_q, self.search_q_max)))
 
         info: Dict[str, Any] = {
             "G_data": float(g_data_norm),
@@ -1736,6 +1945,7 @@ class PQGradNormTunerMB:
             "q_best": float(best_q),
             "rho_best": float(self._rho_from_q_float(best_q)),
             "obj": float(best_obj),
+            "deletion_penalty_best": float(self._deletion_penalty_float(best_p)),
             "densification_penalty_best": float(
                 self._densification_penalty_float(self._rho_from_q_float(best_q))
             ),
@@ -1744,6 +1954,7 @@ class PQGradNormTunerMB:
             "batch_train_used": float(snapshot["batch_train_used"]),
             "search_method": str(self.search_method),
             "optimize_rho": bool(self.optimize_rho),
+            "deletion_penalty_lambda": float(getattr(cfg, "deletion_penalty_lambda", 0.0)),
             "densification_penalty_lambda": float(getattr(cfg, "densification_penalty_lambda", 0.0)),
             "densification_penalty_type": str(self.penalty_type),
             "densification_penalty_rho0": float(self.penalty_rho0),
@@ -1912,8 +2123,8 @@ class PQGradNormTunerMB:
         if len(frozen_batches) == 0:
             return {}
 
-        p_max = cfg.p_max if aug_mode in ("both", "drop") else 0.0
-        q_max = cfg.q_max if aug_mode in ("both", "add") else 0.0
+        p_max = self.search_p_max if aug_mode in ("both", "drop") else 0.0
+        q_max = self.search_q_max if aug_mode in ("both", "add") else 0.0
         include_tensor = (self.search_method == "newton") or bool(cfg.compare_search_methods) or bool(capture_surface)
 
         objective, objective_tensor = self._make_joint_epoch_objective(
@@ -1992,6 +2203,7 @@ class PQGradNormTunerMB:
             "rho_epoch_best": float(self._rho_from_q_float(best_q)),
             "G_reg_best_mean": float(best_greg),
             "obj_mean": float(best_obj),
+            "deletion_penalty_best": float(self._deletion_penalty_float(best_p)),
             "densification_penalty_best": float(
                 self._densification_penalty_float(self._rho_from_q_float(best_q))
             ),
@@ -2091,6 +2303,7 @@ class PQGradNormTunerMB:
             "rho_epoch_best": float(self._rho_from_q_float(best_q)),
             "G_reg_best_mean": best_greg,
             "obj_mean": best_obj,
+            "deletion_penalty_best": float(self._deletion_penalty_float(best_p)),
             "densification_penalty_best": float(
                 self._densification_penalty_float(self._rho_from_q_float(best_q))
             ),
@@ -2115,6 +2328,7 @@ class PQGradNormTunerMB:
                         "rho_best": float(self._rho_from_q_float(best_q)),
                         "G_reg_best": best_greg,
                         "obj": best_obj,
+                        "deletion_penalty_best": float(self._deletion_penalty_float(best_p)),
                         "densification_penalty_best": float(
                             self._densification_penalty_float(self._rho_from_q_float(best_q))
                         ),
@@ -2183,6 +2397,7 @@ class PQGradNormTunerMB:
                 "q_best": 0.0,
                 "rho_best": 0.0,
                 "G_reg_best": 0.0,
+                "deletion_penalty_best": 0.0,
                 "densification_penalty_best": 0.0,
                 "n_eval": 0.0,
                 "solver_success": 0.0,
@@ -2407,6 +2622,12 @@ class PQGradNormTunerMB:
                         "q_best": float(info_b["q_best"]),
                         "rho_best": float(info_b.get("rho_best", self._rho_from_q_float(float(info_b["q_best"])))),
                         "G_reg_best": float(info_b["G_reg_best"]),
+                        "deletion_penalty_best": float(
+                            info_b.get(
+                                "deletion_penalty_best",
+                                self._deletion_penalty_float(float(info_b["p_best"])),
+                            )
+                        ),
                         "densification_penalty_best": float(
                             info_b.get(
                                 "densification_penalty_best",
@@ -2428,6 +2649,12 @@ class PQGradNormTunerMB:
                     result.get("rho_best", self._rho_from_q_float(float(result["q_best"])))
                 )
                 method_agg[method]["G_reg_best"] += weight_b * float(result["G_reg_best"])
+                method_agg[method]["deletion_penalty_best"] += weight_b * float(
+                    result.get(
+                        "deletion_penalty_best",
+                        self._deletion_penalty_float(float(result["p_best"])),
+                    )
+                )
                 method_agg[method]["densification_penalty_best"] += weight_b * float(
                     result.get(
                         "densification_penalty_best",
@@ -2485,6 +2712,9 @@ class PQGradNormTunerMB:
                     "G_reg_best_mean": 0.0,
                     "obj_mean": 0.0,
                     "epoch_objective_mode": str(epoch_mode),
+                    "deletion_penalty_best": float(self._deletion_penalty_float(p_best)),
+                    "deletion_penalty_new": float(self._deletion_penalty_float(p_new)),
+                    "deletion_penalty_lambda": float(getattr(cfg, "deletion_penalty_lambda", 0.0)),
                 }
                 return p_new, q_new, info
 
@@ -2499,8 +2729,8 @@ class PQGradNormTunerMB:
                     surface_grid_size=surface_grid_size,
                 )
             elif use_streamed_gcn_joint_grid:
-                p_max = cfg.p_max if aug_mode in ("both", "drop") else 0.0
-                q_max = cfg.q_max if aug_mode in ("both", "add") else 0.0
+                p_max = self.search_p_max if aug_mode in ("both", "drop") else 0.0
+                q_max = self.search_q_max if aug_mode in ("both", "add") else 0.0
                 joint_info = self._finalize_gcn_joint_grid_stream_state(
                     gcn_joint_grid_state,
                     p_max=p_max,
@@ -2534,8 +2764,8 @@ class PQGradNormTunerMB:
             elif aug_mode == "none":
                 p_new, q_new = 0.0, 0.0
 
-            p_new = float(max(0.0, min(p_new, cfg.p_max)))
-            q_new = float(max(0.0, min(q_new, cfg.q_max)))
+            p_new = float(max(0.0, min(p_new, self.search_p_max)))
+            q_new = float(max(0.0, min(q_new, self.search_q_max)))
 
             def _mean(values: List[float]) -> float:
                 return float(sum(values) / max(len(values), 1))
@@ -2556,6 +2786,8 @@ class PQGradNormTunerMB:
                 "obj_mean": float(joint_info["obj_mean"]),
                 "epoch_objective_mode": str(epoch_mode),
                 "optimize_rho": bool(self.optimize_rho),
+                "deletion_penalty_new": float(self._deletion_penalty_float(p_new)),
+                "deletion_penalty_lambda": float(getattr(cfg, "deletion_penalty_lambda", 0.0)),
                 "densification_penalty_lambda": float(getattr(cfg, "densification_penalty_lambda", 0.0)),
                 "densification_penalty_type": str(self.penalty_type),
                 "densification_penalty_rho0": float(self.penalty_rho0),
@@ -2583,8 +2815,8 @@ class PQGradNormTunerMB:
         elif aug_mode == "none":
             p_new, q_new = 0.0, 0.0
 
-        p_new = float(max(0.0, min(p_new, cfg.p_max)))
-        q_new = float(max(0.0, min(q_new, cfg.q_max)))
+        p_new = float(max(0.0, min(p_new, self.search_p_max)))
+        q_new = float(max(0.0, min(q_new, self.search_q_max)))
 
         def _mean(values: List[float]) -> float:
             return float(sum(values) / max(len(values), 1))
@@ -2601,6 +2833,7 @@ class PQGradNormTunerMB:
                     "q_best": method_agg[method]["q_best"] / weight,
                     "rho_best": method_agg[method]["rho_best"] / weight,
                     "G_reg_best": method_agg[method]["G_reg_best"] / weight,
+                    "deletion_penalty_best": method_agg[method]["deletion_penalty_best"] / weight,
                     "densification_penalty_best": method_agg[method]["densification_penalty_best"] / weight,
                     "n_eval": method_agg[method]["n_eval"] / weight,
                     "solver_success": method_agg[method]["solver_success"] / weight,
@@ -2622,6 +2855,9 @@ class PQGradNormTunerMB:
             "obj_mean": _mean(obj_list),
             "epoch_objective_mode": str(epoch_mode),
             "optimize_rho": bool(self.optimize_rho),
+            "deletion_penalty_best": float(self._deletion_penalty_float(p_avg)),
+            "deletion_penalty_new": float(self._deletion_penalty_float(p_new)),
+            "deletion_penalty_lambda": float(getattr(cfg, "deletion_penalty_lambda", 0.0)),
             "densification_penalty_lambda": float(getattr(cfg, "densification_penalty_lambda", 0.0)),
             "densification_penalty_type": str(self.penalty_type),
             "densification_penalty_rho0": float(self.penalty_rho0),

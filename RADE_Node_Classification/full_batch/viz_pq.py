@@ -184,14 +184,27 @@ def _plot_schedule(
             if use_log_scale:
                 mask = mask & (y > 0.0)
             if mask.any():
-                ax.plot(epochs[mask], y[mask], linewidth=1.0, alpha=0.25)
+                ax.plot(
+                    epochs[mask],
+                    y[mask],
+                    linewidth=1.0,
+                    alpha=0.25,
+                    marker="o" if int(mask.sum()) == 1 else None,
+                    markersize=3.5,
+                )
 
     # mean + std shading
     mean_mask = valid_cols & ~np.isnan(mean)
     if use_log_scale:
         mean_mask = mean_mask & (mean > 0.0)
     if mean_mask.any():
-        ax.plot(epochs[mean_mask], mean[mean_mask], linewidth=2.0)
+        ax.plot(
+            epochs[mean_mask],
+            mean[mean_mask],
+            linewidth=2.0,
+            marker="o" if int(mean_mask.sum()) == 1 else None,
+            markersize=4.5,
+        )
         if use_log_scale:
             pos = arr[np.isfinite(arr) & (arr > 0.0)]
             lower_floor = float(pos.min()) if pos.size > 0 else 1e-12
@@ -233,8 +246,9 @@ def _plot_schedule(
     # No title
     fig.tight_layout()
 
-    # filename format requested: e.g., visualization/cora_gcn_rade_p.png
-    out_path = os.path.join(out_dir, f"{tag}_{name}.png")
+    # filename format requested: e.g., visualization/cora_gcn_rade_p.pdf
+    ext = "pdf" if name in {"p", "q"} else "png"
+    out_path = os.path.join(out_dir, f"{tag}_{name}.{ext}")
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
 
