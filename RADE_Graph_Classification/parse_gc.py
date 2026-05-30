@@ -29,7 +29,6 @@ TU_REFERENCE_DEFAULTS = {
     "seed": 0,
     "epochs": 350,
     "lr": 0.01,
-    # "iters_per_epoch": 50,
     "patience": 0,
 }
 
