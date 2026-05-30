@@ -6,6 +6,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch_geometric.nn import GATConv
 from torch_geometric.nn.inits import reset
 
 
@@ -104,3 +105,46 @@ class DropMessageGINConvGC(nn.Module):
         neigh_sum = _scatter_add_rows(msg, col, N)
         out = (1.0 + self.eps.to(x.device)) * x + neigh_sum
         return self.mlp(out)
+
+
+class DropMessageGATConvGC(nn.Module):
+    """
+    Baseline GAT with DropMessage-style attention/message dropout.
+
+    PyG's GATConv implements this by dropping normalized attention
+    coefficients during training.
+    """
+    supports_dropmessage = True
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        *,
+        heads: int = 1,
+        concat: bool = True,
+        negative_slope: float = 0.2,
+        bias: bool = True,
+    ):
+        super().__init__()
+        self.conv = GATConv(
+            in_channels,
+            out_channels,
+            heads=heads,
+            concat=concat,
+            negative_slope=negative_slope,
+            dropout=0.0,
+            add_self_loops=False,
+            bias=bias,
+        )
+
+    def reset_parameters(self) -> None:
+        self.conv.reset_parameters()
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, drop_rate: float = 0.0) -> torch.Tensor:
+        previous_dropout = float(self.conv.dropout)
+        self.conv.dropout = float(drop_rate) if self.training else 0.0
+        try:
+            return self.conv(x, edge_index)
+        finally:
+            self.conv.dropout = previous_dropout

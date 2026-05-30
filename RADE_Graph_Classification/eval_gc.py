@@ -12,6 +12,11 @@ try:
 except Exception:
     from data_utils_gc import eval_acc_graph, eval_ogb_rocauc, eval_ogb_ap, get_primary_metric, eval_graph_metric
 
+try:
+    from ogb.graphproppred import Evaluator
+except Exception:
+    Evaluator = None
+
 
 def forward_model(model: nn.Module, batch, *, use_edge_attr: bool, p: float = 0.0, q: float = 0.0) -> torch.Tensor:
     """
@@ -19,19 +24,20 @@ def forward_model(model: nn.Module, batch, *, use_edge_attr: bool, p: float = 0.
       model(x, edge_index, batch, edge_attr=..., p=..., q=...)
     """
     edge_attr = getattr(batch, "edge_attr", None) if use_edge_attr else None
+    node_ids = getattr(batch, "n_id", None)
 
     # Try the full signature first
     try:
-        return model(batch.x, batch.edge_index, batch.batch, edge_attr=edge_attr, p=float(p), q=float(q))
+        return model(batch.x, batch.edge_index, batch.batch, edge_attr=edge_attr, p=float(p), q=float(q), node_ids=node_ids)
     except TypeError:
         pass
 
     # Fallbacks (older models)
     try:
-        return model(batch.x, batch.edge_index, batch.batch, edge_attr=edge_attr)
+        return model(batch.x, batch.edge_index, batch.batch, edge_attr=edge_attr, node_ids=node_ids)
     except Exception:
         try:
-            return model(batch.x, batch.edge_index, batch.batch)
+            return model(batch.x, batch.edge_index, batch.batch, node_ids=node_ids)
         except Exception:
             return model(batch.x, batch.edge_index)
 
@@ -45,6 +51,25 @@ def masked_bce_with_logits(logits: torch.Tensor, y: torch.Tensor) -> torch.Tenso
 
 
 def _eval_metric(metric: str, dataset_name: str, y_true: torch.Tensor, logits: torch.Tensor) -> float:
+    dataset_name = str(dataset_name).lower().strip()
+    if dataset_name == "ogbg-molhiv":
+        if Evaluator is None:
+            raise ImportError("OGB Evaluator is required for ogbg-molhiv evaluation.")
+        y = y_true
+        if y.dim() == 1:
+            y = y.view(-1, 1)
+        pred = logits
+        if pred.dim() == 1:
+            pred = pred.view(-1, 1)
+        evaluator = Evaluator(name="ogbg-molhiv")
+        result = evaluator.eval(
+            {
+                "y_true": y.detach().cpu().numpy(),
+                "y_pred": pred.detach().cpu().numpy(),
+            }
+        )
+        return float(result["rocauc"])
+
     if metric == "auto":
         # uses get_primary_metric() internally
         return eval_graph_metric(dataset_name, y_true, logits)
@@ -76,7 +101,7 @@ def evaluate_loader(
     if device is not None:
         model = model.to(device)
 
-    total_loss = 0.0
+    total_loss_tensor: Optional[torch.Tensor] = None
     total_graphs = 0
     ys = []
     outs = []
@@ -104,7 +129,8 @@ def evaluate_loader(
             raise ValueError(f"Unsupported criterion type: {type(criterion)}")
 
         bsz = int(batch.num_graphs) if hasattr(batch, "num_graphs") else int(y.size(0))
-        total_loss += float(loss.item()) * bsz
+        loss_term = loss.detach() * float(bsz)
+        total_loss_tensor = loss_term if total_loss_tensor is None else total_loss_tensor + loss_term
         total_graphs += bsz
 
         ys.append(y.detach().cpu())
@@ -117,6 +143,7 @@ def evaluate_loader(
     out_all = torch.cat(outs, dim=0)
 
     score = _eval_metric(metric, dataset_name, y_all, out_all)
+    total_loss = float(total_loss_tensor.item()) if total_loss_tensor is not None else 0.0
     avg_loss = total_loss / max(total_graphs, 1)
     return float(score), float(avg_loss)
 

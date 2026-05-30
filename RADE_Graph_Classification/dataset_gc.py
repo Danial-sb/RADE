@@ -2,26 +2,49 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
-from typing import Dict, Tuple, Optional, Any
+import zipfile
+from typing import Dict, List, Tuple, Optional, Any
 
+import numpy as np
 import torch
-import torch.nn.functional as F
-import torch_geometric.transforms as T
 from torch_geometric.data import Data
 from torch_geometric.datasets import LRGBDataset
-from torch_geometric.datasets import TUDataset
 from torch_geometric.utils import (
     coalesce,
     remove_self_loops,
     to_undirected,
-    degree,
 )
+from sklearn.model_selection import StratifiedKFold
 
 try:
     from ogb.graphproppred import PygGraphPropPredDataset
 except Exception:
     PygGraphPropPredDataset = None
+
+
+class GraphIdentityDataset:
+    def __init__(self, base_dataset, node_offsets=None, *, attach_node_ids: bool = True):
+        self.base_dataset = base_dataset
+        self.node_offsets = [int(offset) for offset in node_offsets] if node_offsets is not None else []
+        self.attach_node_ids = bool(attach_node_ids)
+        self.global_num_nodes_total = int(node_offsets[-1]) if node_offsets else 0
+
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def __getitem__(self, idx):
+        data = self.base_dataset[idx]
+        if hasattr(data, "clone"):
+            data = data.clone()
+        num_nodes = int(data.num_nodes)
+        if self.attach_node_ids:
+            offset = int(self.node_offsets[int(idx)])
+            data.n_id = torch.arange(num_nodes, dtype=torch.long) + offset
+        data.graph_id = torch.tensor([int(idx)], dtype=torch.long)
+        return data
+
+    def __getattr__(self, name):
+        return getattr(self.base_dataset, name)
 
 
 # -------------------------
@@ -58,6 +81,18 @@ def _tu_official_name(canon: str) -> str:
         return "IMDB-BINARY"
     if canon == "imdb-m":
         return "IMDB-MULTI"
+    raise ValueError(f"Not a TU dataset canon name: {canon}")
+
+
+def _powerful_gnns_tu_name(canon: str) -> str:
+    if canon == "mutag":
+        return "MUTAG"
+    if canon == "proteins":
+        return "PROTEINS"
+    if canon == "imdb-b":
+        return "IMDBBINARY"
+    if canon == "imdb-m":
+        return "IMDBMULTI"
     raise ValueError(f"Not a TU dataset canon name: {canon}")
 
 def _load_lrgb_peptides(root: str, name: str):
@@ -98,6 +133,184 @@ def _random_split_graphs(
     return {"train": train_idx, "valid": valid_idx, "test": test_idx}
 
 
+def _graph_node_offsets(dataset) -> list[int]:
+    offsets = [0]
+    running = 0
+    for idx in range(len(dataset)):
+        running += int(dataset[idx].num_nodes)
+        offsets.append(running)
+    return offsets
+
+
+def attach_graph_identity(dataset, *, attach_node_ids: bool = True):
+    offsets = _graph_node_offsets(dataset) if attach_node_ids else None
+    wrapped = GraphIdentityDataset(dataset, offsets, attach_node_ids=attach_node_ids)
+    return wrapped, int(wrapped.global_num_nodes_total)
+
+
+def _read_powerful_gnns_text(raw_root: str, dataset_name: str) -> Tuple[List[str], str]:
+    root = os.path.abspath(os.path.expanduser(raw_root))
+    txt_rel = os.path.join("dataset", dataset_name, f"{dataset_name}.txt")
+    extracted_path = os.path.join(root, txt_rel)
+    if os.path.exists(extracted_path):
+        with open(extracted_path, "r", encoding="utf-8") as handle:
+            return handle.readlines(), extracted_path
+
+    zip_path = os.path.join(root, "dataset.zip")
+    if os.path.exists(zip_path):
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            zip_member = txt_rel.replace(os.sep, "/")
+            with archive.open(zip_member, "r") as handle:
+                text = handle.read().decode("utf-8")
+        return text.splitlines(keepends=True), f"{zip_path}:{zip_member}"
+
+    raise FileNotFoundError(
+        "Could not find TU raw data. Expected either "
+        f"'{extracted_path}' or '{zip_path}'."
+    )
+
+
+def load_powerful_gnns_tu_dataset(
+    raw_root: str,
+    name: str,
+    *,
+    attach_graph_ids: bool = False,
+    attach_global_node_ids: bool = False,
+) -> Tuple[Any, Dict[str, Any]]:
+    """
+    Load TU graphs with the same raw parser semantics as powerful-gnns/util.py.
+
+    The returned dataset is a list of PyG Data objects so the RADE training code
+    can keep using the existing model and augmentation path unchanged.
+    """
+    canon = _canon_name(name)
+    if canon not in {"mutag", "proteins", "imdb-b", "imdb-m"}:
+        raise ValueError(f"powerful-gnns TU loading only supports TU datasets. Got '{name}'.")
+
+    raw_name = _powerful_gnns_tu_name(canon)
+    lines, source = _read_powerful_gnns_text(raw_root, raw_name)
+    cursor = 0
+    num_graphs = int(lines[cursor].strip())
+    cursor += 1
+
+    label_to_index: Dict[int, int] = {}
+    raw_graphs: List[Dict[str, Any]] = []
+    feature_to_index: Dict[int, int] = {}
+    degree_as_tag = canon in {"imdb-b", "imdb-m"}
+
+    for _ in range(num_graphs):
+        num_nodes, raw_label = [int(value) for value in lines[cursor].strip().split()]
+        cursor += 1
+        if raw_label not in label_to_index:
+            label_to_index[raw_label] = len(label_to_index)
+
+        node_tags: List[int] = []
+        neighbors = [set() for _ in range(num_nodes)]
+        for node_idx in range(num_nodes):
+            row = lines[cursor].strip().split()
+            cursor += 1
+            num_neighbors = int(row[1])
+            adjacency_end = num_neighbors + 2
+            node_tag_raw = int(row[0])
+            if node_tag_raw not in feature_to_index:
+                feature_to_index[node_tag_raw] = len(feature_to_index)
+            node_tags.append(feature_to_index[node_tag_raw])
+
+            for neighbor_raw in row[2:adjacency_end]:
+                neighbor_idx = int(neighbor_raw)
+                neighbors[node_idx].add(neighbor_idx)
+                neighbors[neighbor_idx].add(node_idx)
+
+        if degree_as_tag:
+            node_tags = [len(neighbor_set) for neighbor_set in neighbors]
+
+        undirected_edges = []
+        for src, neighbor_set in enumerate(neighbors):
+            for dst in neighbor_set:
+                if src < dst:
+                    undirected_edges.append((src, dst))
+
+        directed_edges = []
+        for src, dst in undirected_edges:
+            directed_edges.append((src, dst))
+            directed_edges.append((dst, src))
+
+        edge_index = (
+            torch.tensor(directed_edges, dtype=torch.long).t().contiguous()
+            if directed_edges
+            else torch.empty((2, 0), dtype=torch.long)
+        )
+        raw_graphs.append(
+            {
+                "node_tags": node_tags,
+                "edge_index": edge_index,
+                "label": label_to_index[raw_label],
+                "num_nodes": num_nodes,
+            }
+        )
+
+    tagset = set()
+    for graph in raw_graphs:
+        tagset = tagset.union(set(graph["node_tags"]))
+    tag_list = list(tagset)
+    tag_to_index = {tag: idx for idx, tag in enumerate(tag_list)}
+
+    dataset: List[Data] = []
+    for graph_idx, graph in enumerate(raw_graphs):
+        node_tags = graph["node_tags"]
+        x = torch.zeros((len(node_tags), len(tag_list)), dtype=torch.float32)
+        x[torch.arange(len(node_tags)), torch.tensor([tag_to_index[tag] for tag in node_tags])] = 1.0
+        data = Data(
+            x=x,
+            edge_index=graph["edge_index"],
+            y=torch.tensor([int(graph["label"])], dtype=torch.long),
+            num_nodes=int(graph["num_nodes"]),
+        )
+        data.graph_id = torch.tensor([graph_idx], dtype=torch.long)
+        dataset.append(data)
+
+    meta = {
+        "dataset_family": "tu",
+        "dataset_name": raw_name,
+        "task_type": "multiclass",
+        "metric": "acc",
+        "loss": "ce",
+        "evaluator_name": None,
+        "in_dim": int(dataset[0].x.size(-1)),
+        "out_dim": int(len(label_to_index)),
+        "num_classes": int(len(label_to_index)),
+        "y_format": "long_class_index",
+        "raw_source": source,
+        "degree_as_tag": bool(degree_as_tag),
+    }
+    if attach_global_node_ids:
+        dataset_wrapped, total_nodes = attach_graph_identity(dataset)
+        meta["global_num_nodes_total"] = int(total_nodes)
+        return dataset_wrapped, meta
+    if attach_graph_ids:
+        dataset_wrapped, _ = attach_graph_identity(dataset, attach_node_ids=False)
+        return dataset_wrapped, meta
+    return dataset, meta
+
+
+def make_powerful_gnns_tu_folds(dataset, *, seed: int) -> List[Dict[str, torch.Tensor]]:
+    labels = []
+    for graph in dataset:
+        y = graph.y
+        labels.append(int(y.view(-1)[0].item()))
+
+    splitter = StratifiedKFold(n_splits=10, shuffle=True, random_state=int(seed))
+    folds: List[Dict[str, torch.Tensor]] = []
+    for train_idx, valid_idx in splitter.split(np.zeros(len(labels)), labels):
+        folds.append(
+            {
+                "train": torch.as_tensor(train_idx, dtype=torch.long),
+                "valid": torch.as_tensor(valid_idx, dtype=torch.long),
+            }
+        )
+    return folds
+
+
 def _sanitize_graph(
     data: Data,
     *,
@@ -127,69 +340,6 @@ def _sanitize_graph(
     return data
 
 
-def _needs_degree_features(dataset: TUDataset) -> bool:
-    for i in range(min(len(dataset), 50)):
-        if dataset[i].x is None:
-            return True
-    return False
-
-
-def _compute_max_degree_tu(dataset: TUDataset, make_undirected_edges: bool) -> int:
-    max_deg = 0
-    for i in range(len(dataset)):
-        d = dataset[i]
-        d = _sanitize_graph(d, make_undirected_edges=make_undirected_edges)
-        row = d.edge_index[0]
-        deg = degree(row, num_nodes=int(d.num_nodes)).to(torch.long)
-        max_deg = max(max_deg, int(deg.max().item()) if deg.numel() > 0 else 0)
-    return int(max_deg)
-
-
-@dataclass
-class TUPreprocessConfig:
-    make_undirected_edges: bool = True
-    normalize_features: bool = False
-    degree_onehot: bool = True
-    degree_cap: Optional[int] = None
-
-
-class _TUTransform:
-    def __init__(self, cfg: TUPreprocessConfig, max_degree: int):
-        self.cfg = cfg
-        self.max_degree = int(max_degree)
-        self.norm = T.NormalizeFeatures() if cfg.normalize_features else None
-
-    def __call__(self, data: Data) -> Data:
-        data = _sanitize_graph(data, make_undirected_edges=self.cfg.make_undirected_edges)
-
-        if data.y is not None:
-            data.y = data.y.view(-1).to(torch.long)
-
-        if data.x is None:
-            row = data.edge_index[0]
-            deg = degree(row, num_nodes=int(data.num_nodes)).to(torch.long)
-
-            cap = self.cfg.degree_cap
-            if cap is not None:
-                deg = torch.clamp(deg, max=int(cap))
-                K = int(cap)
-            else:
-                K = int(self.max_degree)
-
-            if self.cfg.degree_onehot:
-                data.x = F.one_hot(deg, num_classes=K + 1).to(torch.float32)
-            else:
-                data.x = deg.view(-1, 1).to(torch.float32)
-        else:
-            if not torch.is_floating_point(data.x):
-                data.x = data.x.to(torch.float32)
-
-        if self.norm is not None:
-            data = self.norm(data)
-
-        return data
-
-
 # -------------------------
 # Public loader
 # -------------------------
@@ -201,7 +351,8 @@ def load_gc_dataset(
     seed: int = 0,
     train_prop: float = 0.8,
     valid_prop: float = 0.1,
-    tu_cfg: Optional[TUPreprocessConfig] = None,
+    attach_graph_ids: bool = False,
+    attach_global_node_ids: bool = False,
 ) -> Tuple[Any, Dict[str, torch.Tensor], Dict[str, Any]]:
     """
     Returns:
@@ -213,49 +364,12 @@ def load_gc_dataset(
     """
     canon = _canon_name(name)
 
-    # -------------------------
-    # TU datasets (random split)
-    # -------------------------
     if canon in {"mutag", "proteins", "imdb-b", "imdb-m"}:
-        tu_name = _tu_official_name(canon)
-        root_dir = os.path.join(root, "TU")
-        ds = TUDataset(root=root_dir, name=tu_name)
-
-        cfg = tu_cfg if tu_cfg is not None else TUPreprocessConfig(
-            make_undirected_edges=True,
-            normalize_features=False,
-            degree_onehot=True,
-            degree_cap=None,
+        raise ValueError(
+            "TU datasets use the dedicated reference 10-fold workflow. "
+            "Call load_powerful_gnns_tu_dataset(...) with make_powerful_gnns_tu_folds(...), "
+            "or run main_gc.py directly."
         )
-
-        needs_deg = _needs_degree_features(ds)
-        max_deg_used = 0
-        if needs_deg:
-            max_deg = _compute_max_degree_tu(ds, make_undirected_edges=cfg.make_undirected_edges)
-            max_deg_used = int(cfg.degree_cap) if cfg.degree_cap is not None else int(max_deg)
-
-        # IMPORTANT: always transform (sanitize edges + ensure float x)
-        ds.transform = _TUTransform(cfg=cfg, max_degree=max_deg_used)
-
-        split_idx = _random_split_graphs(len(ds), train_prop=train_prop, valid_prop=valid_prop, seed=seed)
-
-        # infer in_dim after transform
-        d0 = ds[int(split_idx["train"][0])]
-        in_dim = int(d0.x.size(-1))
-
-        meta = {
-            "dataset_family": "tu",
-            "dataset_name": tu_name,
-            "task_type": "multiclass",
-            "metric": "acc",
-            "loss": "ce",
-            "evaluator_name": None,
-            "in_dim": in_dim,
-            "out_dim": int(ds.num_classes),
-            "num_classes": int(ds.num_classes),
-            "y_format": "long_class_index",
-        }
-        return ds, split_idx, meta
 
     # -------------------------
     # OGBG datasets (official split)
@@ -268,7 +382,6 @@ def load_gc_dataset(
         ds = PygGraphPropPredDataset(name=canon, root=root_dir)
 
         def ogb_transform(data: Data) -> Data:
-            data = _sanitize_graph(data, make_undirected_edges=False, remove_loops=True)
             if data.y is not None:
                 data.y = data.y.to(torch.float32)
             return data
@@ -309,6 +422,11 @@ def load_gc_dataset(
                 "y_format": "float_with_nan_or_minus1_missing",
             }
 
+        if attach_global_node_ids:
+            ds, total_nodes = attach_graph_identity(ds)
+            meta["global_num_nodes_total"] = int(total_nodes)
+        elif attach_graph_ids:
+            ds, _ = attach_graph_identity(ds, attach_node_ids=False)
         return ds, split_idx, meta
 
     if canon in ["peptides-func"]:
@@ -316,8 +434,6 @@ def load_gc_dataset(
         dataset, split_idx = _load_lrgb_peptides(root, pyg_name)
 
         def pep_transform(data: Data) -> Data:
-            if data.x is not None and not torch.is_floating_point(data.x):
-                data.x = data.x.to(torch.float32)
             if getattr(data, "y", None) is not None:
                 data.y = data.y.to(torch.float32)
             data.edge_index = data.edge_index.to(torch.long)
@@ -331,6 +447,11 @@ def load_gc_dataset(
         in_dim = dataset[0].x.size(-1)
         out_dim = 10
         meta = {"in_dim": in_dim, "out_dim": out_dim, "task": "multilabel", "loss": "bce", "metric": "ap"}
+        if attach_global_node_ids:
+            dataset, total_nodes = attach_graph_identity(dataset)
+            meta["global_num_nodes_total"] = int(total_nodes)
+        elif attach_graph_ids:
+            dataset, _ = attach_graph_identity(dataset, attach_node_ids=False)
         return dataset, split_idx, meta
 
     raise ValueError(

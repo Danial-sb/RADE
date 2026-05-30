@@ -1,21 +1,27 @@
-# graph_classification/models_gc.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Union, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from torch_geometric.nn import global_add_pool, global_mean_pool, GCNConv, GINConv
-
-from rade_convs_gc import RADEGCNConvGC, RADEGINConvGC, BatchedGraphCache
+from torch_geometric.nn import GATConv, GCNConv, GINConv, global_add_pool, global_mean_pool
 
 try:
-    from .dropmessage_convs_gc import DropMessageGCNConvGC, DropMessageGINConvGC
+    from ogb.graphproppred.mol_encoder import AtomEncoder
 except Exception:
-    from dropmessage_convs_gc import DropMessageGCNConvGC, DropMessageGINConvGC
+    AtomEncoder = None
+
+try:
+    from .rade_convs_gc import BatchedGraphCache, RADEGATConvGC, RADEGCNConvGC, RADEGINConvGC
+except Exception:
+    from rade_convs_gc import BatchedGraphCache, RADEGATConvGC, RADEGCNConvGC, RADEGINConvGC
+
+try:
+    from .dropmessage_convs_gc import DropMessageGATConvGC, DropMessageGCNConvGC, DropMessageGINConvGC
+except Exception:
+    from dropmessage_convs_gc import DropMessageGATConvGC, DropMessageGCNConvGC, DropMessageGINConvGC
 
 
 EdgeIndexObj = Union[torch.Tensor, List[torch.Tensor]]
@@ -23,44 +29,69 @@ EdgeIndexObj = Union[torch.Tensor, List[torch.Tensor]]
 
 @dataclass
 class GraphMPNNConfig:
-    gnn: str = "gin"                 # 'gin' or 'gcn'
-    pooling: str = "sum"             # 'sum' or 'mean'
+    gnn: str = "gin"
+    pooling: str = "sum"
     local_layers: int = 3
     hidden_channels: int = 64
     dropout: float = 0.0
     bn: bool = False
-
     use_ogb_encoders: bool = False
     use_edge_attr: bool = False
-
     pre_linear: bool = False
-
-    # RADE
-    unbiased: bool = False
-    unbiased_mode: str = "rade"      # 'rade' or 'rade-ic'
+    ep_correction: bool = False
+    ep_expectation_mode: str = "analytic"
+    ep_emp_average_mode: str = "running_mean"
+    ep_emp_beta: float = 0.1
+    ep_emp_eps: float = 1e-12
+    rade_variant: str = "rade-of"
     correct_self_loop: bool = True
-
-    # linear
     linear: bool = False
-
-    # augmentation selector (NC style)
-    aug_tech: str = "rade"           # 'rade' | 'dropmessage' | 'dropnode' | 'none'
+    aug_tech: str = "rade"
+    global_num_nodes_total: int = 0
+    gat_heads: int = 1
+    gat_concat: bool = True
+    gat_negative_slope: float = 0.2
+    gat_moment_chunk_size: int = 1024
+    gat_moment_mode: str = "exact"
+    gat_moment_samples: int = 256
+    gat_nonedge_samples: int = 256
+    gat_moment_seed: int = 0
+    gat_ep_corr_clip: float = 2.0
 
     def __post_init__(self) -> None:
         self.gnn = str(self.gnn).lower().strip()
         self.pooling = str(self.pooling).lower().strip()
-        self.unbiased_mode = str(self.unbiased_mode).lower().strip()
+        self.ep_expectation_mode = str(self.ep_expectation_mode).lower().strip()
+        self.ep_emp_average_mode = str(self.ep_emp_average_mode).lower().strip()
+        self.rade_variant = str(self.rade_variant).lower().strip()
         self.aug_tech = str(self.aug_tech).lower().strip()
+        self.gat_moment_mode = str(self.gat_moment_mode).lower().strip()
 
-        if self.gnn not in {"gin", "gcn"}:
-            raise ValueError(f"gnn must be 'gin' or 'gcn'. Got gnn={self.gnn}")
+        if self.gnn not in {"gin", "gcn", "gat"}:
+            raise ValueError(f"gnn must be 'gin', 'gcn', or 'gat'. Got {self.gnn}")
         if self.pooling not in {"sum", "mean"}:
-            raise ValueError(f"pooling must be 'sum' or 'mean'. Got pooling={self.pooling}")
-        if self.unbiased_mode not in {"rade", "rade-ic"}:
-            raise ValueError(f"unbiased_mode must be 'rade' or 'rade-ic'. Got {self.unbiased_mode}")
-        if self.aug_tech not in {"rade", "dropmessage", "dropnode", "none"}:
-            raise ValueError(f"aug_tech must be one of {{rade, dropmessage, dropnode, none}}. Got {self.aug_tech}")
-
+            raise ValueError(f"pooling must be 'sum' or 'mean'. Got {self.pooling}")
+        if self.ep_expectation_mode not in {"analytic", "empirical_ema"}:
+            raise ValueError(
+                "ep_expectation_mode must be one of {'analytic', 'empirical_ema'}. "
+                f"Got {self.ep_expectation_mode}"
+            )
+        if self.ep_emp_average_mode not in {"ema", "running_mean"}:
+            raise ValueError(
+                "ep_emp_average_mode must be one of {'ema', 'running_mean'}. "
+                f"Got {self.ep_emp_average_mode}"
+            )
+        if self.rade_variant not in {"rade-of", "rade-ofs"}:
+            raise ValueError(f"rade_variant must be 'rade-of' or 'rade-ofs'. Got {self.rade_variant}")
+        if self.aug_tech not in {"rade", "dropout", "dropedge", "dropmessage", "dropnode", "none"}:
+            raise ValueError(
+                "aug_tech must be one of {rade, dropout, dropedge, dropmessage, dropnode, none}. "
+                f"Got {self.aug_tech}"
+            )
+        if int(self.gat_heads) <= 0:
+            raise ValueError(f"gat_heads must be positive. Got {self.gat_heads}")
+        if self.gat_moment_mode not in {"exact", "sampled"}:
+            raise ValueError(f"gat_moment_mode must be 'exact' or 'sampled'. Got {self.gat_moment_mode}")
         if self.linear:
             self.bn = False
             self.dropout = 0.0
@@ -75,93 +106,152 @@ def _make_gin_mlp(in_dim: int, out_dim: int, *, hidden_dim: int, dropout: float,
     layers.append(nn.Linear(hidden_dim, out_dim))
     return nn.Sequential(*layers)
 
-class GraphMPNN(nn.Module):
-    """
-    Graph classification MPNN:
-      model(x, edge_index, batch, edge_attr=..., edge_index_keep=..., edge_index_add=..., p=..., q=...,
-            dropmessage_rate=..., dropnode_rate=..., return_embeddings=...)
-    """
 
+class GraphMPNN(nn.Module):
     def __init__(self, *, in_channels: int, out_channels: int, cfg: GraphMPNNConfig):
         super().__init__()
         self.cfg = cfg
 
-        H = int(cfg.hidden_channels)
-        L = int(cfg.local_layers)
-        if L <= 0:
-            raise ValueError(f"local_layers must be >= 1. Got {L}")
+        hidden_channels = int(cfg.hidden_channels)
+        local_layers = int(cfg.local_layers)
+        if local_layers <= 0:
+            raise ValueError(f"local_layers must be >= 1. Got {local_layers}")
+        if cfg.gnn == "gat" and bool(cfg.gat_concat) and (hidden_channels % int(cfg.gat_heads) != 0):
+            raise ValueError(
+                "For GAT with gat_concat=True, hidden_channels must be divisible by gat_heads. "
+                f"Got hidden_channels={hidden_channels}, gat_heads={cfg.gat_heads}."
+            )
 
-        ic_mode = (cfg.unbiased and cfg.unbiased_mode == "rade-ic")
+        if bool(cfg.use_ogb_encoders):
+            if AtomEncoder is None:
+                raise ImportError("OGB AtomEncoder is required when use_ogb_encoders=True.")
+            self.atom_encoder = AtomEncoder(hidden_channels)
+        else:
+            self.atom_encoder = None
 
-        # optional pre-linear projection
-        self.lin_in = nn.Linear(in_channels, H) if bool(cfg.pre_linear) else None
-        first_in = H if self.lin_in is not None else int(in_channels)
+        self.lin_in = nn.Linear(in_channels, hidden_channels) if bool(cfg.pre_linear) and self.atom_encoder is None else None
+        first_in = hidden_channels if (self.atom_encoder is not None or self.lin_in is not None) else int(in_channels)
 
         self.convs = nn.ModuleList()
+        self.bns = nn.ModuleList()
 
-        # -------------------------
-        # Layer construction logic (NC style)
-        # -------------------------
-        if cfg.unbiased:
-            # RADE convs
-            if cfg.gnn == "gcn":
-                self.convs.append(
-                    RADEGCNConvGC(first_in, H, correct_self_loop=cfg.correct_self_loop, ic_mode=ic_mode)
-                )
-                for _ in range(L - 1):
-                    self.convs.append(
-                        RADEGCNConvGC(H, H, correct_self_loop=cfg.correct_self_loop, ic_mode=ic_mode)
+        for layer_idx in range(local_layers):
+            in_dim = first_in if layer_idx == 0 else hidden_channels
+            if cfg.aug_tech == "rade":
+                if cfg.gnn == "gcn":
+                    conv = RADEGCNConvGC(
+                        in_dim,
+                        hidden_channels,
+                        bias=True,
+                        correct_self_loop=cfg.correct_self_loop,
+                        rade_variant=cfg.rade_variant,
+                        ep_correction=cfg.ep_correction,
+                        ep_expectation_mode=cfg.ep_expectation_mode,
+                        ep_emp_average_mode=cfg.ep_emp_average_mode,
+                        ep_emp_beta=cfg.ep_emp_beta,
+                        ep_emp_eps=cfg.ep_emp_eps,
+                    )
+                elif cfg.gnn == "gin":
+                    conv = RADEGINConvGC(
+                        mlp=_make_gin_mlp(
+                            in_dim,
+                            hidden_channels,
+                            hidden_dim=hidden_channels,
+                            dropout=cfg.dropout,
+                            linear=cfg.linear,
+                        ),
+                        eps=0.0,
+                        train_eps=False,
+                        rade_variant=cfg.rade_variant,
+                        ep_correction=cfg.ep_correction,
+                        ep_expectation_mode=cfg.ep_expectation_mode,
+                        ep_emp_average_mode=cfg.ep_emp_average_mode,
+                        ep_emp_beta=cfg.ep_emp_beta,
+                        ep_emp_eps=cfg.ep_emp_eps,
+                    )
+                else:
+                    conv = RADEGATConvGC(
+                        in_dim,
+                        hidden_channels,
+                        heads=int(cfg.gat_heads),
+                        concat=bool(cfg.gat_concat),
+                        negative_slope=float(cfg.gat_negative_slope),
+                        bias=True,
+                        rade_variant=cfg.rade_variant,
+                        ep_correction=cfg.ep_correction,
+                        ep_expectation_mode=cfg.ep_expectation_mode,
+                        ep_emp_eps=cfg.ep_emp_eps,
+                        moment_chunk_size=int(cfg.gat_moment_chunk_size),
+                        moment_mode=str(cfg.gat_moment_mode),
+                        moment_samples=int(cfg.gat_moment_samples),
+                        nonedge_samples=int(cfg.gat_nonedge_samples),
+                        moment_seed=int(cfg.gat_moment_seed),
+                        ep_corr_clip=float(cfg.gat_ep_corr_clip),
+                    )
+            elif cfg.aug_tech == "dropmessage":
+                if cfg.gnn == "gcn":
+                    conv = DropMessageGCNConvGC(in_dim, hidden_channels, bias=True)
+                elif cfg.gnn == "gin":
+                    conv = DropMessageGINConvGC(
+                        mlp=_make_gin_mlp(
+                            in_dim,
+                            hidden_channels,
+                            hidden_dim=hidden_channels,
+                            dropout=cfg.dropout,
+                            linear=cfg.linear,
+                        ),
+                        eps=0.0,
+                        train_eps=False,
+                    )
+                else:
+                    conv = DropMessageGATConvGC(
+                        in_dim,
+                        hidden_channels // int(cfg.gat_heads) if bool(cfg.gat_concat) else hidden_channels,
+                        heads=int(cfg.gat_heads),
+                        concat=bool(cfg.gat_concat),
+                        negative_slope=float(cfg.gat_negative_slope),
+                        bias=True,
                     )
             else:
-                mlp0 = _make_gin_mlp(first_in, H, hidden_dim=H, dropout=cfg.dropout, linear=cfg.linear)
-                self.convs.append(RADEGINConvGC(mlp=mlp0, eps=0.0, train_eps=False, ic_mode=ic_mode))
-                for _ in range(L - 1):
-                    mlp = _make_gin_mlp(H, H, hidden_dim=H, dropout=cfg.dropout, linear=cfg.linear)
-                    self.convs.append(RADEGINConvGC(mlp=mlp, eps=0.0, train_eps=False, ic_mode=ic_mode))
-
-        else:
-            # baselines / clean
-            if cfg.aug_tech == "dropmessage":
                 if cfg.gnn == "gcn":
-                    self.convs.append(DropMessageGCNConvGC(first_in, H, bias=True))
-                    for _ in range(L - 1):
-                        self.convs.append(DropMessageGCNConvGC(H, H, bias=True))
+                    conv = GCNConv(in_dim, hidden_channels, cached=False, normalize=True)
+                elif cfg.gnn == "gin":
+                    conv = GINConv(
+                        _make_gin_mlp(
+                            in_dim,
+                            hidden_channels,
+                            hidden_dim=hidden_channels,
+                            dropout=cfg.dropout,
+                            linear=cfg.linear,
+                        )
+                    )
                 else:
-                    mlp0 = _make_gin_mlp(first_in, H, hidden_dim=H, dropout=cfg.dropout, linear=cfg.linear)
-                    self.convs.append(DropMessageGINConvGC(mlp=mlp0, eps=0.0, train_eps=False))
-                    for _ in range(L - 1):
-                        mlp = _make_gin_mlp(H, H, hidden_dim=H, dropout=cfg.dropout, linear=cfg.linear)
-                        self.convs.append(DropMessageGINConvGC(mlp=mlp, eps=0.0, train_eps=False))
-            else:
-                # clean model (or DropNode, which is applied on x, not in conv)
-                if cfg.gnn == "gcn":
-                    self.convs.append(GCNConv(first_in, H, cached=False, normalize=True))
-                    for _ in range(L - 1):
-                        self.convs.append(GCNConv(H, H, cached=False, normalize=True))
-                else:
-                    mlp0 = _make_gin_mlp(first_in, H, hidden_dim=H, dropout=cfg.dropout, linear=cfg.linear)
-                    self.convs.append(GINConv(mlp0))
-                    for _ in range(L - 1):
-                        mlp = _make_gin_mlp(H, H, hidden_dim=H, dropout=cfg.dropout, linear=cfg.linear)
-                        self.convs.append(GINConv(mlp))
+                    conv = GATConv(
+                        in_dim,
+                        hidden_channels // int(cfg.gat_heads) if bool(cfg.gat_concat) else hidden_channels,
+                        heads=int(cfg.gat_heads),
+                        concat=bool(cfg.gat_concat),
+                        negative_slope=float(cfg.gat_negative_slope),
+                        add_self_loops=False,
+                    )
 
-        # BN (disabled automatically if linear)
-        self.bns = nn.ModuleList()
-        if cfg.bn:
-            for _ in range(L):
-                self.bns.append(nn.BatchNorm1d(H))
+            self.convs.append(conv)
+            if cfg.bn:
+                self.bns.append(nn.BatchNorm1d(hidden_channels))
 
-        self.pred = nn.Linear(H, int(out_channels))
+        self.pred = nn.Linear(hidden_channels, int(out_channels))
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
+        if self.atom_encoder is not None and hasattr(self.atom_encoder, "reset_parameters"):
+            self.atom_encoder.reset_parameters()
         if self.lin_in is not None:
             self.lin_in.reset_parameters()
-        for c in self.convs:
-            if hasattr(c, "reset_parameters"):
-                c.reset_parameters()
-        for b in self.bns:
-            b.reset_parameters()
+        for conv in self.convs:
+            if hasattr(conv, "reset_parameters"):
+                conv.reset_parameters()
+        for bn in self.bns:
+            bn.reset_parameters()
         self.pred.reset_parameters()
 
     def _pool(self, x: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
@@ -173,19 +263,46 @@ class GraphMPNN(nn.Module):
 
     @staticmethod
     def _apply_dropnode(x: torch.Tensor, dropnode_rate: float, training: bool) -> torch.Tensor:
-        """
-        DropNode (current NC style):
-          mask_i ~ Bernoulli(1-r) shared across feature dims, applied at train only.
-          rescale by 1/(1-r) so E[x_masked] = x.
-        """
-        r = float(dropnode_rate)
-        if (not training) or r <= 0.0:
+        rate = float(dropnode_rate)
+        if (not training) or rate <= 0.0:
             return x
-        if r >= 1.0:
-            raise ValueError(f"dropnode_rate must be in [0,1). Got {r}")
-        keep = 1.0 - r
+        if rate >= 1.0:
+            raise ValueError(f"dropnode_rate must be in [0,1). Got {rate}")
+        keep = 1.0 - rate
         mask = torch.empty((x.size(0), 1), device=x.device, dtype=x.dtype).bernoulli_(keep)
         return x * (mask / keep)
+
+    def reset_ep_stats(self, p: float, q: float) -> None:
+        for conv in self.convs:
+            if hasattr(conv, "reset_ep_stats"):
+                conv.reset_ep_stats(p=float(p), q=float(q))
+
+    def update_ep_stats(
+        self,
+        *,
+        edge_index_keep: Optional[EdgeIndexObj],
+        edge_index_add: Optional[EdgeIndexObj],
+        p: float,
+        q: float,
+    ) -> None:
+        def _pick_layer_edges(obj: Optional[EdgeIndexObj], idx: int) -> Optional[torch.Tensor]:
+            if obj is None:
+                return None
+            if isinstance(obj, (list, tuple)):
+                if len(obj) != len(self.convs):
+                    raise ValueError(f"Expected {len(self.convs)} per-layer masks, got {len(obj)}")
+                tensor = obj[idx]
+                return None if tensor is None else tensor
+            return obj
+
+        for layer_idx, conv in enumerate(self.convs):
+            if hasattr(conv, "update_ep_stats"):
+                conv.update_ep_stats(
+                    edge_index_keep=_pick_layer_edges(edge_index_keep, layer_idx),
+                    edge_index_add=_pick_layer_edges(edge_index_add, layer_idx),
+                    p=float(p),
+                    q=float(q),
+                )
 
     def forward(
         self,
@@ -200,98 +317,77 @@ class GraphMPNN(nn.Module):
         q: float = 0.0,
         dropmessage_rate: float = 0.0,
         dropnode_rate: float = 0.0,
+        node_ids: Optional[torch.Tensor] = None,
         return_embeddings: bool = False,
         **kwargs,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        _ = edge_attr  # unused (topology-only)
-
+        _ = edge_attr
         edge_index = edge_index.to(torch.long)
         batch = batch.to(torch.long)
-        if not torch.is_floating_point(x):
+        if self.atom_encoder is not None:
+            x = self.atom_encoder(x.to(torch.long))
+        elif not torch.is_floating_point(x):
             x = x.float()
+
         if self.lin_in is not None:
             x = self.lin_in(x)
-            if (not self.cfg.linear) and (float(self.cfg.dropout) > 0.0):
+            if (not self.cfg.linear) and float(self.cfg.dropout) > 0.0:
                 x = F.dropout(x, p=float(self.cfg.dropout), training=self.training)
 
-        # DropNode baseline: apply on x before message passing (only when selected)
-        if (not self.cfg.unbiased) and (self.cfg.aug_tech == "dropnode"):
+        if self.cfg.aug_tech == "dropnode":
             x = self._apply_dropnode(x, dropnode_rate=float(dropnode_rate), training=self.training)
 
-        # Only build/set graph cache if convs support set_graph (RADE convs)
-        needs_cache = any(hasattr(c, "set_graph") for c in self.convs)
+        needs_cache = any(hasattr(conv, "set_graph") for conv in self.convs)
         if needs_cache:
             num_graphs = int(batch.max().item() + 1) if batch.numel() > 0 else 0
-            graph_cache = BatchedGraphCache.from_edge_index(edge_index, batch, num_graphs=num_graphs)
+            graph_cache = BatchedGraphCache.from_edge_index(
+                edge_index,
+                batch,
+                num_graphs=num_graphs,
+                node_ids=node_ids,
+                global_num_nodes_total=int(self.cfg.global_num_nodes_total) if self.cfg.global_num_nodes_total > 0 else None,
+            )
             for conv in self.convs:
                 if hasattr(conv, "set_graph"):
                     conv.set_graph(graph_cache)
 
-        L = len(self.convs)
+        num_layers = len(self.convs)
 
-        def _pick_per_layer(obj: Optional[EdgeIndexObj], ell: int) -> Optional[torch.Tensor]:
+        def _pick_layer_edges(obj: Optional[EdgeIndexObj], idx: int) -> Optional[torch.Tensor]:
             if obj is None:
                 return None
             if isinstance(obj, (list, tuple)):
-                if len(obj) != L:
-                    raise ValueError(
-                        f"layerwise edge_index list must have length {L} (got {len(obj)}). "
-                        f"Ensure main_gc passes a list of length local_layers."
-                    )
-                t = obj[ell]
-                return None if (t is None or t.numel() == 0) else t.to(torch.long)
-            t = obj
-            return None if t.numel() == 0 else t.to(torch.long)
-
-        # RADE train path requirements (unchanged)
-        if self.training and self.cfg.unbiased and ((float(p) > 0.0) or (float(q) > 0.0)):
-            if edge_index_keep is None:
-                raise RuntimeError(
-                    "RADE training path requires edge_index_keep (and optionally edge_index_add). "
-                    "Pass edge_index_keep=... and edge_index_add=... from main_gc.py."
-                )
-            if isinstance(edge_index_keep, (list, tuple)) and (len(edge_index_keep) != L):
-                raise ValueError(f"edge_index_keep list must have length {L} (got {len(edge_index_keep)})")
+                if len(obj) != num_layers:
+                    raise ValueError(f"Expected {num_layers} per-layer masks, got {len(obj)}")
+                tensor = obj[idx]
+                return None if tensor is None else tensor.to(torch.long)
+            return obj.to(torch.long)
 
         h = x
+        for layer_idx, conv in enumerate(self.convs):
+            keep_l = _pick_layer_edges(edge_index_keep, layer_idx)
+            add_l = _pick_layer_edges(edge_index_add, layer_idx)
 
-        for ell, conv in enumerate(self.convs):
-            keep_l = _pick_per_layer(edge_index_keep, ell)
-            add_l = _pick_per_layer(edge_index_add, ell)
-
-            # ---- Forward routing per conv type ----
             if hasattr(conv, "set_graph"):
-                # RADE convs
-                if keep_l is None:
+                if keep_l is None and add_l is None:
                     h = conv(h, edge_index, p=float(p), q=float(q))
                 else:
-                    h = conv(
-                        h,
-                        edge_index,
-                        edge_index_keep=keep_l,
-                        edge_index_add=add_l,
-                        p=float(p),
-                        q=float(q),
-                    )
+                    h = conv(h, edge_index, edge_index_keep=keep_l, edge_index_add=add_l, p=float(p), q=float(q))
             elif getattr(conv, "supports_dropmessage", False):
-                # DropMessage baselines
                 h = conv(h, edge_index, drop_rate=float(dropmessage_rate))
             else:
-                # Vanilla PyG convs
                 h = conv(h, edge_index)
 
-            # nonlinearity / BN / dropout
             if not self.cfg.linear:
                 if self.cfg.bn:
-                    h = self.bns[ell](h)
+                    h = self.bns[layer_idx](h)
                 h = F.relu(h)
                 if float(self.cfg.dropout) > 0.0:
                     h = F.dropout(h, p=float(self.cfg.dropout), training=self.training)
 
         node_emb = h
-        g = self._pool(node_emb, batch)
-        logits = self.pred(g)
-
+        pooled = self._pool(node_emb, batch)
+        logits = self.pred(pooled)
         if return_embeddings:
             return logits, node_emb
         return logits

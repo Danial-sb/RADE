@@ -1,69 +1,48 @@
+project: rade-gc-radeof-ogbg-densi0.1and1
 program: main_gc.py
+
 method: grid
 metric:
-  name: valid/metric
+  name: best/valid_primary
   goal: maximize
+
 parameters:
   dataset:
-    values: [mutag]
+    values: [ogbg-molhiv]
   gnn:
     values: [gcn]
-  batch_size:
-    values: [32,16]
-  local_layers:
-    values: [4,3]
-  hidden_channels:
-    values: [16,32]
-  lr:
-    values: [0.001]
-
-  dropout:
-    values: [0.0]
-
-  aug_tech: #Dropmessage, Dropnode, RADE
+  aug_tech:
     values: [rade]
-  aug_mode:
-    values: [both] # only when rade (both, add, drop)
-  p:
-    values: [0.2] #Proteins: 0.8
-  q:
-    values: [0.027] #mutagenicity: 0.027, proteins: 0.0324, imdb-b: 0.1354, imdb-m: 0.26809, ogbg-molhiv: 0.02691, peptides: 0.002083
+  pq_update_unit:
+    values: [batch,epoch]
+  pq_densification_penalty_lambda:
+    values: [0.1,1]
 
-  dropmessage_rate:
-    values: [0.0]
-
-  dropnode_rate:
-    values: [0.0]
-
-  unbiased:
-    values: [True]
+  ep_correction:
+    values: [true]
   pq_gradnorm:
-    values: [True]
+    values: [true]
+  aug_mode:
+    values: [both]
+  rade_variant:
+    values: [rade-of]
   mask_sharing:
     values: [shared]
-  linear:
-    values: [False]
-  unbiased_mode:
-    values: [rade]
   pq_p_max:
-    values: [0.8]
-  pq_q_max:
-    values: [0.054] #proteins: 0.0162, imdb-b: 0.270864, imdb-m: 0.53618, ogbg-molhiv: 0.05382, peptides: 0.004166
-  pq_grid_size:
-    values: [5]
-  pq_warmup_epochs:
-    values: [20]
-#  pq_data_anchor:
-#    values: [aug]
+    values: [0.9]
+#  pq_gat_denom_penalty_lambda:
+#    values: [0.0, 0.1, 1.0]
+#  pq_gat_denom_cv2_threshold:
+#    values: [0.5, 1.0, 2.0]
+#  pq_gat_corr_penalty_lambda:
+#    values: [0.0, 10.0, 50.0]
+#  pq_gat_corr_threshold:
+#    values: [1.5, 2.0, 3.0]
+#  gat_ep_corr_clip:
+#    values: [1.5, 2.0, 3.0]
 
   device:
     values: [2]
-  runs:
-    values: [5]
-  epochs:
-    values: [500]
-  patience:
-    values: [100]
 
 command:
   - ${env}
@@ -71,5 +50,5 @@ command:
   - main_gc.py
   - --wandb
   - --wandb_project
-  - rade-gc
+  - rade-gc-radeofs-ogbg
   - ${args}
