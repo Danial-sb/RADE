@@ -29,19 +29,13 @@ class MPNNsMB(nn.Module):
         jk: bool = False,
         gnn: str = "gcn",
         ep_correction: bool = False,
-        ep_expectation_mode: str = "analytic",
-        ep_emp_average_mode: str = "ema",
-        ep_emp_beta: float = 0.1,
-        ep_emp_eps: float = 1e-12,
         rade_variant: str = "rade-of",
         linear: bool = False,
         aug_tech: str = "rade",
-        mb_rade_mode: str = "local",
         gat_heads: int = 1,
         gat_concat: bool = True,
         gat_negative_slope: float = 0.2,
         gat_moment_chunk_size: int = 1024,
-        gat_moment_mode: str = "exact",
         gat_moment_samples: int = 256,
         gat_nonedge_samples: int = 256,
         gat_moment_seed: int = 0,
@@ -76,16 +70,11 @@ class MPNNsMB(nn.Module):
         self.jk = bool(jk)
         self.gnn = str(gnn).lower().strip()
         self.ep_correction = bool(ep_correction)
-        self.ep_expectation_mode = str(ep_expectation_mode).lower().strip()
-        self.ep_emp_average_mode = str(ep_emp_average_mode).lower().strip()
-        self.ep_emp_beta = float(ep_emp_beta)
-        self.ep_emp_eps = float(ep_emp_eps)
         self.rade_variant = str(rade_variant).lower().strip()
         self.gat_heads = int(gat_heads)
         self.gat_concat = bool(gat_concat)
         self.gat_negative_slope = float(gat_negative_slope)
         self.gat_moment_chunk_size = int(gat_moment_chunk_size)
-        self.gat_moment_mode = str(gat_moment_mode).lower().strip()
         self.gat_moment_samples = int(gat_moment_samples)
         self.gat_nonedge_samples = int(gat_nonedge_samples)
         self.gat_moment_seed = int(gat_moment_seed)
@@ -97,10 +86,6 @@ class MPNNsMB(nn.Module):
                 "For GAT with gat_concat=True, hidden_channels must be divisible by gat_heads. "
                 f"Got hidden_channels={hidden_channels}, gat_heads={gat_heads}."
             )
-
-        self.mb_rade_mode = str(mb_rade_mode).lower().strip()
-        if self.mb_rade_mode not in {"local", "disabled"}:
-            raise ValueError(f"mb_rade_mode must be 'local' or 'disabled'. Got {mb_rade_mode}")
 
         self.aug_tech = str(aug_tech).lower().strip()
         if self.aug_tech not in {"rade", "dropout", "dropedge", "dropmessage", "dropnode", "none"}:
@@ -136,10 +121,6 @@ class MPNNsMB(nn.Module):
                         mlp,
                         rade_variant=self.rade_variant,
                         ep_correction=self.ep_correction,
-                        ep_expectation_mode=self.ep_expectation_mode,
-                        ep_emp_average_mode=self.ep_emp_average_mode,
-                        ep_emp_beta=self.ep_emp_beta,
-                        ep_emp_eps=self.ep_emp_eps,
                     )
                 elif self.aug_tech == "dropmessage":
                     conv = DropMessageGINConv(mlp)
@@ -156,10 +137,7 @@ class MPNNsMB(nn.Module):
                         bias=True,
                         rade_variant=self.rade_variant,
                         ep_correction=self.ep_correction,
-                        ep_expectation_mode=self.ep_expectation_mode,
-                        ep_emp_eps=self.ep_emp_eps,
                         moment_chunk_size=self.gat_moment_chunk_size,
-                        moment_mode=self.gat_moment_mode,
                         moment_samples=self.gat_moment_samples,
                         nonedge_samples=self.gat_nonedge_samples,
                         moment_seed=self.gat_moment_seed,
@@ -192,10 +170,6 @@ class MPNNsMB(nn.Module):
                         correct_self_loop=True,
                         rade_variant=self.rade_variant,
                         ep_correction=self.ep_correction,
-                        ep_expectation_mode=self.ep_expectation_mode,
-                        ep_emp_average_mode=self.ep_emp_average_mode,
-                        ep_emp_beta=self.ep_emp_beta,
-                        ep_emp_eps=self.ep_emp_eps,
                     )
                 elif self.aug_tech == "dropmessage":
                     conv = DropMessageGCNConv(in_dim, out_dim, bias=True)
@@ -324,7 +298,6 @@ class MPNNsMB(nn.Module):
 
         rade_active = (
             self.aug_tech == "rade"
-            and self.mb_rade_mode == "local"
             and self.training
             and (edge_index_keep is not None or edge_index_add is not None)
             and (float(p) > 0.0 or float(q) > 0.0)

@@ -24,42 +24,36 @@ MINI_BATCH_AUTO_DEFAULTS = {
         "epochs": 100,
         "p": 0.5,
         "q": 0.0000564785,
-        "pq_grid_size": 5,
     },
     ("flickr", "gin"): {
         "hidden_channels": 256,
         "epochs": 1000,
         "p": 0.5,
         "q": 0.0000564785,
-        "pq_grid_size": 11,
     },
     ("flickr", "gat"): {
         "hidden_channels": 256,
         "epochs": 1000,
         "p": 0.5,
         "q": 0.0000564785,
-        "pq_grid_size": 11,
     },
     ("ogbn-arxiv", "gcn"): {
         "hidden_channels": 256,
         "epochs": 100,
         "p": 0.5,
         "q": 0.00004037395,
-        "pq_grid_size": 5,
     },
     ("ogbn-arxiv", "gin"): {
         "hidden_channels": 256,
         "epochs": 2000,
         "p": 0.5,
         "q": 0.00004037395,
-        "pq_grid_size": 11,
     },
     ("ogbn-arxiv", "gat"): {
         "hidden_channels": 256,
         "epochs": 2000,
         "p": 0.5,
         "q": 0.00004037395,
-        "pq_grid_size": 11,
     },
 }
 
@@ -173,10 +167,6 @@ def apply_mini_batch_aug_defaults(args, explicit_arg_names=None):
 
 
 def parse_method(args, num_nodes, num_classes, in_dim, device):
-    ep_emp_average_mode = getattr(args, "ep_emp_average_mode", None)
-    if ep_emp_average_mode is None:
-        ep_emp_average_mode = "ema" if bool(getattr(args, "pq_gradnorm", False)) else "running_mean"
-    ep_emp_average_mode = str(ep_emp_average_mode).lower().strip()
     model = MPNNsMB(
         in_channels=in_dim,
         hidden_channels=args.hidden_channels,
@@ -191,19 +181,13 @@ def parse_method(args, num_nodes, num_classes, in_dim, device):
         jk=args.jk,
         gnn=args.gnn,
         ep_correction=args.ep_correction,
-        ep_expectation_mode=args.ep_expectation_mode,
-        ep_emp_average_mode=ep_emp_average_mode,
-        ep_emp_beta=args.ep_emp_beta,
-        ep_emp_eps=args.ep_emp_eps,
         rade_variant=args.rade_variant,
         linear=bool(getattr(args, "linear", False)),
         aug_tech=str(getattr(args, "aug_tech", "none")),
-        mb_rade_mode=str(getattr(args, "mb_rade_mode", "local")),
         gat_heads=int(getattr(args, "gat_heads", 1)),
         gat_concat=bool(getattr(args, "gat_concat", True)),
         gat_negative_slope=float(getattr(args, "gat_negative_slope", 0.2)),
         gat_moment_chunk_size=int(getattr(args, "gat_moment_chunk_size", 1024)),
-        gat_moment_mode=str(getattr(args, "gat_moment_mode", "exact")),
         gat_moment_samples=int(getattr(args, "gat_moment_samples", 256)),
         gat_nonedge_samples=int(getattr(args, "gat_nonedge_samples", 256)),
         gat_moment_seed=int(getattr(args, "gat_moment_seed", 0)),
@@ -216,16 +200,11 @@ def parser_add_main_args(parser):
     parser.add_argument(
         "--dataset",
         type=str,
-        default="ogbn-arxiv",
+        default="flickr",
         choices=["flickr", "ogbn-arxiv"],
         help="Dataset name",
     )
     parser.add_argument("--data_dir", type=str, default="./data/", help="Root directory")
-    parser.add_argument(
-        "--remove_citeseer_isolated_nodes",
-        action="store_true",
-        help="Remove isolated nodes when loading CiteSeer. Ignored for other datasets.",
-    )
 
     parser.add_argument("--device", type=int, default=0, help="GPU id (default: 0)")
     parser.add_argument("--seed", type=int, default=42)
@@ -273,14 +252,6 @@ def parser_add_main_args(parser):
         action="store_true",
         help="Evaluate on CPU full graph to avoid GPU OOM during evaluation.",
     )
-    parser.add_argument(
-        "--mb_rade_mode",
-        type=str,
-        default="local",
-        choices=["disabled", "local"],
-        help="Mini-batch RADE semantics. 'local' applies RADE within the sampled batch graph.",
-    )
-
     parser.add_argument("--model", type=str, default="MPNN", choices=["MPNN"])
     parser.add_argument(
         "--gnn",
@@ -313,13 +284,6 @@ def parser_add_main_args(parser):
         type=int,
         default=1024,
         help="Source-node chunk size for mini-batch GAT attention moment computations.",
-    )
-    parser.add_argument(
-        "--gat_moment_mode",
-        type=str,
-        default="sampled",
-        choices=["exact", "sampled"],
-        help="GAT attention moment computation mode. 'sampled' estimates mini-batch local non-edge terms.",
     )
     parser.add_argument(
         "--gat_moment_samples",
@@ -416,32 +380,6 @@ def parser_add_main_args(parser):
         help="Enable GradNorm matching for p,q.",
     )
     parser.add_argument(
-        "--ep_expectation_mode",
-        type=str,
-        default="analytic",
-        choices=["analytic", "empirical_ema"],
-        help="How to obtain the expectation term used in EP correction.",
-    )
-    parser.add_argument(
-        "--ep_emp_beta",
-        type=float,
-        default=0.1,
-        help="EMA update weight for the empirical expectation ablation.",
-    )
-    parser.add_argument(
-        "--ep_emp_average_mode",
-        type=str,
-        default=None,
-        choices=["ema", "running_mean"],
-        help="Averaging mode for empirical EP moment buffers. Defaults to ema with pq_gradnorm, otherwise running_mean.",
-    )
-    parser.add_argument(
-        "--ep_emp_eps",
-        type=float,
-        default=1e-6,
-        help="Small epsilon used to clamp empirical expectation denominators.",
-    )
-    parser.add_argument(
         "--skip_nonfinite_grad_step",
         type=str2bool,
         nargs="?",
@@ -465,31 +403,10 @@ def parser_add_main_args(parser):
     )
 
     parser.add_argument(
-        "--pq_search_method",
-        type=str,
-        default="adam",
-        choices=["grid", "powell", "newton", "adam"],
-        help="How to update (p,q). "
-             "'grid'/'powell'/'newton' use the existing mini-batch search rules. "
-             "'adam' uses a stateful online controller and one Adam step after each mini-batch PQ update.",
-    )
-    parser.add_argument(
-        "--pq_compare_search_methods",
-        action="store_true",
-        help="Evaluate grid, Powell, and Newton on the same PQ-GradNorm snapshot. "
-             "Not supported when --pq_search_method=adam.",
-    )
-    parser.add_argument("--pq_powell_maxiter", type=int, default=25)
-    parser.add_argument("--pq_powell_xtol", type=float, default=1e-3)
-    parser.add_argument("--pq_powell_ftol", type=float, default=1e-3)
-    parser.add_argument("--pq_newton_maxiter", type=int, default=10)
-    parser.add_argument("--pq_newton_tol", type=float, default=1e-4)
-    parser.add_argument("--pq_newton_damping", type=float, default=1e-4)
-    parser.add_argument(
         "--pq_adam_lr",
         type=float,
         default=0.001,
-        help="Learning rate for the Adam-based p/q controller when --pq_search_method=adam.",
+        help="Learning rate for the Adam-based p/q controller.",
     )
     parser.add_argument(
         "--pq_adam_beta1",
@@ -559,78 +476,10 @@ def parser_add_main_args(parser):
         help="Coefficient lambda for the soft expected-densification penalty applied to rho = q / d.",
     )
     parser.add_argument(
-        "--pq_densification_penalty_type",
-        type=str,
-        default="quadratic",
-        choices=["quadratic", "linear", "hinge"],
-        help="Penalty form for PQ-GradNorm densification control.",
-    )
-    parser.add_argument(
-        "--pq_densification_penalty_rho0",
-        type=float,
-        default=1.0,
-        help="Hinge threshold rho0 used only when --pq_densification_penalty_type=hinge.",
-    )
-    parser.add_argument(
-        "--pq_epoch_objective_mode",
-        type=str,
-        default="batch_solutions",
-        choices=["batch_solutions", "joint_objective"],
-        help="Mini-batch PQ update rule. "
-             "'batch_solutions' solves each batch separately then averages p,q over the epoch. "
-             "'joint_objective' solves once on the weighted mean of per-batch squared log-gap objectives.",
-    )
-    parser.add_argument(
-        "--pq_batch_weighting",
-        type=str,
-        default="uniform",
-        choices=["node_count", "uniform"],
-        help="How mini-batches are weighted inside epoch-level PQ updates.",
-    )
-    parser.add_argument(
-        "--pq_grid_size",
-        type=int,
-        default=11,
-        help="Grid size for (p,q) search. Use 11 for GIN; use 3-5 for GCN.",
-    )
-    parser.add_argument(
-        "--pq_surface_plot",
-        action="store_true",
-        help="Save objective heatmaps/contours over a frozen batch-aggregated (p,q) snapshot.",
-    )
-    parser.add_argument(
-        "--pq_surface_animation",
-        action="store_true",
-        help="When --pq_surface_plot is enabled, also build a GIF over epochs if Pillow is available.",
-    )
-    parser.add_argument("--pq_surface_grid_size", type=int, default=31)
-    parser.add_argument("--pq_surface_every", type=int, default=1)
-    parser.add_argument("--pq_surface_run", type=int, default=1)
-    parser.add_argument(
-        "--pq_store_batches",
-        type=int,
-        default=0,
-        help="Optionally cache up to this many train mini-batches for epoch PQ tuning. Stored on CPU.",
-    )
-    parser.add_argument(
-        "--pq_max_batches_for_tuning",
-        type=int,
-        default=0,
-        help="Cap the number of mini-batches used by PQ tuning per epoch. 0 means use all available.",
-    )
-    parser.add_argument("--p_max", type=float, default=0.6, help="Upper bound for p in non-Adam mini-batch PQ search.")
-    parser.add_argument("--q_max", type=float, default=1e-3, help="Upper bound for q in non-Adam mini-batch PQ search.")
-    parser.add_argument(
         "--pq_subset_nodes",
         type=int,
         default=0,
         help="Number of train nodes used to estimate GradNorm norms within a batch.",
-    )
-    parser.add_argument(
-        "--pq_ema",
-        type=float,
-        default=0.9,
-        help="EMA smoothing for p,q updates in search-based PQ tuning (grid/powell/newton only).",
     )
     parser.add_argument("--pq_update_every", type=int, default=1, help="Update (p,q) every k epochs.")
     parser.add_argument(
@@ -656,14 +505,6 @@ def parser_add_main_args(parser):
     parser.add_argument("--pq_warmup_epochs", type=int, default=1, help="Number of initial epochs to skip pq updates.")
     parser.add_argument("--pq_eps", type=float, default=1e-12, help="Small epsilon for log/denominator stabilizers.")
     parser.add_argument("--pq_seed", type=int, default=0, help="Seed for selecting the subset of nodes for pq selection.")
-    parser.add_argument(
-        "--pq_data_anchor",
-        type=str,
-        default="clean",
-        choices=["clean", "aug"],
-        help="PQ-GradNorm anchor for the data-loss gradient norm.",
-    )
-
     parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
     parser.add_argument("--wandb_project", type=str, default="rade-nc-mb")
     parser.add_argument("--wandb_entity", type=str, default=None, help="wandb entity/team (optional)")

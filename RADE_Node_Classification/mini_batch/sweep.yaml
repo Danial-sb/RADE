@@ -27,8 +27,6 @@ parameters:
     values: [both]
   ep_correction:
     values: [True]
-  ep_expectation_mode:
-    values: [analytic]
   rade_variant:
     values: [rade-of,rade-ofs]
   mask_sharing:
@@ -38,23 +36,17 @@ parameters:
 
   pq_gradnorm:
     values: [True]
-  pq_search_method:
-    values: [adam]
   pq_adam_lr:
     values: [0.001]
   pq_optimize_rho:
     values: [True]
   pq_densification_penalty_lambda:
     values: [1.0]
-  pq_densification_penalty_type:
-    values: [quadratic]
 
   gat_heads:
     values: [1]
   gat_concat:
     values: [True]
-  gat_moment_mode:
-    values: [sampled]
   gat_moment_samples:
     values: [128]
   gat_nonedge_samples:
