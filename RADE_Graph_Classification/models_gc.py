@@ -39,10 +39,6 @@ class GraphMPNNConfig:
     use_edge_attr: bool = False
     pre_linear: bool = False
     ep_correction: bool = False
-    ep_expectation_mode: str = "analytic"
-    ep_emp_average_mode: str = "running_mean"
-    ep_emp_beta: float = 0.1
-    ep_emp_eps: float = 1e-12
     rade_variant: str = "rade-of"
     correct_self_loop: bool = True
     linear: bool = False
@@ -52,7 +48,6 @@ class GraphMPNNConfig:
     gat_concat: bool = True
     gat_negative_slope: float = 0.2
     gat_moment_chunk_size: int = 1024
-    gat_moment_mode: str = "exact"
     gat_moment_samples: int = 256
     gat_nonedge_samples: int = 256
     gat_moment_seed: int = 0
@@ -61,26 +56,13 @@ class GraphMPNNConfig:
     def __post_init__(self) -> None:
         self.gnn = str(self.gnn).lower().strip()
         self.pooling = str(self.pooling).lower().strip()
-        self.ep_expectation_mode = str(self.ep_expectation_mode).lower().strip()
-        self.ep_emp_average_mode = str(self.ep_emp_average_mode).lower().strip()
         self.rade_variant = str(self.rade_variant).lower().strip()
         self.aug_tech = str(self.aug_tech).lower().strip()
-        self.gat_moment_mode = str(self.gat_moment_mode).lower().strip()
 
         if self.gnn not in {"gin", "gcn", "gat"}:
             raise ValueError(f"gnn must be 'gin', 'gcn', or 'gat'. Got {self.gnn}")
         if self.pooling not in {"sum", "mean"}:
             raise ValueError(f"pooling must be 'sum' or 'mean'. Got {self.pooling}")
-        if self.ep_expectation_mode not in {"analytic", "empirical_ema"}:
-            raise ValueError(
-                "ep_expectation_mode must be one of {'analytic', 'empirical_ema'}. "
-                f"Got {self.ep_expectation_mode}"
-            )
-        if self.ep_emp_average_mode not in {"ema", "running_mean"}:
-            raise ValueError(
-                "ep_emp_average_mode must be one of {'ema', 'running_mean'}. "
-                f"Got {self.ep_emp_average_mode}"
-            )
         if self.rade_variant not in {"rade-of", "rade-ofs"}:
             raise ValueError(f"rade_variant must be 'rade-of' or 'rade-ofs'. Got {self.rade_variant}")
         if self.aug_tech not in {"rade", "dropout", "dropedge", "dropmessage", "dropnode", "none"}:
@@ -90,8 +72,6 @@ class GraphMPNNConfig:
             )
         if int(self.gat_heads) <= 0:
             raise ValueError(f"gat_heads must be positive. Got {self.gat_heads}")
-        if self.gat_moment_mode not in {"exact", "sampled"}:
-            raise ValueError(f"gat_moment_mode must be 'exact' or 'sampled'. Got {self.gat_moment_mode}")
         if self.linear:
             self.bn = False
             self.dropout = 0.0
@@ -146,10 +126,6 @@ class GraphMPNN(nn.Module):
                         correct_self_loop=cfg.correct_self_loop,
                         rade_variant=cfg.rade_variant,
                         ep_correction=cfg.ep_correction,
-                        ep_expectation_mode=cfg.ep_expectation_mode,
-                        ep_emp_average_mode=cfg.ep_emp_average_mode,
-                        ep_emp_beta=cfg.ep_emp_beta,
-                        ep_emp_eps=cfg.ep_emp_eps,
                     )
                 elif cfg.gnn == "gin":
                     conv = RADEGINConvGC(
@@ -164,10 +140,6 @@ class GraphMPNN(nn.Module):
                         train_eps=False,
                         rade_variant=cfg.rade_variant,
                         ep_correction=cfg.ep_correction,
-                        ep_expectation_mode=cfg.ep_expectation_mode,
-                        ep_emp_average_mode=cfg.ep_emp_average_mode,
-                        ep_emp_beta=cfg.ep_emp_beta,
-                        ep_emp_eps=cfg.ep_emp_eps,
                     )
                 else:
                     conv = RADEGATConvGC(
@@ -179,10 +151,7 @@ class GraphMPNN(nn.Module):
                         bias=True,
                         rade_variant=cfg.rade_variant,
                         ep_correction=cfg.ep_correction,
-                        ep_expectation_mode=cfg.ep_expectation_mode,
-                        ep_emp_eps=cfg.ep_emp_eps,
                         moment_chunk_size=int(cfg.gat_moment_chunk_size),
-                        moment_mode=str(cfg.gat_moment_mode),
                         moment_samples=int(cfg.gat_moment_samples),
                         nonedge_samples=int(cfg.gat_nonedge_samples),
                         moment_seed=int(cfg.gat_moment_seed),
@@ -271,38 +240,6 @@ class GraphMPNN(nn.Module):
         keep = 1.0 - rate
         mask = torch.empty((x.size(0), 1), device=x.device, dtype=x.dtype).bernoulli_(keep)
         return x * (mask / keep)
-
-    def reset_ep_stats(self, p: float, q: float) -> None:
-        for conv in self.convs:
-            if hasattr(conv, "reset_ep_stats"):
-                conv.reset_ep_stats(p=float(p), q=float(q))
-
-    def update_ep_stats(
-        self,
-        *,
-        edge_index_keep: Optional[EdgeIndexObj],
-        edge_index_add: Optional[EdgeIndexObj],
-        p: float,
-        q: float,
-    ) -> None:
-        def _pick_layer_edges(obj: Optional[EdgeIndexObj], idx: int) -> Optional[torch.Tensor]:
-            if obj is None:
-                return None
-            if isinstance(obj, (list, tuple)):
-                if len(obj) != len(self.convs):
-                    raise ValueError(f"Expected {len(self.convs)} per-layer masks, got {len(obj)}")
-                tensor = obj[idx]
-                return None if tensor is None else tensor
-            return obj
-
-        for layer_idx, conv in enumerate(self.convs):
-            if hasattr(conv, "update_ep_stats"):
-                conv.update_ep_stats(
-                    edge_index_keep=_pick_layer_edges(edge_index_keep, layer_idx),
-                    edge_index_add=_pick_layer_edges(edge_index_add, layer_idx),
-                    p=float(p),
-                    q=float(q),
-                )
 
     def forward(
         self,

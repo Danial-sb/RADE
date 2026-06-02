@@ -258,10 +258,6 @@ def parse_method_gc(args, in_channels: int, out_channels: int, device):
         use_edge_attr=bool(getattr(args, "use_edge_attr", False)),
         pre_linear=bool(getattr(args, "pre_linear", False)),
         ep_correction=bool(getattr(args, "ep_correction", False)),
-        ep_expectation_mode=str(getattr(args, "ep_expectation_mode", "analytic")),
-        ep_emp_average_mode=str(getattr(args, "ep_emp_average_mode", "running_mean")),
-        ep_emp_beta=float(getattr(args, "ep_emp_beta", 0.1)),
-        ep_emp_eps=float(getattr(args, "ep_emp_eps", 1e-12)),
         rade_variant=str(getattr(args, "rade_variant", "rade-of")),
         correct_self_loop=True,
         linear=bool(getattr(args, "linear", False)),
@@ -271,7 +267,6 @@ def parse_method_gc(args, in_channels: int, out_channels: int, device):
         gat_concat=bool(getattr(args, "gat_concat", True)),
         gat_negative_slope=float(getattr(args, "gat_negative_slope", 0.2)),
         gat_moment_chunk_size=int(getattr(args, "gat_moment_chunk_size", 1024)),
-        gat_moment_mode=str(getattr(args, "gat_moment_mode", "exact")),
         gat_moment_samples=int(getattr(args, "gat_moment_samples", 256)),
         gat_nonedge_samples=int(getattr(args, "gat_nonedge_samples", 256)),
         gat_moment_seed=int(getattr(args, "gat_moment_seed", 0)),
@@ -358,13 +353,6 @@ def parser_add_gc_args(parser):
         help="Source-node chunk size for graph-classification GAT attention moment computations.",
     )
     parser.add_argument(
-        "--gat_moment_mode",
-        type=str,
-        default="sampled",
-        choices=["exact", "sampled"],
-        help="GAT attention moment computation mode. 'sampled' estimates graph-local non-edge terms.",
-    )
-    parser.add_argument(
         "--gat_moment_samples",
         type=int,
         default=128,
@@ -424,20 +412,6 @@ def parser_add_gc_args(parser):
     )
 
     parser.add_argument("--ep_correction", type=str2bool, default=True)
-    parser.add_argument(
-        "--ep_expectation_mode",
-        type=str,
-        default="analytic",
-        choices=["analytic", "empirical_ema"],
-    )
-    parser.add_argument("--ep_emp_beta", type=float, default=0.1)
-    parser.add_argument(
-        "--ep_emp_average_mode",
-        type=str,
-        default="running_mean",
-        choices=["ema", "running_mean"],
-    )
-    parser.add_argument("--ep_emp_eps", type=float, default=1e-12)
     parser.add_argument(
         "--rade_variant",
         type=str,
@@ -502,7 +476,7 @@ def parser_add_gc_args(parser):
         default=50.0,
         help="GAT-only penalty weight for large EP clean-edge correction gains. Set 0 to disable.",
     )
-    parser.add_argument( # if p becomes so small, increase it.
+    parser.add_argument(
         "--pq_gat_corr_threshold",
         type=float,
         default=1.5,
@@ -529,20 +503,6 @@ def parser_add_gc_args(parser):
         default=0.1,
         help="Penalty weight applied to rho in the GradNorm objective.",
     )
-    parser.add_argument(
-        "--pq_densification_penalty_type",
-        type=str,
-        default="quadratic",
-        choices=["quadratic", "linear", "hinge"],
-        help="Penalty form for rho: quadratic, linear, or hinge above rho0.",
-    )
-    parser.add_argument(
-        "--pq_densification_penalty_rho0",
-        type=float,
-        default=0.1,
-        help="Hinge threshold for --pq_densification_penalty_type=hinge.",
-    )
-
     parser.add_argument("--lr", type=float, default=GRAPH_CLASSIFICATION_FALLBACK_DEFAULTS["lr"])
     parser.add_argument("--weight_decay", type=float, default=0.0)
 

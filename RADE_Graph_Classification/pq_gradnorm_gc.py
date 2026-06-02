@@ -60,23 +60,11 @@ def _restore_batchnorm_buffers(states: List[Tuple[nn.Module, bool]]) -> None:
         module.train(was_training)
 
 
-def _validate_penalty_type(penalty_type: str) -> str:
-    penalty_type = str(penalty_type).lower().strip()
-    if penalty_type not in {"quadratic", "linear", "hinge"}:
-        raise ValueError(
-            "densification_penalty_type must be one of {'quadratic', 'linear', 'hinge'}. "
-            f"Got {penalty_type}"
-        )
-    return penalty_type
-
-
 @dataclass
 class PQTunerGCConfig:
     expected_add_ratio_scale: float = 0.0
     deletion_penalty_lambda: float = 0.0
     densification_penalty_lambda: float = 1.0
-    densification_penalty_type: str = "linear"
-    densification_penalty_rho0: float = 1.0
     p_max: float = P_PROBABILITY_UPPER
     optimize_rho: bool = False
     eps: float = 1e-12
@@ -86,7 +74,6 @@ class PQTunerGCConfig:
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_eps: float = 1e-8
-    ep_expectation_mode: str = "analytic"
     gat_denom_penalty_lambda: float = 1.0
     gat_denom_cv2_threshold: float = 1.0
     gat_corr_penalty_lambda: float = 50.0
@@ -100,7 +87,6 @@ class PQGradNormTunerGC:
         self.rade_variant = str(rade_variant).lower().strip()
         self.pooling = str(pooling).lower().strip()
         self.data_anchor = str(cfg.data_anchor).lower().strip()
-        self.ep_expectation_mode = str(getattr(cfg, "ep_expectation_mode", "analytic")).lower().strip()
         if self.gnn not in {"gin", "gcn", "gat"}:
             raise ValueError("gnn must be 'gin', 'gcn', or 'gat'")
         if self.rade_variant not in {"rade-of", "rade-ofs"}:
@@ -109,19 +95,11 @@ class PQGradNormTunerGC:
             raise ValueError("pooling must be 'sum' or 'mean'")
         if self.data_anchor not in {"clean", "aug"}:
             raise ValueError("data_anchor must be 'clean' or 'aug'")
-        if self.ep_expectation_mode not in {"analytic", "empirical_ema"}:
-            raise ValueError("ep_expectation_mode must be 'analytic' or 'empirical_ema'")
-        if self.gnn == "gat" and self.ep_expectation_mode != "analytic":
-            raise ValueError("GAT PQ-GradNorm currently requires ep_expectation_mode='analytic'.")
         self.optimize_rho = bool(getattr(cfg, "optimize_rho", False))
         self.expected_add_ratio_scale = max(0.0, float(getattr(cfg, "expected_add_ratio_scale", 0.0)))
         self.p_upper = min(float(getattr(cfg, "p_max", P_PROBABILITY_UPPER)), P_PROBABILITY_UPPER)
         if not (0.0 <= self.p_upper < 1.0):
             raise ValueError(f"p_max must be in [0, 1). Got {self.p_upper}")
-        self.penalty_type = _validate_penalty_type(getattr(cfg, "densification_penalty_type", "linear"))
-        self.penalty_rho0 = float(getattr(cfg, "densification_penalty_rho0", 1.0))
-        if self.penalty_rho0 < 0.0:
-            raise ValueError(f"densification_penalty_rho0 must be >= 0. Got {self.penalty_rho0}")
         self.gat_denom_penalty_lambda = float(getattr(cfg, "gat_denom_penalty_lambda", 0.0))
         if self.gat_denom_penalty_lambda < 0.0:
             raise ValueError(f"gat_denom_penalty_lambda must be >= 0. Got {self.gat_denom_penalty_lambda}")
@@ -181,24 +159,13 @@ class PQGradNormTunerGC:
         if lam <= 0.0:
             return 0.0
         rho = float(rho)
-        if self.penalty_type == "quadratic":
-            return lam * rho * rho
-        if self.penalty_type == "linear":
-            return lam * rho
-        excess = max(0.0, rho - float(self.penalty_rho0))
-        return lam * excess * excess
+        return lam * rho * rho
 
     def _densification_penalty_tensor(self, rho: torch.Tensor) -> torch.Tensor:
         lam = float(getattr(self.cfg, "densification_penalty_lambda", 0.0))
         if lam <= 0.0:
             return rho.new_zeros(())
-        if self.penalty_type == "quadratic":
-            return rho.new_tensor(lam) * rho * rho
-        if self.penalty_type == "linear":
-            return rho.new_tensor(lam) * rho
-        rho0_t = rho.new_tensor(float(self.penalty_rho0))
-        excess = torch.clamp_min(rho - rho0_t, 0.0)
-        return rho.new_tensor(lam) * excess * excess
+        return rho.new_tensor(lam) * rho * rho
 
     def _deletion_penalty_float(self, p: float) -> float:
         lam = float(getattr(self.cfg, "deletion_penalty_lambda", 0.0))
@@ -374,10 +341,6 @@ class PQGradNormTunerGC:
     @torch.no_grad()
     def _var_gcn(self, cache: BatchedGraphCache, p: float, q: float, msg: torch.Tensor, msg_sq: torch.Tensor) -> torch.Tensor:
         eps = self.cfg.eps
-        empirical_v = self._empirical_gcn_variance(msg, msg_sq, p=p, q=q, eps=eps)
-        if empirical_v is not None:
-            return empirical_v
-
         row, col = cache.edge_index_clean_dir
         deg = cache.deg_clean.to(torch.float32)
         comp = cache.comp_size.to(torch.float32)
@@ -424,10 +387,6 @@ class PQGradNormTunerGC:
         msg_sq: torch.Tensor,
     ) -> torch.Tensor:
         eps = self.cfg.eps
-        empirical_v = self._empirical_gcn_variance(msg, msg_sq, p=float(p.detach()), q=float(q.detach()), eps=eps)
-        if empirical_v is not None:
-            return empirical_v + (p * 0.0 + q * 0.0)
-
         row, col = cache.edge_index_clean_dir
         deg = cache.deg_clean.to(torch.float32)
         comp = cache.comp_size.to(torch.float32)
@@ -503,42 +462,6 @@ class PQGradNormTunerGC:
         ]
         value = estimates[0] if len(estimates) == 1 else torch.stack(estimates, dim=0).mean(dim=0)
         return value + (p * 0.0 + q * 0.0)
-
-    def _empirical_gcn_variance(
-        self,
-        msg: torch.Tensor,
-        msg_sq: torch.Tensor,
-        *,
-        p: float,
-        q: float,
-        eps: float,
-    ) -> Optional[torch.Tensor]:
-        if self.ep_expectation_mode != "empirical_ema":
-            return None
-        modules = getattr(self, "_empirical_gcn_modules", None)
-        if not modules:
-            return torch.zeros_like(msg_sq)
-        estimates = []
-        for module in modules:
-            fn = getattr(module, "empirical_gcn_variance_proxy", None)
-            if not callable(fn):
-                continue
-            value = fn(msg, msg_sq, p=float(p), q=float(q), eps=float(eps))
-            if value is not None:
-                estimates.append(value)
-        if not estimates:
-            return torch.zeros_like(msg_sq)
-        if len(estimates) == 1:
-            return estimates[0]
-        return torch.stack(estimates, dim=0).mean(dim=0)
-
-    @staticmethod
-    def _collect_empirical_gcn_modules(model: nn.Module) -> List[nn.Module]:
-        return [
-            module
-            for module in model.modules()
-            if callable(getattr(module, "empirical_gcn_variance_proxy", None))
-        ]
 
     def _ensure_adam_state(self, *, current_p: float, current_q: float, device: torch.device) -> None:
         if self._adam_opt is not None and self._adam_device == device and self._adam_p is not None and self._adam_q is not None:
@@ -744,11 +667,6 @@ class PQGradNormTunerGC:
             )
             _, w_graph = self._loss_and_w(logits, batch.y, loss_type=loss_type)
             msg, msg_sq = self._messages_detached(node_emb, model.pred.weight)
-            self._empirical_gcn_modules = (
-                self._collect_empirical_gcn_modules(model)
-                if self.ep_expectation_mode == "empirical_ema" and self.gnn == "gcn"
-                else []
-            )
             self._gat_modules = self._collect_gat_modules(model) if self.gnn == "gat" else []
             cache = BatchedGraphCache.from_edge_index(edge_index, batch_vec, num_graphs=num_graphs, node_ids=node_ids)
             pool_w2 = self._pool_w2(batch_vec, num_graphs, cache.num_nodes, device=msg.device).to(msg.dtype).unsqueeze(1)
@@ -908,13 +826,10 @@ class PQGradNormTunerGC:
                 "gat_corr_gain_mean_new": float(gat_corr_gain_mean_new),
                 "gat_corr_gain_max_best": float(gat_corr_gain_max_best),
                 "gat_corr_gain_max_new": float(gat_corr_gain_max_new),
-                "search_method": "adam",
                 "optimize_rho": bool(self.optimize_rho),
                 "expected_add_ratio_scale": float(self.expected_add_ratio_scale),
                 "deletion_penalty_lambda": float(getattr(cfg, "deletion_penalty_lambda", 0.0)),
                 "densification_penalty_lambda": float(getattr(cfg, "densification_penalty_lambda", 0.0)),
-                "densification_penalty_type": str(self.penalty_type),
-                "densification_penalty_rho0": float(self.penalty_rho0),
                 "gat_denom_penalty_lambda": float(self.gat_denom_penalty_lambda),
                 "gat_denom_cv2_threshold": float(self.gat_denom_cv2_threshold),
                 "gat_corr_penalty_lambda": float(self.gat_corr_penalty_lambda),

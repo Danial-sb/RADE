@@ -468,14 +468,13 @@ def print_training_banner(args, model) -> None:
         f"| method_rate={method_rate} "
         f"| aug_mode={aug_mode}(p={float(getattr(args, 'p', 0.0)):.4f}, q={float(getattr(args, 'q', 0.0)):.6f}) "
         f"| ep_correction={'ON' if bool(getattr(args, 'ep_correction', False)) else 'OFF'}"
-        f"({getattr(args, 'rade_variant', 'off')}, {getattr(args, 'ep_expectation_mode', 'analytic')}) "
+        f"({getattr(args, 'rade_variant', 'off')}, analytic) "
         f"| gradnorm={'ON' if bool(getattr(args, 'pq_gradnorm', False)) else 'OFF'}"
         f"(adam/direct, rho_opt={bool(getattr(args, 'pq_optimize_rho', False))}, "
         f"update_unit={getattr(args, 'pq_update_unit', 'batch')}, "
         f"p_max={float(getattr(args, 'pq_p_max', 1.0 - 1e-6)):.4f}, "
         f"del_pen={float(getattr(args, 'pq_deletion_penalty_lambda', 0.0)):g}, "
-        f"dens_pen={float(getattr(args, 'pq_densification_penalty_lambda', 0.0)):g}/"
-        f"{getattr(args, 'pq_densification_penalty_type', 'linear')}, "
+        f"dens_pen={float(getattr(args, 'pq_densification_penalty_lambda', 0.0)):g}/quadratic, "
         f"gat_den={float(getattr(args, 'pq_gat_denom_penalty_lambda', 0.0)):g}@"
         f"{float(getattr(args, 'pq_gat_denom_cv2_threshold', 1.0)):g}, "
         f"gat_corr={float(getattr(args, 'pq_gat_corr_penalty_lambda', 0.0)):g}@"
@@ -493,8 +492,6 @@ def count_trainable_params(model: torch.nn.Module) -> int:
 def _run_tu_reference_protocol(args, *, device: torch.device, use_wandb: bool) -> None:
     attach_global_node_ids = (
         str(getattr(args, "aug_tech", "rade")).lower().strip() == "rade"
-        and bool(getattr(args, "ep_correction", False))
-        and str(getattr(args, "ep_expectation_mode", "analytic")).lower().strip() == "empirical_ema"
     )
     raw_root = str(getattr(args, "tu_raw_root", "./tu_raw_data"))
     if not os.path.isabs(raw_root):
@@ -571,11 +568,6 @@ def _run_tu_reference_protocol(args, *, device: torch.device, use_wandb: bool) -
         p_eff, q_eff = _enforce_aug_mode(float(getattr(args, "p", 0.0)), float(getattr(args, "q", 0.0)), args.aug_mode)
         if pq_enabled:
             p_eff = min(float(p_eff), float(getattr(args, "pq_p_max", 1.0 - 1e-6)))
-        if attach_global_node_ids:
-            if not hasattr(model, "reset_ep_stats"):
-                raise RuntimeError("ep_expectation_mode='empirical_ema' requires model.reset_ep_stats(...).")
-            model.reset_ep_stats(p_eff, q_eff)
-
         pq_tuner = None
         if pq_enabled:
             pq_tuner = PQGradNormTunerGC(
@@ -586,8 +578,6 @@ def _run_tu_reference_protocol(args, *, device: torch.device, use_wandb: bool) -
                     expected_add_ratio_scale=float(getattr(args, "pq_expected_add_ratio_scale", 0.0)),
                     deletion_penalty_lambda=float(getattr(args, "pq_deletion_penalty_lambda", 0.0)),
                     densification_penalty_lambda=float(getattr(args, "pq_densification_penalty_lambda", 1.0)),
-                    densification_penalty_type=str(getattr(args, "pq_densification_penalty_type", "linear")),
-                    densification_penalty_rho0=float(getattr(args, "pq_densification_penalty_rho0", 1.0)),
                     p_max=float(getattr(args, "pq_p_max", 1.0 - 1e-6)),
                     optimize_rho=bool(getattr(args, "pq_optimize_rho", False)),
                     eps=1e-12,
@@ -597,7 +587,6 @@ def _run_tu_reference_protocol(args, *, device: torch.device, use_wandb: bool) -
                     adam_beta1=float(getattr(args, "pq_adam_beta1", 0.9)),
                     adam_beta2=float(getattr(args, "pq_adam_beta2", 0.999)),
                     adam_eps=float(getattr(args, "pq_adam_eps", 1e-8)),
-                    ep_expectation_mode=str(getattr(args, "ep_expectation_mode", "analytic")),
                     gat_denom_penalty_lambda=float(getattr(args, "pq_gat_denom_penalty_lambda", 0.0)),
                     gat_denom_cv2_threshold=float(getattr(args, "pq_gat_denom_cv2_threshold", 1.0)),
                     gat_corr_penalty_lambda=float(getattr(args, "pq_gat_corr_penalty_lambda", 0.0)),
@@ -746,21 +735,6 @@ def _run_tu_reference_protocol(args, *, device: torch.device, use_wandb: bool) -
 
                 loss.backward()
                 optimizer.step()
-
-                if (
-                    attach_global_node_ids
-                    and do_aug
-                    and bool(getattr(args, "ep_correction", False))
-                    and str(getattr(args, "ep_expectation_mode", "analytic")).lower().strip() == "empirical_ema"
-                ):
-                    if not hasattr(model, "update_ep_stats"):
-                        raise RuntimeError("ep_expectation_mode='empirical_ema' requires model.update_ep_stats(...).")
-                    model.update_ep_stats(
-                        edge_index_keep=edge_index_keep_obj,
-                        edge_index_add=edge_index_add_obj,
-                        p=float(p_eff),
-                        q=float(q_eff),
-                    )
 
                 batch_graphs = int(batch.num_graphs) if hasattr(batch, "num_graphs") else int(y.size(0))
                 loss_term = loss.detach() * float(batch_graphs)
@@ -1182,8 +1156,6 @@ def main():
     if pq_enabled and str(getattr(args, "gnn", "gcn")).lower().strip() == "gat":
         if int(getattr(args, "gat_heads", 1)) != 1:
             raise ValueError("GAT PQ-GradNorm currently supports only --gat_heads 1.")
-        if str(getattr(args, "ep_expectation_mode", "analytic")).lower().strip() != "analytic":
-            raise ValueError("GAT PQ-GradNorm currently requires --ep_expectation_mode analytic.")
     if pq_enabled and aug_tech != "rade":
         raise ValueError("--pq_gradnorm is only valid with --aug_tech=rade.")
     if pq_enabled and str(getattr(args, "aug_mode", "none")).lower().strip() == "none":
@@ -1218,8 +1190,6 @@ def main():
             raise ValueError("--gat_ep_corr_clip must be >= 0.")
     args.pq_p_max = float(pq_p_max)
 
-    args.ep_emp_average_mode = "ema" if pq_enabled else "running_mean"
-
     device = torch.device("cpu") if args.cpu or not torch.cuda.is_available() else torch.device(f"cuda:{int(args.device)}")
     if tu_reference_mode:
         _run_tu_reference_protocol(args, device=device, use_wandb=use_wandb)
@@ -1227,8 +1197,6 @@ def main():
 
     attach_global_node_ids = (
         aug_tech == "rade"
-        and bool(getattr(args, "ep_correction", False))
-        and str(getattr(args, "ep_expectation_mode", "analytic")).lower().strip() == "empirical_ema"
     )
 
     dataset, base_split_idx, meta = load_gc_dataset(
@@ -1284,8 +1252,7 @@ def main():
         f"[CONFIG] dataset={args.dataset} | backbone_raw={args.gnn_raw} -> backbone={args.gnn} | "
         f"linear={bool(getattr(args, 'linear', False))} | aug_tech={args.aug_tech} aug_mode={args.aug_mode} | "
         f"ep_correction={bool(getattr(args, 'ep_correction', False))} "
-        f"(mode={getattr(args, 'ep_expectation_mode', 'analytic')}, avg={getattr(args, 'ep_emp_average_mode', 'running_mean')}, "
-        f"variant={getattr(args, 'rade_variant', '-')}) | "
+        f"(mode=analytic, variant={getattr(args, 'rade_variant', '-')}) | "
         f"pq_gradnorm={pq_enabled}(adam/direct, anchor={getattr(args, 'pq_data_anchor', 'clean')}, "
         f"update_unit={getattr(args, 'pq_update_unit', 'batch')}, "
         f"batch_update_every={int(getattr(args, 'pq_update_every_batches', 1))}, "
@@ -1294,8 +1261,7 @@ def main():
         f"p_max={float(getattr(args, 'pq_p_max', 1.0 - 1e-6)):.4f}, "
         f"rho_scale={float(getattr(args, 'pq_expected_add_ratio_scale', 0.0)):.6e}, "
         f"del_pen={float(getattr(args, 'pq_deletion_penalty_lambda', 0.0)):g}, "
-        f"dens_pen={float(getattr(args, 'pq_densification_penalty_lambda', 0.0)):g}/"
-        f"{getattr(args, 'pq_densification_penalty_type', 'linear')}, "
+        f"dens_pen={float(getattr(args, 'pq_densification_penalty_lambda', 0.0)):g}/quadratic, "
         f"gat_den={float(getattr(args, 'pq_gat_denom_penalty_lambda', 0.0)):g}@"
         f"{float(getattr(args, 'pq_gat_denom_cv2_threshold', 1.0)):g}, "
         f"gat_corr={float(getattr(args, 'pq_gat_corr_penalty_lambda', 0.0)):g}@"
@@ -1367,11 +1333,6 @@ def main():
         if pq_enabled:
             p_eff = min(float(p_eff), float(getattr(args, "pq_p_max", 1.0 - 1e-6)))
 
-        if attach_global_node_ids:
-            if not hasattr(model, "reset_ep_stats"):
-                raise RuntimeError("ep_expectation_mode='empirical_ema' requires model.reset_ep_stats(...).")
-            model.reset_ep_stats(p_eff, q_eff)
-
         pq_tuner = None
         if pq_enabled:
             pq_tuner = PQGradNormTunerGC(
@@ -1382,8 +1343,6 @@ def main():
                     expected_add_ratio_scale=float(getattr(args, "pq_expected_add_ratio_scale", 0.0)),
                     deletion_penalty_lambda=float(getattr(args, "pq_deletion_penalty_lambda", 0.0)),
                     densification_penalty_lambda=float(getattr(args, "pq_densification_penalty_lambda", 1.0)),
-                    densification_penalty_type=str(getattr(args, "pq_densification_penalty_type", "linear")),
-                    densification_penalty_rho0=float(getattr(args, "pq_densification_penalty_rho0", 1.0)),
                     p_max=float(getattr(args, "pq_p_max", 1.0 - 1e-6)),
                     optimize_rho=bool(getattr(args, "pq_optimize_rho", False)),
                     eps=1e-12,
@@ -1393,7 +1352,6 @@ def main():
                     adam_beta1=float(getattr(args, "pq_adam_beta1", 0.9)),
                     adam_beta2=float(getattr(args, "pq_adam_beta2", 0.999)),
                     adam_eps=float(getattr(args, "pq_adam_eps", 1e-8)),
-                    ep_expectation_mode=str(getattr(args, "ep_expectation_mode", "analytic")),
                     gat_denom_penalty_lambda=float(getattr(args, "pq_gat_denom_penalty_lambda", 0.0)),
                     gat_denom_cv2_threshold=float(getattr(args, "pq_gat_denom_cv2_threshold", 1.0)),
                     gat_corr_penalty_lambda=float(getattr(args, "pq_gat_corr_penalty_lambda", 0.0)),
@@ -1538,21 +1496,6 @@ def main():
                 loss.backward()
                 optimizer.step()
 
-                if (
-                    attach_global_node_ids
-                    and do_aug
-                    and bool(getattr(args, "ep_correction", False))
-                    and str(getattr(args, "ep_expectation_mode", "analytic")).lower().strip() == "empirical_ema"
-                ):
-                    if not hasattr(model, "update_ep_stats"):
-                        raise RuntimeError("ep_expectation_mode='empirical_ema' requires model.update_ep_stats(...).")
-                    model.update_ep_stats(
-                        edge_index_keep=edge_index_keep_obj,
-                        edge_index_add=edge_index_add_obj,
-                        p=float(p_eff),
-                        q=float(q_eff),
-                    )
-
                 batch_graphs = int(batch.num_graphs) if hasattr(batch, "num_graphs") else int(y.size(0))
                 loss_term = loss.detach() * float(batch_graphs)
                 epoch_loss_sum_tensor = loss_term if epoch_loss_sum_tensor is None else epoch_loss_sum_tensor + loss_term
@@ -1693,7 +1636,6 @@ def main():
                     "aug/rho": float(q_eff) * float(rho_scale),
                     "runtime/epoch_sec": float(epoch_time_sec),
                     "optim/lr": current_lr,
-                    "rade/ep_expectation_mode": str(getattr(args, "ep_expectation_mode", "analytic")),
                     "rade/variant": str(getattr(args, "rade_variant", "rade-of")),
                 }
                 if aug_tech == "dropedge":
@@ -1803,7 +1745,6 @@ def main():
                                 getattr(args, "pq_gat_corr_penalty_lambda", 0.0)
                             ),
                             "pq/gat_corr_threshold": float(getattr(args, "pq_gat_corr_threshold", 2.0)),
-                            "pq/search_method": "adam",
                         }
                     )
                 wandb.log(log_obj)
@@ -1865,7 +1806,6 @@ def main():
         "gat_concat": bool(getattr(args, "gat_concat", True)),
         "gat_negative_slope": float(getattr(args, "gat_negative_slope", 0.2)),
         "gat_moment_chunk_size": int(getattr(args, "gat_moment_chunk_size", 1024)),
-        "gat_moment_mode": str(getattr(args, "gat_moment_mode", "exact")),
         "gat_moment_samples": int(getattr(args, "gat_moment_samples", 256)),
         "gat_nonedge_samples": int(getattr(args, "gat_nonedge_samples", 256)),
         "gat_moment_seed": int(getattr(args, "gat_moment_seed", 0)),
@@ -1889,10 +1829,6 @@ def main():
         "dropmessage_rate": float(getattr(args, "dropmessage_rate", 0.0)),
         "dropnode_rate": float(getattr(args, "dropnode_rate", 0.0)),
         "ep_correction": bool(getattr(args, "ep_correction", False)),
-        "ep_expectation_mode": str(getattr(args, "ep_expectation_mode", "analytic")),
-        "ep_emp_average_mode": str(getattr(args, "ep_emp_average_mode", "running_mean")),
-        "ep_emp_beta": float(getattr(args, "ep_emp_beta", 0.1)),
-        "ep_emp_eps": float(getattr(args, "ep_emp_eps", 1e-12)),
         "rade_variant": str(getattr(args, "rade_variant", "rade-of")),
         "mask_sharing": str(getattr(args, "mask_sharing", "layerwise")),
         "graph_density": float(getattr(args, "graph_density", 0.0)),
@@ -1918,8 +1854,6 @@ def main():
         "pq_adam_eps": float(getattr(args, "pq_adam_eps", 1e-8)),
         "pq_deletion_penalty_lambda": float(getattr(args, "pq_deletion_penalty_lambda", 0.0)),
         "pq_densification_penalty_lambda": float(getattr(args, "pq_densification_penalty_lambda", 0.0)),
-        "pq_densification_penalty_type": str(getattr(args, "pq_densification_penalty_type", "linear")),
-        "pq_densification_penalty_rho0": float(getattr(args, "pq_densification_penalty_rho0", 1.0)),
         "pq_gat_denom_penalty_lambda": float(getattr(args, "pq_gat_denom_penalty_lambda", 0.0)),
         "pq_gat_denom_cv2_threshold": float(getattr(args, "pq_gat_denom_cv2_threshold", 1.0)),
         "pq_gat_corr_penalty_lambda": float(getattr(args, "pq_gat_corr_penalty_lambda", 0.0)),
@@ -1953,7 +1887,7 @@ def main():
         ).replace("-", "m")
         penalty_tag = (
             f"_del{deletion_lambda_tag}"
-            f"_dens{str(getattr(args, 'pq_densification_penalty_type', 'linear')).lower()}"
+            f"_densquadratic"
             f"{penalty_lambda_tag}"
             f"_gatden{gat_denom_lambda_tag}t{gat_denom_threshold_tag}"
             f"_gatcorr{gat_corr_lambda_tag}t{gat_corr_threshold_tag}"
