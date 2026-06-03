@@ -1,6 +1,9 @@
 # 🚀 RADE: Random Add-Drop Edge as a Regularizer
 
-**Official implementation of the ICML 2026 paper.**
+**Official implementation of the ICML 2026 paper:**
+**[RADE: Random Add-Drop Edge as a Regularizer](https://arxiv.org/abs/2606.00757)**
+
+[![arXiv](https://img.shields.io/badge/arXiv-2606.00757-b31b1b.svg)](https://arxiv.org/abs/2606.00757)
 
 RADE is a stochastic graph augmentation framework for graph neural networks that jointly addresses **overfitting** and **over-squashing** through random edge deletion, random edge addition, and expectation-preserving aggregation corrections.
 
@@ -121,9 +124,8 @@ Don't forget to cite our paper!
 @inproceedings{rade2026,
   title     = {RADE: Random Add-Drop Edge as a Regularizer},
   author    = {Saber, Danial and Salehi-Abari, Amirali},
-  booktitle = {To be added},
-  year      = {2026}
+  booktitle = {International Conference on Machine Learning},
+  year      = {2026},
+  url       = {https://arxiv.org/abs/2606.00757}
 }
 ```
-
-The final citation will be updated once the official proceedings information is available.
