@@ -315,7 +315,7 @@ def parser_add_gc_args(parser):
     parser.add_argument("--full_eval_cpu", action="store_true")
 
     parser.add_argument("--epochs", type=int, default=GRAPH_CLASSIFICATION_FALLBACK_DEFAULTS["epochs"])
-    parser.add_argument("--runs", type=int, default=5)
+    parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=GRAPH_CLASSIFICATION_FALLBACK_DEFAULTS["batch_size"])
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument(
@@ -328,7 +328,7 @@ def parser_add_gc_args(parser):
     parser.add_argument(
         "--gnn",
         type=str,
-        default="gin",
+        default="gcn",
         choices=["gcn", "gin", "gat", "sgc", "gin-linear"],
         help="Backbone: gcn/gin/gat are standard. sgc routes to linear-GCN. gin-linear routes to linear-GIN.",
     )
@@ -370,7 +370,7 @@ def parser_add_gc_args(parser):
         default=0,
         help="Deterministic seed for sampled graph-classification GAT moment estimates.",
     )
-    parser.add_argument( # when loss explodes, lower it.
+    parser.add_argument(
         "--gat_ep_corr_clip",
         type=float,
         default=2.0,

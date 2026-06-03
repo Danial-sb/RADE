@@ -1,4 +1,4 @@
-project: rade-gc-radeof-ogbg-densi0.1and1
+project: rade
 program: main_gc.py
 
 method: grid
@@ -8,15 +8,15 @@ metric:
 
 parameters:
   dataset:
-    values: [ogbg-molhiv]
+    values: [ogbg]
   gnn:
     values: [gcn]
   aug_tech:
     values: [rade]
   pq_update_unit:
-    values: [batch,epoch]
+    values: [epoch]
   pq_densification_penalty_lambda:
-    values: [0.1,1]
+    values: [0.1]
 
   ep_correction:
     values: [true]
@@ -30,16 +30,6 @@ parameters:
     values: [shared]
   pq_p_max:
     values: [0.9]
-#  pq_gat_denom_penalty_lambda:
-#    values: [0.0, 0.1, 1.0]
-#  pq_gat_denom_cv2_threshold:
-#    values: [0.5, 1.0, 2.0]
-#  pq_gat_corr_penalty_lambda:
-#    values: [0.0, 10.0, 50.0]
-#  pq_gat_corr_threshold:
-#    values: [1.5, 2.0, 3.0]
-#  gat_ep_corr_clip:
-#    values: [1.5, 2.0, 3.0]
 
   device:
     values: [2]
@@ -50,5 +40,5 @@ command:
   - main_gc.py
   - --wandb
   - --wandb_project
-  - rade-gc-radeofs-ogbg
+  - rade
   - ${args}

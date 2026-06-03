@@ -325,7 +325,7 @@ def parser_add_main_args(parser):
 
     # training schedule
     parser.add_argument("--epochs", type=int, default=500, help="number of training epochs")
-    parser.add_argument("--runs", type=int, default=5, help="number of distinct runs")
+    parser.add_argument("--runs", type=int, default=1, help="number of distinct runs")
 
     # split control
     parser.add_argument("--train_prop", type=float, default=0.6, help="training proportion (random-split datasets)")

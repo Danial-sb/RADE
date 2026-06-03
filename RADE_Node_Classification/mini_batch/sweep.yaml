@@ -1,4 +1,4 @@
-project: rade_gat_ogbn
+project: rade
 
 method: grid
 metric:
@@ -64,5 +64,5 @@ command:
   - RADE_Node_Classification.mini_batch.mb_main
   - --wandb
   - --wandb_project
-  - rade_gat_ogbn
+  - rade
   - ${args}

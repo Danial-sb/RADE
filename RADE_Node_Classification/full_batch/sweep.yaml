@@ -1,4 +1,4 @@
-project: rade_computer_new
+project: rade
 
 method: grid
 metric:
@@ -7,9 +7,9 @@ metric:
 
 parameters:
   dataset:
-    values: [computer, cs, physics]
+    values: [cora]
   gnn:
-    values: [gcn, gin, gat]
+    values: [gcn]
   local_layers:
     values: [2]
 #  hidden_channels:
@@ -22,7 +22,7 @@ parameters:
   aug_tech:
     values: [rade]
   rade_variant:
-    values: [rade-of, rade-ofs]
+    values: [rade-of]
   aug_mode:
     values: [both]
 #  dropout:
@@ -50,5 +50,5 @@ command:
   - main.py
   - --wandb
   - --wandb_project
-  - rade_computer_new
+  - rade
   - ${args}
