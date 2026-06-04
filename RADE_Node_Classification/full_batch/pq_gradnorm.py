@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple, List, Callable, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -10,11 +10,11 @@ import torch.nn as nn
 from augmentation import BernoulliEdgeAugmentor
 from rade_convs import (
     GraphCache,
-    _scatter_add_rows,
-    _delta_E_inv_sqrt_caseA,
-    _delta_E_inv_sqrt_caseB,
     _delta_E_inv_caseA,
     _delta_E_inv_caseB,
+    _delta_E_inv_sqrt_caseA,
+    _delta_E_inv_sqrt_caseB,
+    _scatter_add_rows,
 )
 
 

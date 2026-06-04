@@ -1,7 +1,5 @@
 import argparse
 
-from sympy import false
-
 from models import MPNNs
 
 
