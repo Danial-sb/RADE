@@ -1,13 +1,13 @@
 # graph_classification/data_utils_gc.py
 from __future__ import annotations
 
-from typing import Dict, Tuple, Optional
+from typing import Dict
 
 import numpy as np
 import torch
 
 # sklearn fallback (works even if OGB Evaluator is unavailable)
-from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.metrics import average_precision_score, roc_auc_score
 
 
 def random_split_graph_idx(

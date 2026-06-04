@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import zipfile
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch

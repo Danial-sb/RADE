@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Optional, Set, Tuple, List
+from typing import List, Literal, Optional, Set, Tuple
 
 import torch
 from torch_geometric.utils import coalesce, remove_self_loops

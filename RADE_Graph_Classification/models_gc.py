@@ -6,7 +6,13 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATConv, GCNConv, GINConv, global_add_pool, global_mean_pool
+from torch_geometric.nn import (
+    GATConv,
+    GCNConv,
+    GINConv,
+    global_add_pool,
+    global_mean_pool,
+)
 
 try:
     from ogb.graphproppred.mol_encoder import AtomEncoder
@@ -14,14 +20,32 @@ except Exception:
     AtomEncoder = None
 
 try:
-    from .rade_convs_gc import BatchedGraphCache, RADEGATConvGC, RADEGCNConvGC, RADEGINConvGC
+    from .rade_convs_gc import (
+        BatchedGraphCache,
+        RADEGATConvGC,
+        RADEGCNConvGC,
+        RADEGINConvGC,
+    )
 except Exception:
-    from rade_convs_gc import BatchedGraphCache, RADEGATConvGC, RADEGCNConvGC, RADEGINConvGC
+    from rade_convs_gc import (
+        BatchedGraphCache,
+        RADEGATConvGC,
+        RADEGCNConvGC,
+        RADEGINConvGC,
+    )
 
 try:
-    from .dropmessage_convs_gc import DropMessageGATConvGC, DropMessageGCNConvGC, DropMessageGINConvGC
+    from .dropmessage_convs_gc import (
+        DropMessageGATConvGC,
+        DropMessageGCNConvGC,
+        DropMessageGINConvGC,
+    )
 except Exception:
-    from dropmessage_convs_gc import DropMessageGATConvGC, DropMessageGCNConvGC, DropMessageGINConvGC
+    from dropmessage_convs_gc import (
+        DropMessageGATConvGC,
+        DropMessageGCNConvGC,
+        DropMessageGINConvGC,
+    )
 
 
 EdgeIndexObj = Union[torch.Tensor, List[torch.Tensor]]
